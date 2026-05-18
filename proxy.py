@@ -102,7 +102,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "http://127.0.0.1:1234/v1",
         "api_key_env": "",
         "require_api_key": False,
-        "model": "qwen3.6-35b-a3b",
+        "model": "local-security-inspector",
         "timeout_seconds": 60,
         "fail_closed": True,
         "max_chars": 3_000,
@@ -146,7 +146,7 @@ PROMPT_INJECTION_PATTERNS: list[tuple[str, str, int]] = [
     ("local_secret_file_request", r"\b(show|reveal|dump|print|read|open|send|upload)\b.{0,80}(?:\.env|auth\.json|id_rsa|known_hosts|credentials?|secrets?)", 8),
     ("tool_escalation", r"\b(enable|install|call|invoke|run|execute|open)\b.{0,100}\b(tool|mcp|terminal|shell|command|curl|wget|python|osascript|browser)\b", 5),
     ("policy_bypass", r"\b(bypass|disable|turn off|ignore|override)\b.{0,100}\b(security|policy|guard|approval|audit|logging|sandbox|restriction)\b", 7),
-    ("external_write", r"\b(post|tweet|dm|email|push|commit|merge|publish|upload|delete|modify|write)\b.{0,100}\b(github|x\.com|twitter|notion|google|drive|slack|teams|linear|file|repo|branch)\b", 6),
+    ("external_write", r"\b(post|dm|email|push|commit|merge|publish|upload|delete|modify|write)\b.{0,100}\b(external service|social platform|cloud drive|chat app|issue tracker|file|repo|branch)\b", 6),
     ("hidden_instruction_marker", r"\b(base64|hex|url[- ]?encoded|rot13|zero[- ]?width|invisible|hidden|html comment|metadata|alt text)\b.{0,100}\b(instruction|prompt|command)\b", 5),
     ("authority_laundering", r"\b(operator|administrator|admin|developer|system)\b.{0,80}\b(override|instruction|policy|authority|message)\b", 5),
 ]
@@ -154,7 +154,7 @@ PROMPT_INJECTION_PATTERNS: list[tuple[str, str, int]] = [
 
 SECRET_PATTERNS: list[tuple[str, str, int]] = [
     ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----", 10),
-    ("github_token", r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b", 10),
+    ("hosted_git_token", r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b", 10),
     ("openai_key", r"\bsk-[A-Za-z0-9_-]{20,}\b", 10),
     ("anthropic_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}\b", 10),
     ("aws_access_key", r"\bAKIA[0-9A-Z]{16}\b", 10),
@@ -173,7 +173,7 @@ URL_PATTERN = re.compile(r"https?://[^\s<>\]\"')]+", re.IGNORECASE)
 DANGEROUS_URI_PATTERN = re.compile(r"\b(?:file|data|javascript|ftp|smb)://[^\s<>\]\"')]+|\b(?:javascript|data):[^\s<>\]\"')]+", re.IGNORECASE)
 LOCAL_PATH_PATTERN = re.compile(r"(?:(?:~|/Users|/private|/var|/etc|/tmp|/Volumes)/[^\s'\"<>]+|[A-Za-z]:\\[^\s'\"<>]+)")
 SYSTEM_DISCLOSURE_PATTERN = re.compile(
-    r"\b(system prompt|developer message|hidden prompt|internal prompt|tool list|api server key|hermes config|launchagent|stack trace|traceback)\b",
+    r"\b(system prompt|developer message|hidden prompt|internal prompt|tool list|api server key|agent config|service config|stack trace|traceback)\b",
     re.IGNORECASE,
 )
 RECOMMENDATION_MARKERS = re.compile(
@@ -388,9 +388,15 @@ def content_to_text(content: Any) -> str:
 
 
 def get_capability(headers: http.client.HTTPMessage, payload: dict[str, Any]) -> str:
-    header_value = headers.get("X-Agent-Capability") or headers.get("X-Hermes-Capability")
+    header_value = headers.get("X-Agent-Capability")
     if header_value:
         return header_value.strip()
+    for name in headers.keys():
+        lowered = name.lower()
+        if lowered.startswith("x-") and lowered.endswith("-capability"):
+            vendor_value = headers.get(name)
+            if vendor_value:
+                return vendor_value.strip()
     metadata = payload.get("metadata")
     if isinstance(metadata, dict) and isinstance(metadata.get("capability"), str):
         return metadata["capability"].strip()
@@ -416,7 +422,7 @@ def verify_agent(headers: http.client.HTTPMessage, cfg: dict[str, Any], client_i
     if cfg.get("allow_unauthenticated_localhost") and client_ip in {"127.0.0.1", "::1"} and not auth:
         return "localhost-dev", {
             "trust_tier": "local_dev",
-            "allowed_capabilities": ["inspect", "coordination_result", "x_readonly_search", "submit_result"],
+            "allowed_capabilities": ["inspect", "coordination_result", "public_readonly_search", "submit_result"],
         }
     if not auth.startswith("Bearer "):
         raise PermissionError("missing bearer token")
@@ -986,7 +992,7 @@ def forward_to_agent_command(prompt: str, cfg: dict[str, Any]) -> str:
 
 def build_agent_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
     target = cfg.get("target", {})
-    agent_bin = target.get("agent_bin") or target.get("hermes_bin") or "agent"
+    agent_bin = target.get("agent_bin") or next((value for key, value in target.items() if str(key).endswith("_bin")), "agent")
     cmd = [str(agent_bin), "chat", "-Q"]
     toolsets = target.get("toolsets") or []
     if toolsets:
@@ -1279,16 +1285,16 @@ def write_example_config(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     example = json.loads(json.dumps(DEFAULT_CONFIG))
     example["agents"] = {
-        "x-research-worker-01": {
+        "external-worker-01": {
             "token_sha256": "replace-with-output-of-proxy-py-hash-token",
             "trust_tier": "external_readonly",
-            "allowed_capabilities": ["inspect", "x_readonly_search", "submit_result", "coordination_result"],
+            "allowed_capabilities": ["inspect", "public_readonly_search", "submit_result", "coordination_result"],
             "allowed_client_cidrs": ["192.0.2.0/24", "127.0.0.1/32"],
         },
-        "codex-local": {
+        "local-agent": {
             "token_sha256": "replace-with-output-of-proxy-py-hash-token",
-            "trust_tier": "codex_local",
-            "allowed_capabilities": ["inspect", "coordination_result", "x_readonly_search", "submit_result"],
+            "trust_tier": "local_trusted",
+            "allowed_capabilities": ["inspect", "coordination_result", "public_readonly_search", "submit_result"],
             "allowed_client_cidrs": ["127.0.0.1/32"],
         },
     }

@@ -42,7 +42,7 @@ class ProxyScannerTests(unittest.TestCase):
     def test_capability_denied(self):
         agent = {"allowed_capabilities": ["inspect"]}
         with self.assertRaises(PermissionError):
-            proxy.enforce_capability(agent, "x_readonly_search")
+            proxy.enforce_capability(agent, "public_readonly_search")
 
     def test_audit_hash_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,7 +208,7 @@ class ProxyScannerTests(unittest.TestCase):
 
     def test_output_guard_blocks_secret_and_local_path(self):
         scan = proxy.scan_output_text(
-            "The config is in /Users/example/.hermes/config.yaml and API_KEY=fakeTestSecretValue123.",
+            "The config is in /Users/example/.agent-runtime/config.yaml and API_KEY=fakeTestSecretValue123.",
             proxy.DEFAULT_CONFIG,
         )
         self.assertTrue(proxy.output_guard_blocks(scan, proxy.DEFAULT_CONFIG))
@@ -250,7 +250,7 @@ class ProxyHTTPTests(unittest.TestCase):
             "http-test-agent": {
                 "token_sha256": proxy.hash_token(token),
                 "trust_tier": "test_readonly",
-                "allowed_capabilities": ["inspect", "x_readonly_search", "submit_result"],
+                "allowed_capabilities": ["inspect", "public_readonly_search", "submit_result"],
                 "allowed_client_cidrs": ["127.0.0.1/32"],
             }
         }
@@ -275,7 +275,7 @@ class ProxyHTTPTests(unittest.TestCase):
         payload: dict,
         *,
         token: str | None = None,
-        capability: str = "x_readonly_search",
+        capability: str = "public_readonly_search",
     ) -> tuple[int, dict, dict]:
         headers = {"Content-Type": "application/json", "X-Agent-Capability": capability}
         data = json.dumps(payload).encode("utf-8")

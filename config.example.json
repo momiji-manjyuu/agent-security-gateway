@@ -1,22 +1,22 @@
 {
   "agents": {
-    "codex-local": {
+    "local-agent": {
       "allowed_capabilities": [
         "inspect",
         "coordination_result",
-        "x_readonly_search",
+        "public_readonly_search",
         "submit_result"
       ],
       "allowed_client_cidrs": [
         "127.0.0.1/32"
       ],
       "token_sha256": "replace-with-output-of-proxy-py-hash-token",
-      "trust_tier": "codex_local"
+      "trust_tier": "local_trusted"
     },
-    "x-research-worker-01": {
+    "external-worker-01": {
       "allowed_capabilities": [
         "inspect",
-        "x_readonly_search",
+        "public_readonly_search",
         "submit_result",
         "coordination_result"
       ],
@@ -46,7 +46,7 @@
     "max_chars": 3000,
     "max_tokens": 1500,
     "min_risk_score": 0,
-    "model": "qwen3.6-35b-a3b",
+    "model": "local-security-inspector",
     "no_think": true,
     "provider": "openai_compatible",
     "require_api_key": false,

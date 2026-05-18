@@ -33,7 +33,7 @@ def load_or_create_token(path: Path, *, overwrite: bool) -> str:
     return token
 
 
-def build_config(args: argparse.Namespace, codex_token: str, external_token: str) -> dict:
+def build_config(args: argparse.Namespace, local_token: str, external_token: str) -> dict:
     cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
     bind_cidr = f"{args.bind}/32" if args.bind != "127.0.0.1" else "127.0.0.1/32"
     external_cidrs = args.external_cidr or []
@@ -59,16 +59,16 @@ def build_config(args: argparse.Namespace, codex_token: str, external_token: str
         }
     )
     cfg["agents"] = {
-        "codex-local": {
-            "token_sha256": proxy.hash_token(codex_token),
-            "trust_tier": "codex_local",
-            "allowed_capabilities": ["inspect", "coordination_result", "x_readonly_search", "submit_result"],
+        "local-agent": {
+            "token_sha256": proxy.hash_token(local_token),
+            "trust_tier": "local_trusted",
+            "allowed_capabilities": ["inspect", "coordination_result", "public_readonly_search", "submit_result"],
             "allowed_client_cidrs": sorted({"127.0.0.1/32", bind_cidr}),
         },
-        "x-research-worker-01": {
+        "external-worker-01": {
             "token_sha256": proxy.hash_token(external_token),
             "trust_tier": "external_readonly",
-            "allowed_capabilities": ["inspect", "x_readonly_search", "submit_result", "coordination_result"],
+            "allowed_capabilities": ["inspect", "public_readonly_search", "submit_result", "coordination_result"],
             "allowed_client_cidrs": external_cidrs,
         },
     }
@@ -84,7 +84,6 @@ def main() -> int:
     parser.add_argument("--enable-forward", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--agent-bin", default="agent")
-    parser.add_argument("--hermes-bin", dest="agent_bin", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -94,9 +93,9 @@ def main() -> int:
     (args.runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
     os.chmod(args.runtime_dir / "logs", stat.S_IRWXU)
 
-    codex_token = load_or_create_token(args.runtime_dir / "tokens" / "codex-local.token", overwrite=args.force)
-    external_token = load_or_create_token(args.runtime_dir / "tokens" / "x-research-worker-01.token", overwrite=args.force)
-    cfg = build_config(args, codex_token, external_token)
+    local_token = load_or_create_token(args.runtime_dir / "tokens" / "local-agent.token", overwrite=args.force)
+    external_token = load_or_create_token(args.runtime_dir / "tokens" / "external-worker-01.token", overwrite=args.force)
+    cfg = build_config(args, local_token, external_token)
 
     config_path = args.runtime_dir / "config.json"
     if config_path.exists() and not args.force:
