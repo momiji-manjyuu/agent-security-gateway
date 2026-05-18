@@ -1,0 +1,125 @@
+{
+  "agents": {
+    "codex-local": {
+      "allowed_capabilities": [
+        "inspect",
+        "coordination_result",
+        "x_readonly_search",
+        "submit_result"
+      ],
+      "allowed_client_cidrs": [
+        "127.0.0.1/32"
+      ],
+      "token_sha256": "replace-with-output-of-proxy-py-hash-token",
+      "trust_tier": "codex_local"
+    },
+    "x-research-worker-01": {
+      "allowed_capabilities": [
+        "inspect",
+        "x_readonly_search",
+        "submit_result",
+        "coordination_result"
+      ],
+      "allowed_client_cidrs": [
+        "192.0.2.0/24",
+        "127.0.0.1/32"
+      ],
+      "token_sha256": "replace-with-output-of-proxy-py-hash-token",
+      "trust_tier": "external_readonly"
+    }
+  },
+  "audit_log": "/Users/example/.agent-security-proxy/audit.jsonl",
+  "audit": {
+    "include_findings": true,
+    "include_structured_extract": false
+  },
+  "bind": "127.0.0.1",
+  "block_risk_score": 8,
+  "kill_switch_file": "/Users/example/.agent-security-proxy/KILL_SWITCH",
+  "llm_inspector": {
+    "api_key_env": "",
+    "base_url": "http://127.0.0.1:1234/v1",
+    "block_score": 0.82,
+    "enabled": false,
+    "fail_closed": true,
+    "inspect_blocked": false,
+    "max_chars": 3000,
+    "max_tokens": 1500,
+    "min_risk_score": 0,
+    "model": "qwen3.6-35b-a3b",
+    "no_think": true,
+    "provider": "openai_compatible",
+    "require_api_key": false,
+    "timeout_seconds": 60
+  },
+  "max_body_bytes": 262144,
+  "normalize": {
+    "max_content_chars": 40000,
+    "strip_control_chars": true,
+    "strip_format_chars": true,
+    "strip_html_comments": true,
+    "unicode_nfkc": true
+  },
+  "port": 8787,
+  "output_guard": {
+    "block_local_paths": true,
+    "block_on_review": true,
+    "block_risk_score": 8,
+    "disallow_dangerous_schemes": true,
+    "disallow_ip_literals": true,
+    "disallow_private_hosts": true,
+    "disallow_url_fragment": true,
+    "disallow_url_query": true,
+    "disallow_userinfo": true,
+    "enabled": true,
+    "flag_encoded_paths": true,
+    "flag_punycode_hosts": true,
+    "flag_shorteners": true,
+    "max_content_chars": 40000,
+    "review_risk_score": 4,
+    "shortener_hosts": [
+      "bit.ly",
+      "buff.ly",
+      "goo.gl",
+      "is.gd",
+      "ow.ly",
+      "t.co",
+      "tinyurl.com"
+    ],
+    "strip_control_chars": true,
+    "strip_format_chars": true,
+    "unicode_nfkc": true
+  },
+  "rate_limit": {
+    "capability_overrides": {},
+    "enabled": true,
+    "max_requests": 120,
+    "window_seconds": 60
+  },
+  "review_policy": {
+    "block_forward": true
+  },
+  "review_risk_score": 4,
+  "structured_extract": {
+    "max_claims": 12,
+    "max_excerpt_chars": 240,
+    "max_recommendations": 12,
+    "max_suspicious_instructions": 12,
+    "max_urls": 20
+  },
+  "target": {
+    "dry_run": true,
+    "forward_raw_content": false,
+    "checkpoints": true,
+    "hermes_bin": "/opt/hermes/bin/hermes",
+    "http_api_key_env": "HERMES_API_SERVER_KEY",
+    "http_base_url": "http://127.0.0.1:8642/v1",
+    "ignore_rules": true,
+    "ignore_user_config": false,
+    "max_turns": 2,
+    "mode": "command",
+    "source": "agent-security-proxy",
+    "timeout_seconds": 180,
+    "toolsets": []
+  }
+}

@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.DS_Store
+
+# Runtime state lives outside the project, but keep these out if copied here.
+.agent-security-proxy/
+tokens/
+audit.jsonl
+logs/
+KILL_SWITCH
+
+# Local editor and test artifacts.
+.idea/
+.vscode/
+.pytest_cache/
+.coverage

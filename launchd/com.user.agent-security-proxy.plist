@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.agent-security-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ROOT__/scripts/start.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__RUNTIME_DIR__/logs/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__RUNTIME_DIR__/logs/stderr.log</string>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ASP_CONFIG</key>
+    <string>__RUNTIME_DIR__/config.json</string>
+    <key>ASP_PYTHON</key>
+    <string>__PYTHON_BIN__</string>
+  </dict>
+</dict>
+</plist>
