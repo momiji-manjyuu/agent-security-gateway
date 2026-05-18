@@ -56,6 +56,44 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_requests": 120,
         "capability_overrides": {},
     },
+    "capabilities": {
+        "_default": {
+            "allowed_tools": [],
+            "allowed_domains": [],
+            "allow_external_write": False,
+            "allow_local_files": False,
+            "allow_response_format": False,
+            "max_tokens": 1_500,
+            "temperature": 0,
+            "output_url_policy": "no_query_no_fragment",
+        },
+        "public_readonly_search": {
+            "allowed_tools": [],
+            "allowed_domains": [],
+            "allow_external_write": False,
+            "allow_local_files": False,
+            "max_tokens": 1_200,
+        },
+        "submit_result": {
+            "allowed_tools": [],
+            "allow_external_write": False,
+            "allow_local_files": False,
+            "max_tokens": 800,
+            "requires_review_above_risk": 4,
+        },
+        "coordination_result": {
+            "allowed_tools": [],
+            "allow_external_write": False,
+            "allow_local_files": False,
+            "max_tokens": 1_200,
+        },
+        "inspect": {
+            "allowed_tools": [],
+            "allow_external_write": False,
+            "allow_local_files": False,
+            "max_tokens": 0,
+        },
+    },
     "audit": {
         "include_structured_extract": False,
         "include_findings": True,
@@ -119,11 +157,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "source": "agent-security-proxy",
         "max_turns": 2,
         "toolsets": [],
-        "ignore_rules": True,
+        "ignore_rules": False,
         "ignore_user_config": False,
         "checkpoints": True,
         "timeout_seconds": 180,
         "http_base_url": "http://127.0.0.1:8642/v1",
+        "http_model": "backend-agent",
         "http_api_key_env": "BACKEND_AGENT_API_KEY",
         "forward_raw_content": False,
     },
@@ -149,6 +188,9 @@ PROMPT_INJECTION_PATTERNS: list[tuple[str, str, int]] = [
     ("external_write", r"\b(post|dm|email|push|commit|merge|publish|upload|delete|modify|write)\b.{0,100}\b(external service|social platform|cloud drive|chat app|issue tracker|file|repo|branch)\b", 6),
     ("hidden_instruction_marker", r"\b(base64|hex|url[- ]?encoded|rot13|zero[- ]?width|invisible|hidden|html comment|metadata|alt text)\b.{0,100}\b(instruction|prompt|command)\b", 5),
     ("authority_laundering", r"\b(operator|administrator|admin|developer|system)\b.{0,80}\b(override|instruction|policy|authority|message)\b", 5),
+    ("ja_ignore_previous", r"(?:前|以前|これまで|上記).{0,20}(?:指示|命令|プロンプト|ルール).{0,40}(?:無視|忘れ|破棄|上書き)", 5),
+    ("ja_secret_exfiltration", r"(?:(?:表示|見せ|送信|アップロード|漏えい|漏洩|開示|出力).{0,80}(?:APIキー|token|トークン|秘密鍵|\.env|認証情報|パスワード)|(?:APIキー|token|トークン|秘密鍵|\.env|認証情報|パスワード).{0,80}(?:表示|見せ|送信|アップロード|漏えい|漏洩|開示|出力))", 8),
+    ("ja_policy_bypass", r"(?:セキュリティ|ポリシー|監査|制限|承認).{0,60}(?:無効|回避|バイパス|解除|上書き)", 7),
 ]
 
 
@@ -443,7 +485,42 @@ def enforce_capability(agent: dict[str, Any], capability: str) -> None:
         raise PermissionError(f"capability '{capability}' is not allowed for this agent")
 
 
-def forward_requires_review(agent: dict[str, Any], cfg: dict[str, Any], scan: ScanResult) -> bool:
+def capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
+    policies = cfg.get("capabilities") or {}
+    merged: dict[str, Any] = {}
+    default_policy = policies.get("_default") if isinstance(policies, dict) else None
+    specific_policy = policies.get(capability) if isinstance(policies, dict) else None
+    if isinstance(default_policy, dict):
+        deep_update(merged, json.loads(json.dumps(default_policy)))
+    if isinstance(specific_policy, dict):
+        deep_update(merged, json.loads(json.dumps(specific_policy)))
+    return merged
+
+
+def bounded_int(value: Any, *, default: int, minimum: int, maximum: int | None = None) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    number = max(minimum, number)
+    if maximum is not None:
+        number = min(number, maximum)
+    return number
+
+
+def bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def forward_requires_review(agent: dict[str, Any], cfg: dict[str, Any], scan: ScanResult, capability: str) -> bool:
+    policy = capability_policy(cfg, capability)
+    threshold = policy.get("requires_review_above_risk")
+    if threshold is not None and scan.risk_score >= bounded_int(threshold, default=4, minimum=0):
+        return not bool(agent.get("allow_forward_on_review", False))
     if not scan.requires_review:
         return False
     if not cfg.get("review_policy", {}).get("block_forward", True):
@@ -1014,12 +1091,49 @@ def build_agent_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
     return cmd
 
 
-def forward_to_agent_http(payload: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def build_http_forward_payload(payload: dict[str, Any], prompt: str, cfg: dict[str, Any], capability: str) -> dict[str, Any]:
+    target = cfg.get("target", {})
+    policy = capability_policy(cfg, capability)
+    configured_max_tokens = bounded_int(policy.get("max_tokens"), default=1_500, minimum=0)
+    if configured_max_tokens <= 0:
+        configured_max_tokens = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1)
+    requested_max_tokens = payload.get("max_tokens")
+    max_tokens = configured_max_tokens
+    if requested_max_tokens is not None:
+        max_tokens = min(
+            bounded_int(requested_max_tokens, default=configured_max_tokens, minimum=1),
+            configured_max_tokens,
+        )
+
+    body_payload: dict[str, Any] = {
+        "model": str(policy.get("http_model") or target.get("http_model") or "backend-agent"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": bounded_float(policy.get("temperature"), default=0.0, minimum=0.0, maximum=2.0),
+        "stream": False,
+        "max_tokens": max_tokens,
+    }
+
+    backend_tools = policy.get("backend_tools")
+    if isinstance(backend_tools, list) and backend_tools:
+        body_payload["tools"] = backend_tools
+        if "tool_choice" in policy:
+            body_payload["tool_choice"] = policy["tool_choice"]
+
+    if policy.get("allow_response_format", False) and isinstance(payload.get("response_format"), dict):
+        allowed_types = {str(item) for item in policy.get("allowed_response_format_types", [])}
+        response_format = payload["response_format"]
+        response_type = str(response_format.get("type", ""))
+        if not allowed_types or response_type in allowed_types:
+            body_payload["response_format"] = response_format
+
+    return body_payload
+
+
+def forward_to_agent_http(payload: dict[str, Any], prompt: str, cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     target = cfg.get("target", {})
     if target.get("dry_run", True):
         return openai_response("DRY_RUN: request accepted by Agent Security Proxy but not forwarded to the backend AI agent.", payload)
-    body_payload = dict(payload)
-    body_payload["messages"] = [{"role": "user", "content": prompt}]
+    body_payload = build_http_forward_payload(payload, prompt, cfg, capability)
     api_key = os.environ.get(str(target.get("http_api_key_env", "")), "")
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -1181,7 +1295,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.write_json(403, {"error": "blocked_by_security_proxy", "request_id": request_id, "scan": inbound.scan.public_dict()})
             return
 
-        if forward and forward_requires_review(agent, cfg, inbound.scan):
+        if forward and forward_requires_review(agent, cfg, inbound.scan, capability):
             audit.write({"event": "review_required", "reason": "scan_requires_review", **audit_base})
             self.write_json(403, {"error": "manual_review_required", "request_id": request_id, "scan": inbound.scan.public_dict()})
             return
@@ -1203,7 +1317,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         audit.write({"event": "allow", "decision": "forward", **audit_base})
         target_mode = str(cfg.get("target", {}).get("mode", "command"))
         if target_mode == "http":
-            upstream = forward_to_agent_http(payload, prompt, cfg)
+            upstream = forward_to_agent_http(payload, prompt, cfg, capability)
             output_scan = output_guard_scan_for_upstream(upstream, cfg)
             if output_guard_blocks(output_scan, cfg):
                 self.write_output_guard_block(audit, request_id, verified, output_scan, cfg)

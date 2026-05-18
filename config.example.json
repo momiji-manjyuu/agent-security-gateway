@@ -35,6 +35,44 @@
   },
   "bind": "127.0.0.1",
   "block_risk_score": 8,
+  "capabilities": {
+    "_default": {
+      "allow_external_write": false,
+      "allow_local_files": false,
+      "allow_response_format": false,
+      "allowed_domains": [],
+      "allowed_tools": [],
+      "max_tokens": 1500,
+      "output_url_policy": "no_query_no_fragment",
+      "temperature": 0
+    },
+    "coordination_result": {
+      "allow_external_write": false,
+      "allow_local_files": false,
+      "allowed_tools": [],
+      "max_tokens": 1200
+    },
+    "inspect": {
+      "allow_external_write": false,
+      "allow_local_files": false,
+      "allowed_tools": [],
+      "max_tokens": 0
+    },
+    "public_readonly_search": {
+      "allow_external_write": false,
+      "allow_local_files": false,
+      "allowed_domains": [],
+      "allowed_tools": [],
+      "max_tokens": 1200
+    },
+    "submit_result": {
+      "allow_external_write": false,
+      "allow_local_files": false,
+      "allowed_tools": [],
+      "max_tokens": 800,
+      "requires_review_above_risk": 4
+    }
+  },
   "kill_switch_file": "/Users/example/.agent-security-proxy/KILL_SWITCH",
   "llm_inspector": {
     "api_key_env": "",
@@ -114,7 +152,8 @@
     "agent_bin": "/opt/agent-runtime/bin/agent",
     "http_api_key_env": "BACKEND_AGENT_API_KEY",
     "http_base_url": "http://127.0.0.1:8642/v1",
-    "ignore_rules": true,
+    "http_model": "backend-agent",
+    "ignore_rules": false,
     "ignore_user_config": false,
     "max_turns": 2,
     "mode": "command",
