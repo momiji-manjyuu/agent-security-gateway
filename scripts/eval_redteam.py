@@ -29,14 +29,28 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
             case.setdefault("id", f"case-{line_number}")
             case.setdefault("direction", "input")
             case.setdefault("expect", "review_or_block")
+            tags = case.get("tags", [])
+            if isinstance(tags, str):
+                tags = [tags]
+            if not isinstance(tags, list):
+                tags = []
+            case["tags"] = [str(tag) for tag in tags]
             cases.append(case)
     return cases
 
 
 def classify(case: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, proxy.ScanResult]:
-    text = str(case.get("text", ""))
     direction = str(case.get("direction", "input"))
     capability = str(case.get("capability", "public_readonly_search"))
+    if direction == "input" and isinstance(case.get("payload"), dict):
+        scan = proxy.scan_inbound_payload(case["payload"], cfg).scan
+        if scan.blocked:
+            return "block", scan
+        if scan.requires_review:
+            return "review", scan
+        return "allow", scan
+
+    text = str(case.get("text", ""))
     if direction == "output":
         scan = proxy.scan_output_text(text, cfg, capability)
         if proxy.output_guard_blocks(scan, cfg):
@@ -73,6 +87,7 @@ def main() -> int:
 
     cfg = proxy.load_config(args.config) if args.config else json.loads(json.dumps(proxy.DEFAULT_CONFIG))
     rows: list[dict[str, Any]] = []
+    tag_metrics: dict[str, dict[str, int]] = {}
     counts: dict[str, int] = {
         "attack_total": 0,
         "attack_caught": 0,
@@ -91,6 +106,30 @@ def main() -> int:
             counts["benign_total"] += 1
             if decision == "allow":
                 counts["benign_allowed"] += 1
+        ok = expectation_met(decision, expected)
+        for tag in case.get("tags", []):
+            tag_row = tag_metrics.setdefault(
+                tag,
+                {
+                    "total": 0,
+                    "passed": 0,
+                    "attack_total": 0,
+                    "attack_caught": 0,
+                    "benign_total": 0,
+                    "benign_allowed": 0,
+                },
+            )
+            tag_row["total"] += 1
+            if ok:
+                tag_row["passed"] += 1
+            if is_attack:
+                tag_row["attack_total"] += 1
+                if decision in {"review", "block"}:
+                    tag_row["attack_caught"] += 1
+            else:
+                tag_row["benign_total"] += 1
+                if decision == "allow":
+                    tag_row["benign_allowed"] += 1
         rows.append(
             {
                 "id": case["id"],
@@ -98,7 +137,8 @@ def main() -> int:
                 "capability": case.get("capability", "public_readonly_search"),
                 "expect": expected,
                 "decision": decision,
-                "ok": expectation_met(decision, expected),
+                "ok": ok,
+                "tags": case.get("tags", []),
                 "risk_score": scan.risk_score,
                 "findings": [finding.category for finding in scan.findings],
             }
@@ -112,20 +152,31 @@ def main() -> int:
         **counts,
     }
     if args.json:
-        print(json.dumps({"passed": passed, "failed": failed, "metrics": metrics, "cases": rows}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {"passed": passed, "failed": failed, "metrics": metrics, "tag_metrics": tag_metrics, "cases": rows},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         print(f"redteam corpus: {passed}/{len(rows)} passed")
         if metrics["attack_catch_rate"] is not None:
             print(f"attack catch rate: {metrics['attack_caught']}/{metrics['attack_total']} = {metrics['attack_catch_rate']:.2%}")
         if metrics["benign_allow_rate"] is not None:
             print(f"benign allow rate: {metrics['benign_allowed']}/{metrics['benign_total']} = {metrics['benign_allow_rate']:.2%}")
+        if tag_metrics:
+            print("tag coverage:")
+            for tag, tag_row in sorted(tag_metrics.items()):
+                print(f"  {tag}: {tag_row['passed']}/{tag_row['total']} passed")
         for row in rows:
             status = "ok" if row["ok"] else "FAIL"
             findings = ",".join(row["findings"]) or "-"
+            tags = ",".join(row["tags"]) or "-"
             print(
                 f"{status:4} {row['id']:24} direction={row['direction']:6} "
                 f"capability={row['capability']:22} expect={row['expect']:15} "
-                f"decision={row['decision']:6} score={row['risk_score']:3} findings={findings}"
+                f"decision={row['decision']:6} score={row['risk_score']:3} tags={tags} findings={findings}"
             )
     return 0 if failed == 0 else 1
 

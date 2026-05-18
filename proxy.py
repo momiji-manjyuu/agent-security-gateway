@@ -37,7 +37,24 @@ from typing import Any
 APP_NAME = "agent-security-proxy"
 DEFAULT_CONFIG_PATH = Path.home() / ".agent-security-proxy" / "config.json"
 OUTPUT_URL_POLICIES = {"no_query_no_fragment", "public_web", "block_all"}
-REQUEST_CONTROL_FIELDS = ("tools", "tool_choice", "response_format", "metadata")
+REQUEST_CONTROL_FIELDS = (
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "response_format",
+    "metadata",
+    "stream",
+    "model",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "logit_bias",
+    "user",
+    "store",
+)
+MESSAGE_CONTROL_FIELDS = ("tool_calls", "function_call", "tool_call_id", "name")
+UNTRUSTED_CONTROL_ROLES = {"system", "developer", "tool", "function"}
 MAX_HTTP_MAX_TOKENS = 8_192
 MAX_TIMEOUT_SECONDS = 600
 
@@ -200,15 +217,22 @@ PROMPT_INJECTION_PATTERNS: list[tuple[str, str, int]] = [
     ("ja_ignore_previous", r"(?:前|以前|これまで|上記).{0,20}(?:指示|命令|プロンプト|ルール).{0,40}(?:無視|忘れ|破棄|上書き)", 5),
     ("ja_secret_exfiltration", r"(?:(?:表示|見せ|送信|アップロード|漏えい|漏洩|開示|出力).{0,80}(?:APIキー|token|トークン|秘密鍵|\.env|認証情報|パスワード)|(?:APIキー|token|トークン|秘密鍵|\.env|認証情報|パスワード).{0,80}(?:表示|見せ|送信|アップロード|漏えい|漏洩|開示|出力))", 8),
     ("ja_policy_bypass", r"(?:セキュリティ|ポリシー|監査|制限|承認).{0,60}(?:無効|回避|バイパス|解除|上書き)", 7),
+    ("es_ignore_previous", r"\b(ignora|olvida|descarta)\b.{0,50}\b(instrucciones|reglas|mensaje anterior|indicaciones)\b", 5),
+    ("fr_ignore_previous", r"\b(ignore|oublie|supprime)\b.{0,20}\b(?:les|des)\b.{0,30}\b(instructions|règles|regles|message précédent|message precedent)\b", 5),
+    ("zh_ignore_previous", r"(?:忽略|无视|無視).{0,30}(?:之前|以前|上面|上述).{0,30}(?:指令|规则|規則|提示|消息)", 5),
+    ("ko_ignore_previous", r"(?:이전|위의).{0,30}(?:지시|규칙|프롬프트).{0,30}(?:무시|삭제|폐기)", 5),
 ]
 
 
 SECRET_PATTERNS: list[tuple[str, str, int]] = [
     ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----", 10),
     ("hosted_git_token", r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b", 10),
+    ("gitlab_token", r"\bglpat-[A-Za-z0-9_-]{20,}\b", 10),
     ("openai_key", r"\bsk-[A-Za-z0-9_-]{20,}\b", 10),
     ("anthropic_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}\b", 10),
     ("aws_access_key", r"\bAKIA[0-9A-Z]{16}\b", 10),
+    ("google_api_key", r"\bAIza[0-9A-Za-z_-]{35}\b", 10),
+    ("jwt", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", 8),
     ("bearer_token", r"\bBearer\s+[A-Za-z0-9._~+/=-]{24,}\b", 8),
     ("generic_assignment_secret", r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\s*[:=]\s*[^\s'\"]{12,}", 8),
 ]
@@ -364,9 +388,53 @@ def normalize_untrusted_text(text: str, cfg: dict[str, Any]) -> tuple[str, dict[
     return normalized, removed
 
 
+def untrusted_url_findings(url: str, *, category_prefix: str) -> list[Finding]:
+    findings: list[Finding] = []
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower()
+
+    if "@" in parsed.netloc.rsplit("]", 1)[-1]:
+        findings.append(Finding(f"{category_prefix}:url_userinfo", 8, "URL contains userinfo, which can hide destination or credentials"))
+    if parsed.query and SENSITIVE_QUERY_PATTERN.search(parsed.query):
+        findings.append(Finding(f"{category_prefix}:url_sensitive_query", 8, "URL query string contains sensitive-looking parameters"))
+    if "xn--" in host:
+        findings.append(Finding(f"{category_prefix}:punycode_host", 4, "URL host uses punycode and requires review"))
+
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            findings.append(Finding(f"{category_prefix}:private_host", 6, "URL targets a private, loopback, or non-public address"))
+    except ValueError:
+        if host in {"localhost", "localhost.localdomain"}:
+            findings.append(Finding(f"{category_prefix}:private_host", 6, "URL targets localhost"))
+
+    if len(re.findall(r"%[0-9a-fA-F]{2}", parsed.path or "")) >= 4:
+        findings.append(Finding(f"{category_prefix}:encoded_path", 4, "URL path contains heavy percent-encoding"))
+    if re.search(r"[A-Za-z0-9_-]{64,}", parsed.path or ""):
+        findings.append(Finding(f"{category_prefix}:high_entropy_path", 4, "URL path contains a long token-like segment"))
+    return findings
+
+
 def scan_text(text: str, cfg: dict[str, Any]) -> ScanResult:
     normalized, removed = normalize_untrusted_text(text, cfg)
     findings: list[Finding] = []
+
+    if "[request_control:untrusted_message_role]" in normalized:
+        findings.append(Finding("request_control:untrusted_message_role", 5, "untrusted caller supplied a privileged message role"))
+    if re.search(r"\[(?:request|message)_control:(?:tools|tool_choice|functions|function_call|tool_calls)\]", normalized):
+        findings.append(Finding("request_control:caller_tooling", 5, "caller-controlled tool or function definitions require review"))
+    if "[request_control:stream]" in normalized and re.search(r"\[request_control:stream\]\s*true\b", normalized, re.IGNORECASE):
+        findings.append(Finding("request_control:stream_requested", 3, "caller requested streaming; proxy forwards non-streaming by policy"))
+    if "image_url_sensitive_query=true" in normalized:
+        findings.append(Finding("input_dlp:image_url_sensitive_query", 8, "image URL query contains sensitive-looking parameters"))
+    if "image_url_fragment_omitted=true" in normalized:
+        findings.append(Finding("input_dlp:image_url_fragment", 3, "image URL fragment was omitted before forwarding"))
+    if LOCAL_PATH_PATTERN.search(normalized):
+        findings.append(Finding("input_dlp:local_path", 4, "local filesystem path appeared in untrusted input"))
+    if DANGEROUS_URI_PATTERN.search(normalized):
+        findings.append(Finding("input_dlp:dangerous_uri_scheme", 8, "dangerous URI scheme appeared in untrusted input"))
+    for match in URL_PATTERN.finditer(normalized):
+        findings.extend(untrusted_url_findings(match.group(0), category_prefix="input_dlp"))
 
     for name, pattern, severity in SECRET_PATTERNS:
         if re.search(pattern, normalized, flags=re.DOTALL):
@@ -411,7 +479,10 @@ def extract_content(payload: Any) -> str:
                 continue
             role = msg.get("role", "unknown")
             chunks.append(f"[{role}]")
+            if str(role).lower() in UNTRUSTED_CONTROL_ROLES:
+                chunks.append(f"[request_control:untrusted_message_role] {role}")
             chunks.append(content_to_text(msg.get("content")))
+            chunks.extend(extract_message_control_fields(msg))
     elif "input" in payload:
         chunks.append(content_to_text(payload.get("input")))
     else:
@@ -427,6 +498,16 @@ def extract_request_control_fields(payload: dict[str, Any]) -> list[str]:
             continue
         chunks.append(f"[request_control:{field}]")
         chunks.append(json.dumps(payload[field], ensure_ascii=False, sort_keys=True))
+    return chunks
+
+
+def extract_message_control_fields(message: dict[str, Any]) -> list[str]:
+    chunks: list[str] = []
+    for field in MESSAGE_CONTROL_FIELDS:
+        if field not in message:
+            continue
+        chunks.append(f"[message_control:{field}]")
+        chunks.append(json.dumps(message[field], ensure_ascii=False, sort_keys=True))
     return chunks
 
 
@@ -447,6 +528,13 @@ def content_to_text(content: Any) -> str:
                     if url:
                         parts.append("image_url_sha256=" + sha256_text(str(url)))
                         parts.append("image_url_report=" + json.dumps(sanitize_url_for_report(str(url)), ensure_ascii=False, sort_keys=True))
+                        parsed = urllib.parse.urlsplit(str(url))
+                        if parsed.query:
+                            parts.append("image_url_query_omitted=true")
+                            if SENSITIVE_QUERY_PATTERN.search(parsed.query):
+                                parts.append("image_url_sensitive_query=true")
+                        if parsed.fragment:
+                            parts.append("image_url_fragment_omitted=true")
                 else:
                     parts.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
             else:
@@ -1069,6 +1157,12 @@ def extract_openai_response_text(payload: dict[str, Any]) -> str:
 
 def public_scan_for_audit(scan: ScanResult, cfg: dict[str, Any]) -> dict[str, Any]:
     public = scan.public_dict()
+    counts: dict[str, int] = {}
+    for finding in scan.findings:
+        prefix = finding.category.split(":", 1)[0]
+        counts[prefix] = counts.get(prefix, 0) + 1
+    public["finding_counts"] = counts
+    public["max_finding_severity"] = max((finding.severity for finding in scan.findings), default=0)
     if not cfg.get("audit", {}).get("include_findings", True):
         public["finding_count"] = len(public.get("findings", []))
         public.pop("findings", None)
