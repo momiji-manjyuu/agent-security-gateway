@@ -181,6 +181,9 @@
         "allow_response_format": {
           "type": "boolean"
         },
+        "requires_human_approval": {
+          "type": "boolean"
+        },
         "allowed_response_format_types": {
           "type": "array",
           "items": {

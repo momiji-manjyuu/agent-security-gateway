@@ -10,3 +10,4 @@
 - Expanded scanner coverage for caller tool/function controls, privileged message roles, sensitive image URL queries, JWT/GitLab/Google-style secrets, and additional languages.
 - Expanded the red-team corpus with tagged payload cases for tool calls, function arguments, image URLs, and multilingual injection probes.
 - Added audit finding summaries for easier log aggregation.
+- Added backend policy manifest export and stricter validation that backend tools must be explicitly allowlisted by capability.

@@ -273,6 +273,7 @@ class ProxyScannerTests(unittest.TestCase):
 
     def test_http_forward_payload_uses_configured_backend_tools_only(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["public_readonly_search"]["allowed_tools"] = ["safe_search"]
         cfg["capabilities"]["public_readonly_search"]["backend_tools"] = [
             {"type": "function", "function": {"name": "safe_search", "description": "Search public pages."}}
         ]
@@ -285,6 +286,34 @@ class ProxyScannerTests(unittest.TestCase):
         body = proxy.build_http_forward_payload(payload, "wrapped prompt", cfg, "public_readonly_search")
         self.assertEqual(body["tools"][0]["function"]["name"], "safe_search")
         self.assertEqual(body["tool_choice"]["function"]["name"], "safe_search")
+
+    def test_backend_policy_manifest_excludes_token_hashes(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["agents"]["worker"] = {
+            "token_sha256": "a" * 64,
+            "trust_tier": "external_readonly",
+            "allowed_capabilities": ["public_readonly_search"],
+            "allowed_client_cidrs": ["127.0.0.1/32"],
+        }
+        manifest = proxy.build_backend_policy_manifest(cfg, ["public_readonly_search"])
+        self.assertEqual(manifest["capabilities"]["public_readonly_search"]["capability"], "public_readonly_search")
+        self.assertFalse(manifest["capabilities"]["public_readonly_search"]["caller_supplied_tools_forwarded"])
+        self.assertNotIn("token_sha256", json.dumps(manifest))
+
+    def test_wrap_metadata_includes_effective_capability_policy(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        scan = proxy.scan_text("normal result text", cfg)
+        wrapped = proxy.wrap_for_backend_agent(
+            agent_id="agent-1",
+            agent={"trust_tier": "external_readonly"},
+            capability="public_readonly_search",
+            request_id="req_test",
+            scan=scan,
+            structured=proxy.build_structured_extract(scan, cfg),
+            cfg=cfg,
+        )
+        self.assertIn('"effective_capability_policy"', wrapped)
+        self.assertIn('"caller_supplied_tools_forwarded": false', wrapped)
 
     def test_extract_json_object_ignores_wrappers_and_trailing_text(self):
         raw = '<|channel|>final <|message|>{"score":0.9,"categories":["prompt_injection"],"reason":"x"}}'
@@ -490,6 +519,32 @@ class ProxyScannerTests(unittest.TestCase):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
         cfg["target"]["http_max_tokens"] = 512
         cfg["capabilities"]["public_readonly_search"]["max_tokens"] = 1024
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
+    def test_validate_config_rejects_backend_tool_without_allowlist(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["public_readonly_search"]["backend_tools"] = [
+            {"type": "function", "function": {"name": "safe_search", "description": "Search public pages."}}
+        ]
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
+    def test_validate_config_rejects_backend_tool_outside_allowlist(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["public_readonly_search"]["allowed_tools"] = ["safe_search"]
+        cfg["capabilities"]["public_readonly_search"]["backend_tools"] = [
+            {"type": "function", "function": {"name": "unsafe_search", "description": "Search public pages."}}
+        ]
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
+    def test_validate_config_rejects_write_tool_without_approval(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["submit_result"]["allowed_tools"] = ["send_result"]
+        cfg["capabilities"]["submit_result"]["backend_tools"] = [
+            {"type": "function", "function": {"name": "send_result", "description": "Post a result to an external endpoint."}}
+        ]
         with self.assertRaises(ValueError):
             proxy.validate_config(cfg)
 

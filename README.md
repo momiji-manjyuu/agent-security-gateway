@@ -234,6 +234,7 @@ agent が capability を名乗れるだけでは、実際の tool、network、to
     "allowed_domains": [],
     "allow_external_write": false,
     "allow_local_files": false,
+    "requires_human_approval": false,
     "max_tokens": 1200,
     "output_url_policy": "public_web"
   },
@@ -248,15 +249,24 @@ agent が capability を名乗れるだけでは、実際の tool、network、to
 }
 ```
 
-現時点では、HTTP mode の payload 再構築と review threshold にこの policy が反映されます。command mode では backend CLI 側の toolsets、sandbox、network policy と組み合わせて実効的な制限にしてください。
+HTTP mode の payload 再構築、review threshold、backend policy manifest にこの policy が反映されます。command mode では backend CLI 側の toolsets、sandbox、network policy と組み合わせて実効的な制限にしてください。
 
-HTTP mode で `tools` を backend へ渡す必要がある場合は、呼び出し元 payload からコピーせず、proxy config の `backend_tools` と `tool_choice` に定義してください。
+HTTP mode で `tools` を backend へ渡す必要がある場合は、呼び出し元 payload からコピーせず、proxy config の `backend_tools` と `tool_choice` に定義してください。`backend_tools` を設定する場合、その tool name は同じ capability の `allowed_tools` に明示されている必要があります。write-capable らしい tool を許可する場合は、`allow_external_write: true` と `requires_human_approval: true` を明示してください。
 
 `output_url_policy` は backend 応答に含まれる URL の扱いを capability ごとに変えます。
 
 - `no_query_no_fragment`: query string と fragment を block します。結果提出や coordination 用の既定です。
 - `public_web`: public web URL の query/fragment は許可します。ただし sensitive-looking query、private host、IP literal、shortener、危険 scheme は引き続き block します。検索結果の返却向けです。
 - `block_all`: URL をすべて block します。外部 worker へ clickable link を返したくない capability 向けです。
+
+backend runtime や sidecar が機械的に参照できる policy manifest は、次の command で出力できます。token hash や API key は含めません。
+
+```bash
+python3 proxy.py --config ~/.agent-security-proxy/config.json export-backend-policy
+python3 proxy.py --config ~/.agent-security-proxy/config.json export-backend-policy --capability public_readonly_search
+```
+
+backend へ渡す prompt metadata にも、該当 capability の effective policy が含まれます。これは backend 側の強制境界そのものではありませんが、backend runtime が tool/network/filesystem の制約を確認するための機械可読な契約になります。
 
 `allowed_domains` を指定すると、backend 応答に含まれる URL host も capability ごとに制限できます。`example.com` は完全一致、`*.example.com` または `.example.com` はサブドメインも許可します。
 

@@ -37,6 +37,10 @@ from typing import Any
 APP_NAME = "agent-security-proxy"
 DEFAULT_CONFIG_PATH = Path.home() / ".agent-security-proxy" / "config.json"
 OUTPUT_URL_POLICIES = {"no_query_no_fragment", "public_web", "block_all"}
+WRITE_TOOL_PATTERN = re.compile(
+    r"\b(write|create|update|delete|remove|upload|send|post|publish|commit|merge|push|email|dm|notify|exfiltrate)\b",
+    re.IGNORECASE,
+)
 REQUEST_CONTROL_FIELDS = (
     "tools",
     "tool_choice",
@@ -84,6 +88,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "allow_external_write": False,
             "allow_local_files": False,
             "allow_response_format": False,
+            "requires_human_approval": False,
             "max_tokens": 1_500,
             "temperature": 0,
             "output_url_policy": "no_query_no_fragment",
@@ -599,6 +604,32 @@ def enforce_capability(agent: dict[str, Any], capability: str) -> None:
         raise PermissionError(f"capability '{capability}' is not allowed for this agent")
 
 
+def backend_tool_name(tool: Any) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
+        return function["name"].strip()
+    if isinstance(tool.get("name"), str):
+        return str(tool["name"]).strip()
+    return ""
+
+
+def backend_tool_names(policy: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for tool in policy.get("backend_tools") or []:
+        name = backend_tool_name(tool)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def backend_tool_policy_text(tool: Any) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    return json.dumps(tool, ensure_ascii=False, sort_keys=True)
+
+
 def capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     policies = cfg.get("capabilities") or {}
     merged: dict[str, Any] = {}
@@ -609,6 +640,57 @@ def capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     if isinstance(specific_policy, dict):
         deep_update(merged, json.loads(json.dumps(specific_policy)))
     return merged
+
+
+def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
+    policy = capability_policy(cfg, capability)
+    return {
+        "capability": capability,
+        "allowed_tools": [str(item) for item in policy.get("allowed_tools") or []],
+        "backend_tool_names": backend_tool_names(policy),
+        "allowed_domains": [str(item) for item in policy.get("allowed_domains") or []],
+        "allow_external_write": bool(policy.get("allow_external_write", False)),
+        "allow_local_files": bool(policy.get("allow_local_files", False)),
+        "allow_response_format": bool(policy.get("allow_response_format", False)),
+        "allowed_response_format_types": [str(item) for item in policy.get("allowed_response_format_types") or []],
+        "max_tokens": bounded_int(policy.get("max_tokens"), default=1_500, minimum=0, maximum=MAX_HTTP_MAX_TOKENS),
+        "temperature": bounded_float(policy.get("temperature"), default=0.0, minimum=0.0, maximum=2.0),
+        "output_url_policy": str(
+            policy.get("output_url_policy", cfg.get("output_guard", {}).get("output_url_policy", "no_query_no_fragment"))
+        ),
+        "requires_review_above_risk": policy.get("requires_review_above_risk"),
+        "requires_human_approval": bool(policy.get("requires_human_approval", False)),
+        "caller_supplied_tools_forwarded": False,
+        "caller_supplied_stream_forwarded": False,
+        "caller_supplied_model_forwarded": False,
+    }
+
+
+def build_backend_policy_manifest(cfg: dict[str, Any], capabilities: list[str] | None = None) -> dict[str, Any]:
+    configured = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
+    capability_names = capabilities or [name for name in configured.keys() if name != "_default"]
+    target = cfg.get("target", {}) if isinstance(cfg.get("target"), dict) else {}
+    agents: dict[str, Any] = {}
+    for agent_id, agent in (cfg.get("agents") or {}).items():
+        if not isinstance(agent, dict):
+            continue
+        agents[str(agent_id)] = {
+            "trust_tier": agent.get("trust_tier"),
+            "allowed_capabilities": [str(item) for item in agent.get("allowed_capabilities") or []],
+            "allowed_client_cidrs": [str(item) for item in agent.get("allowed_client_cidrs") or []],
+        }
+    return {
+        "schema_version": 1,
+        "service": APP_NAME,
+        "target": {
+            "mode": str(target.get("mode", "command")),
+            "forward_raw_content": bool(target.get("forward_raw_content", False)),
+            "http_model": str(target.get("http_model", "backend-agent")),
+            "http_max_tokens": bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS),
+        },
+        "agents": agents,
+        "capabilities": {name: backend_capability_policy(cfg, name) for name in capability_names},
+    }
 
 
 def bounded_int(value: Any, *, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -682,6 +764,29 @@ def validate_config(cfg: dict[str, Any]) -> None:
             for list_field in ("allowed_tools", "allowed_domains", "backend_tools"):
                 if list_field in policy and not isinstance(policy[list_field], list):
                     errors.append(f"capabilities.{name}.{list_field} must be an array")
+            allowed_tools = policy.get("allowed_tools") or []
+            if isinstance(allowed_tools, list) and not all(isinstance(item, str) and item.strip() for item in allowed_tools):
+                errors.append(f"capabilities.{name}.allowed_tools must contain non-empty strings")
+            backend_tools = policy.get("backend_tools") or []
+            if isinstance(backend_tools, list) and backend_tools:
+                allowed_tool_names = {str(item).strip() for item in allowed_tools if isinstance(item, str)}
+                if not allowed_tool_names:
+                    errors.append(f"capabilities.{name}.backend_tools requires explicit allowed_tools entries")
+                for index, tool in enumerate(backend_tools):
+                    tool_name = backend_tool_name(tool)
+                    if not tool_name:
+                        errors.append(f"capabilities.{name}.backend_tools[{index}] must have a function.name")
+                        continue
+                    if allowed_tool_names and tool_name not in allowed_tool_names:
+                        errors.append(f"capabilities.{name}.backend_tools[{index}] name '{tool_name}' is not in allowed_tools")
+                    if not bool(policy.get("allow_external_write", False)) and WRITE_TOOL_PATTERN.search(backend_tool_policy_text(tool)):
+                        errors.append(
+                            f"capabilities.{name}.backend_tools[{index}] appears write-capable; set allow_external_write=true and requires_human_approval=true if intentional"
+                        )
+            if bool(policy.get("allow_external_write", False)) and not bool(policy.get("requires_human_approval", False)):
+                errors.append(f"capabilities.{name}.allow_external_write=true requires requires_human_approval=true")
+            if bool(policy.get("allow_local_files", False)) and not bool(policy.get("requires_human_approval", False)):
+                errors.append(f"capabilities.{name}.allow_local_files=true requires requires_human_approval=true")
             max_tokens_raw, max_tokens_ok = parse_int(policy.get("max_tokens", 1_500), default=1_500)
             max_tokens_value = bounded_int(max_tokens_raw, default=1_500, minimum=0, maximum=MAX_HTTP_MAX_TOKENS)
             if "max_tokens" in policy and (not max_tokens_ok or max_tokens_value != max_tokens_raw):
@@ -1357,6 +1462,7 @@ def wrap_for_backend_agent(
         "risk_score": scan.risk_score,
         "finding_categories": [f.category for f in scan.findings],
         "forward_raw_content": bool(cfg.get("target", {}).get("forward_raw_content", False)),
+        "effective_capability_policy": backend_capability_policy(cfg, capability),
     }
     prompt = (
         "You are receiving data from Agent Security Proxy.\n"
@@ -1733,6 +1839,12 @@ def verify_audit_cli(path: Path) -> None:
         raise SystemExit(1)
 
 
+def export_backend_policy_cli(config_path: Path, capabilities: list[str] | None) -> None:
+    cfg = load_config(config_path)
+    manifest = build_backend_policy_manifest(cfg, capabilities or None)
+    print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
+
+
 def write_example_config(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     example = json.loads(json.dumps(DEFAULT_CONFIG))
@@ -1778,6 +1890,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("validate-config")
     p_verify_audit = sub.add_parser("verify-audit")
     p_verify_audit.add_argument("--path", type=Path, default=None)
+    p_export_policy = sub.add_parser("export-backend-policy")
+    p_export_policy.add_argument("--capability", action="append", default=[])
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -1797,6 +1911,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "verify-audit":
         path = args.path or Path(load_config(args.config)["audit_log"])
         verify_audit_cli(path)
+    elif args.command == "export-backend-policy":
+        export_backend_policy_cli(args.config, args.capability)
     return 0
 
 

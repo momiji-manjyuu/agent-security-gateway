@@ -44,6 +44,7 @@
       "allowed_tools": [],
       "max_tokens": 1500,
       "output_url_policy": "no_query_no_fragment",
+      "requires_human_approval": false,
       "temperature": 0
     },
     "coordination_result": {
