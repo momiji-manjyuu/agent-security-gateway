@@ -149,12 +149,14 @@
     "max_urls": 20
   },
   "target": {
+    "allow_ignore_rules": false,
     "dry_run": true,
     "forward_raw_content": false,
     "checkpoints": true,
     "agent_bin": "/opt/agent-runtime/bin/agent",
     "http_api_key_env": "BACKEND_AGENT_API_KEY",
     "http_base_url": "http://127.0.0.1:8642/v1",
+    "http_max_tokens": 1500,
     "http_model": "backend-agent",
     "ignore_rules": false,
     "ignore_user_config": false,

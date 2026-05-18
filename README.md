@@ -337,12 +337,13 @@ cp .env.example .env
   "max_turns": 2,
   "toolsets": [],
   "ignore_rules": false,
+  "allow_ignore_rules": false,
   "ignore_user_config": false,
   "checkpoints": true
 }
 ```
 
-command mode は、`agent chat -Q --source agent-security-proxy ... -q <prompt>` の形で backend CLI を呼びます。`toolsets` はデフォルトで空です。外部エージェント入口では、必要な tool だけを backend 側で明示的に許可してください。`ignore_rules` は backend 固有の native policy を無視する可能性があるため、必要性を理解している場合だけ `true` にします。
+command mode は、`agent chat -Q --source agent-security-proxy ... -q <prompt>` の形で backend CLI を呼びます。`toolsets` はデフォルトで空です。外部エージェント入口では、必要な tool だけを backend 側で明示的に許可してください。`ignore_rules` は backend 固有の native policy を無視する可能性があるため、必要性を理解している場合だけ `allow_ignore_rules` と一緒に `true` にします。
 
 ### HTTP mode
 
@@ -352,6 +353,7 @@ command mode は、`agent chat -Q --source agent-security-proxy ... -q <prompt>`
   "mode": "http",
   "http_base_url": "http://127.0.0.1:8642/v1",
   "http_model": "backend-agent",
+  "http_max_tokens": 1500,
   "http_api_key_env": "BACKEND_AGENT_API_KEY",
   "timeout_seconds": 180
 }
@@ -359,13 +361,15 @@ command mode は、`agent chat -Q --source agent-security-proxy ... -q <prompt>`
 
 HTTP mode は `http_base_url + "/chat/completions"` に OpenAI 互換 request を送ります。`http_api_key_env` に環境変数名を設定すると、backend への request に `Authorization: Bearer ...` を付けます。
 
-HTTP 転送では、呼び出し元の payload をコピーしません。proxy が新しい payload を作り、`model`、`messages`、`temperature`、`stream: false`、`max_tokens` だけを既定で送ります。`tools`、`tool_choice`、`response_format`、`metadata`、`stream` などの呼び出し元指定は、proxy policy で明示的に許可・構成しない限り backend へ渡りません。
+HTTP 転送では、呼び出し元の payload をコピーしません。proxy が新しい payload を作り、`model`、`messages`、`temperature`、`stream: false`、`max_tokens` だけを既定で送ります。`max_tokens` は capability policy と `target.http_max_tokens` の小さい方に丸めます。config validation では、各 capability の `max_tokens` が `target.http_max_tokens` を超えていないことも確認します。`tools`、`tool_choice`、`response_format`、`metadata`、`stream` などの呼び出し元指定は、proxy policy で明示的に許可・構成しない限り backend へ渡りません。
 
 設定を変更した後は、起動前に config validation を実行できます。
 
 ```bash
 python3 proxy.py --config ~/.agent-security-proxy/config.json validate-config
 ```
+
+JSON Schema は `schemas/config.schema.json` にあります。editor や CI で schema validation を使う場合はこの file を参照してください。プロキシ本体は追加 package なしで動くよう、実行時には内蔵の軽量 validator を使います。
 
 ## LLM Inspector
 
@@ -507,7 +511,13 @@ python3 scripts/eval_redteam.py
 
 `tests/redteam_corpus.jsonl` は検知率を証明するものではありません。日本語/英語混在、不可視文字、URL encode、tool escalation、output DLP など、境界の基本挙動が regress していないかを確認する最小 corpus です。公開運用前には、実際の入力分布に合わせて benign case と attack case を増やしてください。
 
+GitHub Actions 用の CI workflow template は `docs/github-actions-ci.yml` にあります。unit test、red-team corpus、example config validation を実行します。GitHub Actions を有効化する場合は、この file を `.github/workflows/ci.yml` として配置してください。
+
 `tests/` は runtime には不要ですが、このプロキシの security boundary の挙動を固定する仕様として残しています。
+
+## Release Notes
+
+変更履歴は `CHANGELOG.md` にまとめます。security issue の報告方針は `SECURITY.md` を参照してください。tagged release を切るまでは、public `main` branch が唯一の supported version です。
 
 ## Security Notes
 

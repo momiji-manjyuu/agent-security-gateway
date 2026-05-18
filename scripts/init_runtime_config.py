@@ -53,9 +53,11 @@ def build_config(args: argparse.Namespace, local_token: str, external_token: str
             "source": "agent-security-proxy",
             "toolsets": [],
             "ignore_rules": False,
+            "allow_ignore_rules": False,
             "ignore_user_config": False,
             "checkpoints": True,
             "http_model": "backend-agent",
+            "http_max_tokens": 1500,
             "forward_raw_content": False,
         }
     )

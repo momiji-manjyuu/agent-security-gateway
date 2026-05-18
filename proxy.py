@@ -38,6 +38,8 @@ APP_NAME = "agent-security-proxy"
 DEFAULT_CONFIG_PATH = Path.home() / ".agent-security-proxy" / "config.json"
 OUTPUT_URL_POLICIES = {"no_query_no_fragment", "public_web", "block_all"}
 REQUEST_CONTROL_FIELDS = ("tools", "tool_choice", "response_format", "metadata")
+MAX_HTTP_MAX_TOKENS = 8_192
+MAX_TIMEOUT_SECONDS = 600
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -168,8 +170,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout_seconds": 180,
         "http_base_url": "http://127.0.0.1:8642/v1",
         "http_model": "backend-agent",
+        "http_max_tokens": 1_500,
         "http_api_key_env": "BACKEND_AGENT_API_KEY",
         "forward_raw_content": False,
+        "allow_ignore_rules": False,
     },
     "structured_extract": {
         "max_claims": 12,
@@ -530,6 +534,13 @@ def bounded_int(value: Any, *, default: int, minimum: int, maximum: int | None =
     return number
 
 
+def parse_int(value: Any, *, default: int) -> tuple[int, bool]:
+    try:
+        return int(value), True
+    except (TypeError, ValueError):
+        return default, False
+
+
 def bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
     try:
         number = float(value)
@@ -544,13 +555,22 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if bind in {"0.0.0.0", "::"} and not bool(cfg.get("allow_public_bind", False)):
         errors.append("bind uses a wildcard address; set allow_public_bind=true only if a TLS/VPN boundary is in front")
 
-    target = cfg.get("target", {})
-    if not isinstance(target, dict):
+    raw_target = cfg.get("target", {})
+    target = raw_target if isinstance(raw_target, dict) else {}
+    if not isinstance(raw_target, dict):
         errors.append("target must be an object")
     else:
         mode = str(target.get("mode", "command"))
         if mode not in {"command", "http"}:
             errors.append("target.mode must be 'command' or 'http'")
+        if bool(target.get("ignore_rules", False)) and not bool(target.get("allow_ignore_rules", False)):
+            errors.append("target.ignore_rules=true requires target.allow_ignore_rules=true to acknowledge backend policy bypass risk")
+        timeout_seconds, timeout_ok = parse_int(target.get("timeout_seconds", 180), default=180)
+        if not timeout_ok or bounded_int(timeout_seconds, default=180, minimum=1, maximum=MAX_TIMEOUT_SECONDS) != timeout_seconds:
+            errors.append(f"target.timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")
+        http_max_tokens, http_max_tokens_ok = parse_int(target.get("http_max_tokens", 1_500), default=1_500)
+        if not http_max_tokens_ok or bounded_int(http_max_tokens, default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS) != http_max_tokens:
+            errors.append(f"target.http_max_tokens must be between 1 and {MAX_HTTP_MAX_TOKENS}")
         if mode == "http":
             base_url = str(target.get("http_base_url", ""))
             parsed = urllib.parse.urlsplit(base_url)
@@ -565,16 +585,32 @@ def validate_config(cfg: dict[str, Any]) -> None:
             if not isinstance(policy, dict):
                 errors.append(f"capabilities.{name} must be an object")
                 continue
-            output_policy = str(policy.get("output_url_policy", cfg.get("output_guard", {}).get("output_url_policy", "no_query_no_fragment")))
+            output_guard = cfg.get("output_guard", {})
+            if not isinstance(output_guard, dict):
+                output_guard = {}
+            output_policy = str(policy.get("output_url_policy", output_guard.get("output_url_policy", "no_query_no_fragment")))
             if output_policy not in OUTPUT_URL_POLICIES:
                 errors.append(f"capabilities.{name}.output_url_policy must be one of {sorted(OUTPUT_URL_POLICIES)}")
             for list_field in ("allowed_tools", "allowed_domains", "backend_tools"):
                 if list_field in policy and not isinstance(policy[list_field], list):
                     errors.append(f"capabilities.{name}.{list_field} must be an array")
-            if "max_tokens" in policy and bounded_int(policy.get("max_tokens"), default=-1, minimum=-1) < 0:
-                errors.append(f"capabilities.{name}.max_tokens must be >= 0")
+            max_tokens_raw, max_tokens_ok = parse_int(policy.get("max_tokens", 1_500), default=1_500)
+            max_tokens_value = bounded_int(max_tokens_raw, default=1_500, minimum=0, maximum=MAX_HTTP_MAX_TOKENS)
+            if "max_tokens" in policy and (not max_tokens_ok or max_tokens_value != max_tokens_raw):
+                errors.append(f"capabilities.{name}.max_tokens must be between 0 and {MAX_HTTP_MAX_TOKENS}")
+            target_http_max = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS)
+            if max_tokens_value > target_http_max:
+                errors.append(f"capabilities.{name}.max_tokens must not exceed target.http_max_tokens")
             if "temperature" in policy:
-                bounded_float(policy.get("temperature"), default=-1.0, minimum=-1.0, maximum=3.0)
+                try:
+                    raw_temp = float(policy.get("temperature", 0))
+                    temp_ok = True
+                except (TypeError, ValueError):
+                    raw_temp = 0.0
+                    temp_ok = False
+                temp = bounded_float(raw_temp, default=0.0, minimum=0.0, maximum=2.0)
+                if not temp_ok or temp != raw_temp:
+                    errors.append(f"capabilities.{name}.temperature must be between 0 and 2")
 
     agents = cfg.get("agents", {})
     if agents and not isinstance(agents, dict):
@@ -1269,7 +1305,7 @@ def build_agent_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
     toolsets = target.get("toolsets") or []
     if toolsets:
         cmd += ["--toolsets", ",".join(map(str, toolsets))]
-    if target.get("ignore_rules", True):
+    if target.get("ignore_rules", False) and target.get("allow_ignore_rules", False):
         cmd.append("--ignore-rules")
     if target.get("ignore_user_config", False):
         cmd.append("--ignore-user-config")
@@ -1289,9 +1325,10 @@ def build_agent_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
 def build_http_forward_payload(payload: dict[str, Any], prompt: str, cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     target = cfg.get("target", {})
     policy = capability_policy(cfg, capability)
-    configured_max_tokens = bounded_int(policy.get("max_tokens"), default=1_500, minimum=0)
+    global_max_tokens = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS)
+    configured_max_tokens = bounded_int(policy.get("max_tokens"), default=global_max_tokens, minimum=0, maximum=global_max_tokens)
     if configured_max_tokens <= 0:
-        configured_max_tokens = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1)
+        configured_max_tokens = global_max_tokens
     requested_max_tokens = payload.get("max_tokens")
     max_tokens = configured_max_tokens
     if requested_max_tokens is not None:

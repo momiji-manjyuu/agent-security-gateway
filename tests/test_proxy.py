@@ -175,8 +175,15 @@ class ProxyScannerTests(unittest.TestCase):
     def test_agent_command_can_ignore_rules_when_explicitly_enabled(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
         cfg["target"]["ignore_rules"] = True
+        cfg["target"]["allow_ignore_rules"] = True
         cmd = proxy.build_agent_command("hello", cfg)
         self.assertIn("--ignore-rules", cmd)
+
+    def test_agent_command_does_not_ignore_rules_without_acknowledgement(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["target"]["ignore_rules"] = True
+        cmd = proxy.build_agent_command("hello", cfg)
+        self.assertNotIn("--ignore-rules", cmd)
 
     def test_http_forward_payload_rebuilds_from_allowlist(self):
         payload = {
@@ -198,6 +205,14 @@ class ProxyScannerTests(unittest.TestCase):
         self.assertNotIn("tool_choice", body)
         self.assertNotIn("response_format", body)
         self.assertNotIn("metadata", body)
+
+    def test_http_forward_payload_respects_global_token_ceiling(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["target"]["http_max_tokens"] = 256
+        cfg["capabilities"]["public_readonly_search"]["max_tokens"] = 512
+        payload = {"messages": [{"role": "user", "content": "normal request"}], "max_tokens": 10_000}
+        body = proxy.build_http_forward_payload(payload, "wrapped prompt", cfg, "public_readonly_search")
+        self.assertEqual(body["max_tokens"], 256)
 
     def test_http_forward_payload_uses_configured_backend_tools_only(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
@@ -396,11 +411,36 @@ class ProxyScannerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             proxy.validate_config(cfg)
 
+    def test_validate_config_rejects_non_object_target(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["target"] = "not-an-object"
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
     def test_validate_config_rejects_invalid_url_policy(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
         cfg["capabilities"]["public_readonly_search"]["output_url_policy"] = "unknown"
         with self.assertRaises(ValueError):
             proxy.validate_config(cfg)
+
+    def test_validate_config_rejects_unacknowledged_ignore_rules(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["target"]["ignore_rules"] = True
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
+    def test_validate_config_rejects_excessive_max_tokens(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["target"]["http_max_tokens"] = 512
+        cfg["capabilities"]["public_readonly_search"]["max_tokens"] = 1024
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
+    def test_config_schema_is_valid_json(self):
+        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "config.schema.json"
+        data = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["title"], "Agent Security Proxy config")
+        self.assertIn("properties", data)
 
 
 class ProxyHTTPTests(unittest.TestCase):

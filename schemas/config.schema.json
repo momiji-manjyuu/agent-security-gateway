@@ -1,0 +1,411 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/agent-security-proxy/config.schema.json",
+  "title": "Agent Security Proxy config",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "bind": {
+      "type": "string",
+      "default": "127.0.0.1"
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 8787
+    },
+    "allow_public_bind": {
+      "type": "boolean",
+      "default": false
+    },
+    "allow_unauthenticated_localhost": {
+      "type": "boolean",
+      "default": false
+    },
+    "max_body_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "block_risk_score": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "review_risk_score": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "kill_switch_file": {
+      "type": "string"
+    },
+    "audit_log": {
+      "type": "string"
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/agent"
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/capability"
+      }
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "output_guard": {
+      "$ref": "#/$defs/output_guard"
+    },
+    "rate_limit": {
+      "$ref": "#/$defs/rate_limit"
+    },
+    "llm_inspector": {
+      "$ref": "#/$defs/llm_inspector"
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include_structured_extract": {
+          "type": "boolean"
+        },
+        "include_findings": {
+          "type": "boolean"
+        }
+      }
+    },
+    "normalize": {
+      "$ref": "#/$defs/normalization"
+    },
+    "structured_extract": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_claims": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_recommendations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_suspicious_instructions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_urls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_excerpt_chars": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "review_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block_forward": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "agent": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "token_sha256",
+        "allowed_capabilities"
+      ],
+      "properties": {
+        "token_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "trust_tier": {
+          "type": "string"
+        },
+        "allowed_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_client_cidrs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_forward_on_review": {
+          "type": "boolean"
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "backend_tools": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "tool_choice": {},
+        "allowed_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_external_write": {
+          "type": "boolean"
+        },
+        "allow_local_files": {
+          "type": "boolean"
+        },
+        "allow_response_format": {
+          "type": "boolean"
+        },
+        "allowed_response_format_types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8192
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "http_model": {
+          "type": "string"
+        },
+        "output_url_policy": {
+          "enum": [
+            "no_query_no_fragment",
+            "public_web",
+            "block_all"
+          ]
+        },
+        "requires_review_above_risk": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "mode": {
+          "enum": [
+            "command",
+            "http"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "agent_bin": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "max_turns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "toolsets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ignore_rules": {
+          "type": "boolean"
+        },
+        "allow_ignore_rules": {
+          "type": "boolean"
+        },
+        "ignore_user_config": {
+          "type": "boolean"
+        },
+        "checkpoints": {
+          "type": "boolean"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        },
+        "http_base_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "http_model": {
+          "type": "string"
+        },
+        "http_max_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "http_api_key_env": {
+          "type": "string"
+        },
+        "forward_raw_content": {
+          "type": "boolean"
+        }
+      }
+    },
+    "output_guard": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "output_url_policy": {
+          "enum": [
+            "no_query_no_fragment",
+            "public_web",
+            "block_all"
+          ]
+        },
+        "allowed_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "block_risk_score": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "review_risk_score": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "block_on_review": {
+          "type": "boolean"
+        },
+        "shortener_hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "window_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "capability_overrides": {
+          "type": "object"
+        }
+      }
+    },
+    "llm_inspector": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "api_key_env": {
+          "type": "string"
+        },
+        "require_api_key": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        },
+        "fail_closed": {
+          "type": "boolean"
+        },
+        "max_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "block_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "normalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unicode_nfkc": {
+          "type": "boolean"
+        },
+        "strip_format_chars": {
+          "type": "boolean"
+        },
+        "strip_control_chars": {
+          "type": "boolean"
+        },
+        "strip_html_comments": {
+          "type": "boolean"
+        },
+        "max_content_chars": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

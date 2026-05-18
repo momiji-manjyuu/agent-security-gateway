@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m py_compile proxy.py tests/test_proxy.py scripts/init_runtime_config.py scripts/smoke_test.py scripts/eval_redteam.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+      - name: Red-team corpus
+        run: python scripts/eval_redteam.py
+      - name: Validate example config
+        run: python proxy.py --config config.example.json validate-config
