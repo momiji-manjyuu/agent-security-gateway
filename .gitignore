@@ -4,6 +4,10 @@ __pycache__/
 
 .DS_Store
 
+.env
+.env.*
+!.env.example
+
 # Runtime state lives outside the project, but keep these out if copied here.
 .agent-security-proxy/
 tokens/
