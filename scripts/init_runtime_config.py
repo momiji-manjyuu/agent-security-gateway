@@ -49,7 +49,7 @@ def build_config(args: argparse.Namespace, codex_token: str, external_token: str
         {
             "dry_run": not args.enable_forward,
             "mode": "command",
-            "hermes_bin": args.hermes_bin,
+            "agent_bin": args.agent_bin,
             "source": "agent-security-proxy",
             "toolsets": [],
             "ignore_rules": True,
@@ -83,7 +83,8 @@ def main() -> int:
     parser.add_argument("--external-cidr", action="append", default=[])
     parser.add_argument("--enable-forward", action="store_true")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--hermes-bin", default=str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"))
+    parser.add_argument("--agent-bin", default="agent")
+    parser.add_argument("--hermes-bin", dest="agent_bin", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     args.runtime_dir.mkdir(parents=True, exist_ok=True)

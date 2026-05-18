@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Agent security proxy.
 
-Standalone, dependency-light gateway for untrusted agent traffic.  It is
-designed to sit in front of Hermes and keep the hard security decisions outside
-Hermes' frequently updated codebase.
+Standalone, dependency-light gateway for untrusted agent traffic. It is
+designed to sit in front of a backend AI agent runtime and keep the hard
+security decisions outside the frequently updated agent codebase.
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "target": {
         "mode": "command",
         "dry_run": True,
-        "hermes_bin": str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"),
+        "agent_bin": "agent",
         "source": "agent-security-proxy",
         "max_turns": 2,
         "toolsets": [],
@@ -124,7 +124,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "checkpoints": True,
         "timeout_seconds": 180,
         "http_base_url": "http://127.0.0.1:8642/v1",
-        "http_api_key_env": "HERMES_API_SERVER_KEY",
+        "http_api_key_env": "BACKEND_AGENT_API_KEY",
         "forward_raw_content": False,
     },
     "structured_extract": {
@@ -388,7 +388,7 @@ def content_to_text(content: Any) -> str:
 
 
 def get_capability(headers: http.client.HTTPMessage, payload: dict[str, Any]) -> str:
-    header_value = headers.get("X-Hermes-Capability")
+    header_value = headers.get("X-Agent-Capability") or headers.get("X-Hermes-Capability")
     if header_value:
         return header_value.strip()
     metadata = payload.get("metadata")
@@ -929,7 +929,7 @@ def build_structured_extract(scan: ScanResult, cfg: dict[str, Any]) -> dict[str,
     }
 
 
-def wrap_for_hermes(
+def wrap_for_backend_agent(
     *,
     agent_id: str,
     agent: dict[str, Any],
@@ -967,11 +967,11 @@ def wrap_for_hermes(
     return prompt
 
 
-def forward_to_hermes_command(prompt: str, cfg: dict[str, Any]) -> str:
+def forward_to_agent_command(prompt: str, cfg: dict[str, Any]) -> str:
     target = cfg.get("target", {})
     if target.get("dry_run", True):
-        return "DRY_RUN: request accepted by Agent Security Proxy but not forwarded to Hermes."
-    cmd = build_hermes_command(prompt, cfg)
+        return "DRY_RUN: request accepted by Agent Security Proxy but not forwarded to the backend AI agent."
+    cmd = build_agent_command(prompt, cfg)
     proc = subprocess.run(
         cmd,
         check=False,
@@ -980,13 +980,14 @@ def forward_to_hermes_command(prompt: str, cfg: dict[str, Any]) -> str:
         timeout=float(target.get("timeout_seconds", 180)),
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"Hermes command failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        raise RuntimeError(f"Backend AI agent command failed: {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout.strip()
 
 
-def build_hermes_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
+def build_agent_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
     target = cfg.get("target", {})
-    cmd = [str(target.get("hermes_bin")), "chat", "-Q"]
+    agent_bin = target.get("agent_bin") or target.get("hermes_bin") or "agent"
+    cmd = [str(agent_bin), "chat", "-Q"]
     toolsets = target.get("toolsets") or []
     if toolsets:
         cmd += ["--toolsets", ",".join(map(str, toolsets))]
@@ -1007,10 +1008,10 @@ def build_hermes_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
     return cmd
 
 
-def forward_to_hermes_http(payload: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def forward_to_agent_http(payload: dict[str, Any], prompt: str, cfg: dict[str, Any]) -> dict[str, Any]:
     target = cfg.get("target", {})
     if target.get("dry_run", True):
-        return openai_response("DRY_RUN: request accepted by Agent Security Proxy but not forwarded to Hermes.", payload)
+        return openai_response("DRY_RUN: request accepted by Agent Security Proxy but not forwarded to the backend AI agent.", payload)
     body_payload = dict(payload)
     body_payload["messages"] = [{"role": "user", "content": prompt}]
     api_key = os.environ.get(str(target.get("http_api_key_env", "")), "")
@@ -1184,7 +1185,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.write_json(200, {"request_id": request_id, "scan": inbound.scan.public_dict(), "structured_extract": inbound.structured_extract})
             return
 
-        prompt = wrap_for_hermes(
+        prompt = wrap_for_backend_agent(
             agent_id=agent_id,
             agent=agent,
             capability=capability,
@@ -1196,14 +1197,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         audit.write({"event": "allow", "decision": "forward", **audit_base})
         target_mode = str(cfg.get("target", {}).get("mode", "command"))
         if target_mode == "http":
-            upstream = forward_to_hermes_http(payload, prompt, cfg)
+            upstream = forward_to_agent_http(payload, prompt, cfg)
             output_scan = output_guard_scan_for_upstream(upstream, cfg)
             if output_guard_blocks(output_scan, cfg):
                 self.write_output_guard_block(audit, request_id, verified, output_scan, cfg)
                 return
             self.write_json(200, upstream)
         elif target_mode == "command":
-            content = forward_to_hermes_command(prompt, cfg)
+            content = forward_to_agent_command(prompt, cfg)
             output_scan = scan_output_text(content, cfg)
             if output_guard_blocks(output_scan, cfg):
                 self.write_output_guard_block(audit, request_id, verified, output_scan, cfg)
