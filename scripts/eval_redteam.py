@@ -36,8 +36,9 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
 def classify(case: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, proxy.ScanResult]:
     text = str(case.get("text", ""))
     direction = str(case.get("direction", "input"))
+    capability = str(case.get("capability", "public_readonly_search"))
     if direction == "output":
-        scan = proxy.scan_output_text(text, cfg)
+        scan = proxy.scan_output_text(text, cfg, capability)
         if proxy.output_guard_blocks(scan, cfg):
             return "block", scan
         if scan.requires_review:
@@ -72,13 +73,29 @@ def main() -> int:
 
     cfg = proxy.load_config(args.config) if args.config else json.loads(json.dumps(proxy.DEFAULT_CONFIG))
     rows: list[dict[str, Any]] = []
+    counts: dict[str, int] = {
+        "attack_total": 0,
+        "attack_caught": 0,
+        "benign_total": 0,
+        "benign_allowed": 0,
+    }
     for case in load_cases(args.corpus):
         decision, scan = classify(case, cfg)
         expected = str(case.get("expect", "review_or_block"))
+        is_attack = expected in {"review", "block", "review_or_block"}
+        if is_attack:
+            counts["attack_total"] += 1
+            if decision in {"review", "block"}:
+                counts["attack_caught"] += 1
+        else:
+            counts["benign_total"] += 1
+            if decision == "allow":
+                counts["benign_allowed"] += 1
         rows.append(
             {
                 "id": case["id"],
                 "direction": case.get("direction", "input"),
+                "capability": case.get("capability", "public_readonly_search"),
                 "expect": expected,
                 "decision": decision,
                 "ok": expectation_met(decision, expected),
@@ -89,16 +106,26 @@ def main() -> int:
 
     passed = sum(1 for row in rows if row["ok"])
     failed = len(rows) - passed
+    metrics = {
+        "attack_catch_rate": (counts["attack_caught"] / counts["attack_total"]) if counts["attack_total"] else None,
+        "benign_allow_rate": (counts["benign_allowed"] / counts["benign_total"]) if counts["benign_total"] else None,
+        **counts,
+    }
     if args.json:
-        print(json.dumps({"passed": passed, "failed": failed, "cases": rows}, ensure_ascii=False, indent=2))
+        print(json.dumps({"passed": passed, "failed": failed, "metrics": metrics, "cases": rows}, ensure_ascii=False, indent=2))
     else:
         print(f"redteam corpus: {passed}/{len(rows)} passed")
+        if metrics["attack_catch_rate"] is not None:
+            print(f"attack catch rate: {metrics['attack_caught']}/{metrics['attack_total']} = {metrics['attack_catch_rate']:.2%}")
+        if metrics["benign_allow_rate"] is not None:
+            print(f"benign allow rate: {metrics['benign_allowed']}/{metrics['benign_total']} = {metrics['benign_allow_rate']:.2%}")
         for row in rows:
             status = "ok" if row["ok"] else "FAIL"
             findings = ",".join(row["findings"]) or "-"
             print(
                 f"{status:4} {row['id']:24} direction={row['direction']:6} "
-                f"expect={row['expect']:15} decision={row['decision']:6} score={row['risk_score']:3} findings={findings}"
+                f"capability={row['capability']:22} expect={row['expect']:15} "
+                f"decision={row['decision']:6} score={row['risk_score']:3} findings={findings}"
             )
     return 0 if failed == 0 else 1
 

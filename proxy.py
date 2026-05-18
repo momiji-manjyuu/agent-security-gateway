@@ -36,6 +36,8 @@ from typing import Any
 
 APP_NAME = "agent-security-proxy"
 DEFAULT_CONFIG_PATH = Path.home() / ".agent-security-proxy" / "config.json"
+OUTPUT_URL_POLICIES = {"no_query_no_fragment", "public_web", "block_all"}
+REQUEST_CONTROL_FIELDS = ("tools", "tool_choice", "response_format", "metadata")
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -73,6 +75,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "allow_external_write": False,
             "allow_local_files": False,
             "max_tokens": 1_200,
+            "output_url_policy": "public_web",
         },
         "submit_result": {
             "allowed_tools": [],
@@ -100,6 +103,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "output_guard": {
         "enabled": True,
+        "output_url_policy": "no_query_no_fragment",
+        "allowed_domains": [],
         "block_risk_score": 8,
         "review_risk_score": 4,
         "block_on_review": True,
@@ -178,8 +183,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 PROMPT_INJECTION_PATTERNS: list[tuple[str, str, int]] = [
-    ("ignore_previous_short", r"\b(ignore|disregard|forget)\b.{0,40}\b(previous|above|prior)\b.{0,40}\b(instructions?|rules?|prompt)?\b", 5),
-    ("override_instructions", r"\b(ignore|disregard|forget)\b.{0,80}\b(previous|above|prior|system|developer)\b.{0,80}\b(instruction|prompt|message|rules?)\b", 5),
+    ("ignore_previous_short", r"\b(ignore|disregard|forget)\b.{0,40}\b(previous|above|prior|earlier)\b.{0,40}\b(instructions?|rules?|prompt)?\b", 5),
+    ("override_instructions", r"\b(ignore|disregard|forget)\b.{0,80}\b(previous|above|prior|earlier|system|developer)\b.{0,80}\b(instruction|prompt|message|rules?)\b", 5),
     ("role_reassignment", r"\b(you are now|from now on|act as|developer mode|system prompt|new instructions?)\b", 4),
     ("secret_exfiltration", r"\b(send|forward|upload|exfiltrate|paste|print|show|reveal|dump|disclose|leak|share)\b.{0,120}\b(api[-_ ]?key|token|cookie|ssh key|private key|\.env|auth\.json|secret|credential|password)\b", 8),
     ("local_secret_file_request", r"\b(show|reveal|dump|print|read|open|send|upload)\b.{0,80}(?:\.env|auth\.json|id_rsa|known_hosts|credentials?|secrets?)", 8),
@@ -222,6 +227,10 @@ RECOMMENDATION_MARKERS = re.compile(
     r"\b(should|must|recommend|recommended|mitigate|defense|defence|guardrail|allowlist|sandbox|quarantine|least privilege|human[- ]in[- ]the[- ]loop)\b"
     r"|(?:べき|推奨|対策|防御|隔離|最小権限|承認|監査|検証)",
     re.IGNORECASE,
+)
+SENSITIVE_QUERY_PATTERN = re.compile(
+    r"(?i)(?:^|[&;])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|credential|auth|data)="
+    r"|=(?:[^&;]{0,32})?(?:secret|token|credential|password)",
 )
 
 
@@ -299,6 +308,7 @@ def load_config(path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as fh:
             user_cfg = json.load(fh)
         deep_update(cfg, user_cfg)
+    validate_config(cfg)
     return cfg
 
 
@@ -402,7 +412,18 @@ def extract_content(payload: Any) -> str:
         chunks.append(content_to_text(payload.get("input")))
     else:
         chunks.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    chunks.extend(extract_request_control_fields(payload))
     return "\n".join(chunks)
+
+
+def extract_request_control_fields(payload: dict[str, Any]) -> list[str]:
+    chunks: list[str] = []
+    for field in REQUEST_CONTROL_FIELDS:
+        if field not in payload:
+            continue
+        chunks.append(f"[request_control:{field}]")
+        chunks.append(json.dumps(payload[field], ensure_ascii=False, sort_keys=True))
+    return chunks
 
 
 def content_to_text(content: Any) -> str:
@@ -421,6 +442,7 @@ def content_to_text(content: Any) -> str:
                     url = item.get("image_url", {}).get("url", "")
                     if url:
                         parts.append("image_url_sha256=" + sha256_text(str(url)))
+                        parts.append("image_url_report=" + json.dumps(sanitize_url_for_report(str(url)), ensure_ascii=False, sort_keys=True))
                 else:
                     parts.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
             else:
@@ -516,6 +538,73 @@ def bounded_float(value: Any, *, default: float, minimum: float, maximum: float)
     return max(minimum, min(maximum, number))
 
 
+def validate_config(cfg: dict[str, Any]) -> None:
+    errors: list[str] = []
+    bind = str(cfg.get("bind", ""))
+    if bind in {"0.0.0.0", "::"} and not bool(cfg.get("allow_public_bind", False)):
+        errors.append("bind uses a wildcard address; set allow_public_bind=true only if a TLS/VPN boundary is in front")
+
+    target = cfg.get("target", {})
+    if not isinstance(target, dict):
+        errors.append("target must be an object")
+    else:
+        mode = str(target.get("mode", "command"))
+        if mode not in {"command", "http"}:
+            errors.append("target.mode must be 'command' or 'http'")
+        if mode == "http":
+            base_url = str(target.get("http_base_url", ""))
+            parsed = urllib.parse.urlsplit(base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                errors.append("target.http_base_url must be an absolute http(s) URL")
+
+    capabilities = cfg.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        errors.append("capabilities must be an object")
+    else:
+        for name, policy in capabilities.items():
+            if not isinstance(policy, dict):
+                errors.append(f"capabilities.{name} must be an object")
+                continue
+            output_policy = str(policy.get("output_url_policy", cfg.get("output_guard", {}).get("output_url_policy", "no_query_no_fragment")))
+            if output_policy not in OUTPUT_URL_POLICIES:
+                errors.append(f"capabilities.{name}.output_url_policy must be one of {sorted(OUTPUT_URL_POLICIES)}")
+            for list_field in ("allowed_tools", "allowed_domains", "backend_tools"):
+                if list_field in policy and not isinstance(policy[list_field], list):
+                    errors.append(f"capabilities.{name}.{list_field} must be an array")
+            if "max_tokens" in policy and bounded_int(policy.get("max_tokens"), default=-1, minimum=-1) < 0:
+                errors.append(f"capabilities.{name}.max_tokens must be >= 0")
+            if "temperature" in policy:
+                bounded_float(policy.get("temperature"), default=-1.0, minimum=-1.0, maximum=3.0)
+
+    agents = cfg.get("agents", {})
+    if agents and not isinstance(agents, dict):
+        errors.append("agents must be an object")
+    elif isinstance(agents, dict):
+        for agent_id, agent in agents.items():
+            if not isinstance(agent, dict):
+                errors.append(f"agents.{agent_id} must be an object")
+                continue
+            token_hash = str(agent.get("token_sha256", ""))
+            if token_hash and not re.fullmatch(r"[a-fA-F0-9]{64}", token_hash):
+                errors.append(f"agents.{agent_id}.token_sha256 must be a 64-character SHA-256 hex digest")
+            for cidr in agent.get("allowed_client_cidrs") or []:
+                try:
+                    ipaddress.ip_network(str(cidr), strict=False)
+                except ValueError:
+                    errors.append(f"agents.{agent_id}.allowed_client_cidrs contains invalid CIDR: {cidr}")
+
+    guard = cfg.get("output_guard", {})
+    if isinstance(guard, dict):
+        output_policy = str(guard.get("output_url_policy", "no_query_no_fragment"))
+        if output_policy not in OUTPUT_URL_POLICIES:
+            errors.append(f"output_guard.output_url_policy must be one of {sorted(OUTPUT_URL_POLICIES)}")
+        if "allowed_domains" in guard and not isinstance(guard.get("allowed_domains"), list):
+            errors.append("output_guard.allowed_domains must be an array")
+
+    if errors:
+        raise ValueError("invalid config: " + "; ".join(errors))
+
+
 def forward_requires_review(agent: dict[str, Any], cfg: dict[str, Any], scan: ScanResult, capability: str) -> bool:
     policy = capability_policy(cfg, capability)
     threshold = policy.get("requires_review_above_risk")
@@ -564,6 +653,53 @@ class AuditLogger:
         if not existed:
             os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
         return event
+
+
+def verify_audit_log(path: Path) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    previous_hash = "0" * 64
+    events = 0
+    if not path.exists():
+        return {"ok": True, "events": 0, "errors": []}
+
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line_number, line in enumerate(fh, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            events += 1
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                errors.append({"line": line_number, "error": "invalid_json", "detail": str(exc)})
+                continue
+
+            event_hash = str(event.get("event_hash", ""))
+            prev_hash = str(event.get("prev_hash", ""))
+            if prev_hash != previous_hash:
+                errors.append(
+                    {
+                        "line": line_number,
+                        "error": "prev_hash_mismatch",
+                        "expected": previous_hash,
+                        "actual": prev_hash,
+                    }
+                )
+            canonical_event = dict(event)
+            canonical_event.pop("event_hash", None)
+            canonical = json.dumps(canonical_event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            expected_hash = sha256_text(canonical)
+            if event_hash != expected_hash:
+                errors.append(
+                    {
+                        "line": line_number,
+                        "error": "event_hash_mismatch",
+                        "expected": expected_hash,
+                        "actual": event_hash,
+                    }
+                )
+            previous_hash = event_hash or expected_hash
+    return {"ok": not errors, "events": events, "errors": errors}
 
 
 class LLMInspector:
@@ -687,7 +823,10 @@ def sentence_candidates(text: str) -> list[str]:
 
 def sanitize_url_for_report(url: str) -> dict[str, str]:
     parsed = urllib.parse.urlsplit(url)
-    safe_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    if parsed.scheme.lower() not in {"http", "https"}:
+        safe_url = f"{parsed.scheme}:[omitted]"
+    else:
+        safe_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return {
         "url": safe_url,
         "host": parsed.netloc,
@@ -734,6 +873,48 @@ def output_normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def output_guard_config_for_capability(cfg: dict[str, Any], capability: str | None) -> dict[str, Any]:
+    merged = json.loads(json.dumps(cfg))
+    guard = merged.setdefault("output_guard", {})
+    policy = capability_policy(cfg, capability) if capability else {}
+    url_policy = str(policy.get("output_url_policy", guard.get("output_url_policy", "no_query_no_fragment")))
+    guard["output_url_policy"] = url_policy
+    if url_policy == "no_query_no_fragment":
+        guard["disallow_url_query"] = True
+        guard["disallow_url_fragment"] = True
+        guard["block_all_urls"] = False
+    elif url_policy == "public_web":
+        guard["disallow_url_query"] = False
+        guard["disallow_url_fragment"] = False
+        guard["block_all_urls"] = False
+    elif url_policy == "block_all":
+        guard["block_all_urls"] = True
+    allowed_domains = policy.get("allowed_domains", guard.get("allowed_domains", []))
+    if isinstance(allowed_domains, list):
+        guard["allowed_domains"] = allowed_domains
+    return merged
+
+
+def host_matches_allowed_domain(host: str, allowed_domain: str) -> bool:
+    host = host.lower().rstrip(".")
+    allowed = allowed_domain.lower().strip().rstrip(".")
+    if not allowed:
+        return False
+    if allowed.startswith("*."):
+        suffix = allowed[2:]
+        return host == suffix or host.endswith("." + suffix)
+    if allowed.startswith("."):
+        suffix = allowed[1:]
+        return host == suffix or host.endswith("." + suffix)
+    return host == allowed
+
+
+def host_allowed_by_policy(host: str, allowed_domains: list[Any]) -> bool:
+    if not allowed_domains:
+        return True
+    return any(host_matches_allowed_domain(host, str(allowed)) for allowed in allowed_domains)
+
+
 def url_policy_findings(url: str, cfg: dict[str, Any], *, category_prefix: str) -> list[Finding]:
     guard = cfg.get("output_guard", {})
     findings: list[Finding] = []
@@ -741,8 +922,15 @@ def url_policy_findings(url: str, cfg: dict[str, Any], *, category_prefix: str) 
     host = parsed.hostname or ""
     host_lower = host.lower()
 
+    if guard.get("block_all_urls", False):
+        findings.append(Finding(f"{category_prefix}:url_blocked", 8, "URL output is disallowed by capability policy"))
+    allowed_domains = guard.get("allowed_domains") or []
+    if isinstance(allowed_domains, list) and host_lower and not host_allowed_by_policy(host_lower, allowed_domains):
+        findings.append(Finding(f"{category_prefix}:domain_not_allowed", 8, "URL host is not allowed by capability policy"))
     if guard.get("disallow_userinfo", True) and ("@" in parsed.netloc.rsplit("]", 1)[-1]):
         findings.append(Finding(f"{category_prefix}:url_userinfo", 8, "URL contains userinfo, which can hide destination or credentials"))
+    if parsed.query and SENSITIVE_QUERY_PATTERN.search(parsed.query):
+        findings.append(Finding(f"{category_prefix}:url_sensitive_query", 8, "URL query string contains sensitive-looking parameters"))
     if guard.get("disallow_url_query", True) and parsed.query:
         findings.append(Finding(f"{category_prefix}:url_query", 8, "URL query string is disallowed on egress"))
     if guard.get("disallow_url_fragment", True) and parsed.fragment:
@@ -775,10 +963,11 @@ def url_policy_findings(url: str, cfg: dict[str, Any], *, category_prefix: str) 
     return findings
 
 
-def scan_output_text(text: str, cfg: dict[str, Any]) -> ScanResult:
-    guard = cfg.get("output_guard", {})
+def scan_output_text(text: str, cfg: dict[str, Any], capability: str | None = None) -> ScanResult:
+    effective_cfg = output_guard_config_for_capability(cfg, capability)
+    guard = effective_cfg.get("output_guard", {})
     if not guard.get("enabled", True):
-        normalized, removed = normalize_untrusted_text(text, cfg)
+        normalized, removed = normalize_untrusted_text(text, effective_cfg)
         return ScanResult(
             original_sha256=sha256_text(text),
             normalized_sha256=sha256_text(normalized),
@@ -790,7 +979,7 @@ def scan_output_text(text: str, cfg: dict[str, Any]) -> ScanResult:
             requires_review=False,
         )
 
-    scan = scan_text(text, output_normalize_config(cfg))
+    scan = scan_text(text, output_normalize_config(effective_cfg))
     findings = list(scan.findings)
     normalized = scan.normalized_text
 
@@ -805,12 +994,12 @@ def scan_output_text(text: str, cfg: dict[str, Any]) -> ScanResult:
         findings.append(Finding("output_dlp:system_disclosure", 8, "internal prompt, config, or traceback reference is disallowed on egress"))
 
     for match in URL_PATTERN.finditer(normalized):
-        findings.extend(url_policy_findings(match.group(0), cfg, category_prefix="output_dlp"))
+        findings.extend(url_policy_findings(match.group(0), effective_cfg, category_prefix="output_dlp"))
 
     scan.findings = findings
     scan.risk_score = sum(f.severity for f in findings)
-    scan.blocked = scan.risk_score >= int(guard.get("block_risk_score", cfg.get("block_risk_score", 8)))
-    scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", cfg.get("review_risk_score", 4)))
+    scan.blocked = scan.risk_score >= int(guard.get("block_risk_score", effective_cfg.get("block_risk_score", 8)))
+    scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", effective_cfg.get("review_risk_score", 4)))
     return scan
 
 
@@ -828,7 +1017,13 @@ def extract_openai_response_text(payload: dict[str, Any]) -> str:
             continue
         message = choice.get("message")
         if isinstance(message, dict):
-            chunks.append(content_to_text(message.get("content")))
+            content_text = content_to_text(message.get("content"))
+            if content_text:
+                chunks.append(content_text)
+            for field in ("tool_calls", "function_call"):
+                if field in message:
+                    chunks.append(f"[backend_control:{field}]")
+                    chunks.append(json.dumps(message[field], ensure_ascii=False, sort_keys=True))
         elif "text" in choice:
             chunks.append(str(choice.get("text", "")))
     if not chunks:
@@ -893,8 +1088,8 @@ def build_audit_base(
     return event
 
 
-def output_guard_scan_for_upstream(upstream: dict[str, Any], cfg: dict[str, Any]) -> ScanResult:
-    return scan_output_text(extract_openai_response_text(upstream), cfg)
+def output_guard_scan_for_upstream(upstream: dict[str, Any], cfg: dict[str, Any], capability: str) -> ScanResult:
+    return scan_output_text(extract_openai_response_text(upstream), cfg, capability)
 
 
 def output_guard_audit_event(
@@ -1318,14 +1513,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         target_mode = str(cfg.get("target", {}).get("mode", "command"))
         if target_mode == "http":
             upstream = forward_to_agent_http(payload, prompt, cfg, capability)
-            output_scan = output_guard_scan_for_upstream(upstream, cfg)
+            output_scan = output_guard_scan_for_upstream(upstream, cfg, capability)
             if output_guard_blocks(output_scan, cfg):
                 self.write_output_guard_block(audit, request_id, verified, output_scan, cfg)
                 return
             self.write_json(200, upstream)
         elif target_mode == "command":
             content = forward_to_agent_command(prompt, cfg)
-            output_scan = scan_output_text(content, cfg)
+            output_scan = scan_output_text(content, cfg, capability)
             if output_guard_blocks(output_scan, cfg):
                 self.write_output_guard_block(audit, request_id, verified, output_scan, cfg)
                 return
@@ -1395,18 +1590,31 @@ def inspect_cli(config_path: Path, text: str) -> None:
     print(json.dumps({"scan": scan.public_dict(), "structured_extract": structured, "normalized_text": scan.normalized_text}, ensure_ascii=False, indent=2))
 
 
+def validate_config_cli(config_path: Path) -> None:
+    cfg = load_config(config_path)
+    print(json.dumps({"ok": True, "config": str(config_path), "bind": cfg.get("bind"), "port": cfg.get("port")}, ensure_ascii=False, sort_keys=True))
+
+
+def verify_audit_cli(path: Path) -> None:
+    result = verify_audit_log(path)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
 def write_example_config(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     example = json.loads(json.dumps(DEFAULT_CONFIG))
+    placeholder_hash = "0" * 64
     example["agents"] = {
         "external-worker-01": {
-            "token_sha256": "replace-with-output-of-proxy-py-hash-token",
+            "token_sha256": placeholder_hash,
             "trust_tier": "external_readonly",
             "allowed_capabilities": ["inspect", "public_readonly_search", "submit_result", "coordination_result"],
             "allowed_client_cidrs": ["192.0.2.0/24", "127.0.0.1/32"],
         },
         "local-agent": {
-            "token_sha256": "replace-with-output-of-proxy-py-hash-token",
+            "token_sha256": placeholder_hash,
             "trust_tier": "local_trusted",
             "allowed_capabilities": ["inspect", "coordination_result", "public_readonly_search", "submit_result"],
             "allowed_client_cidrs": ["127.0.0.1/32"],
@@ -1436,6 +1644,9 @@ def main(argv: list[str] | None = None) -> int:
     p_inspect.add_argument("text")
     p_init = sub.add_parser("init-config")
     p_init.add_argument("--path", type=Path, default=DEFAULT_CONFIG_PATH)
+    sub.add_parser("validate-config")
+    p_verify_audit = sub.add_parser("verify-audit")
+    p_verify_audit.add_argument("--path", type=Path, default=None)
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -1450,6 +1661,11 @@ def main(argv: list[str] | None = None) -> int:
         inspect_cli(args.config, args.text)
     elif args.command == "init-config":
         write_example_config(args.path)
+    elif args.command == "validate-config":
+        validate_config_cli(args.config)
+    elif args.command == "verify-audit":
+        path = args.path or Path(load_config(args.config)["audit_log"])
+        verify_audit_cli(path)
     return 0
 
 

@@ -10,7 +10,7 @@
       "allowed_client_cidrs": [
         "127.0.0.1/32"
       ],
-      "token_sha256": "replace-with-output-of-proxy-py-hash-token",
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "trust_tier": "local_trusted"
     },
     "external-worker-01": {
@@ -24,7 +24,7 @@
         "192.0.2.0/24",
         "127.0.0.1/32"
       ],
-      "token_sha256": "replace-with-output-of-proxy-py-hash-token",
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "trust_tier": "external_readonly"
     }
   },
@@ -63,7 +63,8 @@
       "allow_local_files": false,
       "allowed_domains": [],
       "allowed_tools": [],
-      "max_tokens": 1200
+      "max_tokens": 1200,
+      "output_url_policy": "public_web"
     },
     "submit_result": {
       "allow_external_write": false,
@@ -100,6 +101,7 @@
   },
   "port": 8787,
   "output_guard": {
+    "allowed_domains": [],
     "block_local_paths": true,
     "block_on_review": true,
     "block_risk_score": 8,
@@ -114,6 +116,7 @@
     "flag_punycode_hosts": true,
     "flag_shorteners": true,
     "max_content_chars": 40000,
+    "output_url_policy": "no_query_no_fragment",
     "review_risk_score": 4,
     "shortener_hosts": [
       "bit.ly",
