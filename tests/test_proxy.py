@@ -276,6 +276,13 @@ class ProxyScannerTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             proxy.build_http_forward_payload(payload, "wrapped prompt", proxy.DEFAULT_CONFIG, "inspect")
 
+    def test_http_forward_payload_rejects_human_approval_capability(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["submit_result"]["requires_human_approval"] = True
+        payload = {"messages": [{"role": "user", "content": "normal request"}]}
+        with self.assertRaises(PermissionError):
+            proxy.build_http_forward_payload(payload, "wrapped prompt", cfg, "submit_result")
+
     def test_http_forward_payload_uses_configured_backend_tools_only(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
         cfg["capabilities"]["public_readonly_search"]["allowed_tools"] = ["safe_search"]
@@ -303,12 +310,24 @@ class ProxyScannerTests(unittest.TestCase):
         manifest = proxy.build_backend_policy_manifest(cfg, ["public_readonly_search"])
         self.assertEqual(manifest["capabilities"]["public_readonly_search"]["capability"], "public_readonly_search")
         self.assertFalse(manifest["capabilities"]["public_readonly_search"]["caller_supplied_tools_forwarded"])
+        self.assertIn("manifest_sha256", manifest)
+        self.assertRegex(manifest["capabilities"]["public_readonly_search"]["policy_sha256"], r"^[a-f0-9]{64}$")
         self.assertNotIn("token_sha256", json.dumps(manifest))
 
     def test_backend_policy_manifest_marks_inspect_non_forwardable(self):
         manifest = proxy.build_backend_policy_manifest(proxy.DEFAULT_CONFIG, ["inspect"])
         self.assertFalse(manifest["capabilities"]["inspect"]["allow_forward"])
+        self.assertFalse(manifest["capabilities"]["inspect"]["automated_forward_allowed"])
         self.assertEqual(manifest["capabilities"]["inspect"]["max_tokens"], 0)
+
+    def test_backend_policy_manifest_marks_human_approval_non_automated(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["submit_result"]["requires_human_approval"] = True
+        manifest = proxy.build_backend_policy_manifest(cfg, ["submit_result"])
+        policy = manifest["capabilities"]["submit_result"]
+        self.assertTrue(policy["allow_forward"])
+        self.assertTrue(policy["requires_human_approval"])
+        self.assertFalse(policy["automated_forward_allowed"])
 
     def test_wrap_metadata_includes_effective_capability_policy(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
@@ -684,6 +703,23 @@ class ProxyHTTPTests(unittest.TestCase):
             self.assertEqual(status, 403)
             self.assertEqual(body["error"], "manual_review_required")
             self.assertTrue(body["scan"]["requires_review"])
+
+    def test_http_human_approval_required_blocks_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, token = self.make_config(tmp)
+            cfg["capabilities"]["submit_result"]["requires_human_approval"] = True
+            base_url = self.start_server(cfg)
+            status, body, _ = self.post_json(
+                base_url,
+                "/v1/chat/completions",
+                {"model": "backend-agent", "messages": [{"role": "user", "content": "normal result submission"}]},
+                token=token,
+                capability="submit_result",
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"], "human_approval_required")
+            events = [json.loads(line) for line in Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(events[-1]["reason"], "human_approval_required")
 
     def test_http_rate_limit_returns_429(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -254,6 +254,8 @@ HTTP mode の payload 再構築、review threshold、backend policy manifest に
 
 `allow_forward: false` の capability は `/inspect` 用です。その capability を `POST /v1/chat/completions` で使おうとした場合、proxy は backend へ到達する前に `capability_forward_disabled` として拒否します。既定の `inspect` capability は `allow_forward: false` かつ `max_tokens: 0` です。
 
+`requires_human_approval: true` の capability は自動 forward されません。API は見かけ上通常の OpenAI 互換 endpoint のままにし、追加の承認 token は受け付けず、`human_approval_required` として停止します。実際の承認フローが必要な場合は、reverse proxy、backend runtime、または運用手順側で trusted channel を用意してください。
+
 HTTP mode で `tools` を backend へ渡す必要がある場合は、呼び出し元 payload からコピーせず、proxy config の `backend_tools` と `tool_choice` に定義してください。`backend_tools` を設定する場合、その tool name は同じ capability の `allowed_tools` に明示されている必要があります。write-capable らしい tool を許可する場合は、`allow_external_write: true` と `requires_human_approval: true` を明示してください。
 
 `output_url_policy` は backend 応答に含まれる URL の扱いを capability ごとに変えます。
@@ -269,7 +271,7 @@ python3 proxy.py --config ~/.agent-security-proxy/config.json export-backend-pol
 python3 proxy.py --config ~/.agent-security-proxy/config.json export-backend-policy --capability public_readonly_search
 ```
 
-backend へ渡す prompt metadata にも、該当 capability の effective policy が含まれます。これは backend 側の強制境界そのものではありませんが、backend runtime が tool/network/filesystem の制約を確認するための機械可読な契約になります。
+manifest には capability ごとの `policy_sha256` と全体の `manifest_sha256` が入ります。backend へ渡す prompt metadata にも、該当 capability の effective policy が含まれます。これは backend 側の強制境界そのものではありませんが、backend runtime が tool/network/filesystem の制約を確認するための機械可読な契約になります。
 
 `allowed_domains` を指定すると、backend 応答に含まれる URL host も capability ごとに制限できます。`example.com` は完全一致、`*.example.com` または `.example.com` はサブドメインも許可します。
 
@@ -312,7 +314,9 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 
 - `401 unauthorized`: bearer token が無い、または token hash が一致しない
 - `403 capability_denied`: agent に capability が許可されていない
+- `403 capability_forward_disabled`: `/inspect` 用など forward 不可の capability が chat endpoint で使われた
 - `403 blocked_by_security_proxy`: deterministic scanner が block
+- `403 human_approval_required`: capability policy が人間の承認なしの自動 forward を禁止
 - `403 manual_review_required`: 中リスクで review gate が block
 - `403 blocked_by_output_guard`: backend 応答を output guard が block
 - `429 rate_limited`: IP、agent、または capability rate limit

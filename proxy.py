@@ -646,9 +646,12 @@ def capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
 
 def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     policy = capability_policy(cfg, capability)
-    return {
+    allow_forward = bool(policy.get("allow_forward", True))
+    requires_human_approval = bool(policy.get("requires_human_approval", False))
+    result = {
         "capability": capability,
-        "allow_forward": bool(policy.get("allow_forward", True)),
+        "allow_forward": allow_forward,
+        "automated_forward_allowed": allow_forward and not requires_human_approval,
         "allowed_tools": [str(item) for item in policy.get("allowed_tools") or []],
         "backend_tool_names": backend_tool_names(policy),
         "allowed_domains": [str(item) for item in policy.get("allowed_domains") or []],
@@ -662,11 +665,13 @@ def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str,
             policy.get("output_url_policy", cfg.get("output_guard", {}).get("output_url_policy", "no_query_no_fragment"))
         ),
         "requires_review_above_risk": policy.get("requires_review_above_risk"),
-        "requires_human_approval": bool(policy.get("requires_human_approval", False)),
+        "requires_human_approval": requires_human_approval,
         "caller_supplied_tools_forwarded": False,
         "caller_supplied_stream_forwarded": False,
         "caller_supplied_model_forwarded": False,
     }
+    result["policy_sha256"] = sha256_text(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    return result
 
 
 def capability_allows_forward(cfg: dict[str, Any], capability: str) -> bool:
@@ -674,6 +679,10 @@ def capability_allows_forward(cfg: dict[str, Any], capability: str) -> bool:
     if "allow_forward" in policy:
         return bool(policy.get("allow_forward"))
     return bounded_int(policy.get("max_tokens"), default=1, minimum=0, maximum=MAX_HTTP_MAX_TOKENS) > 0
+
+
+def capability_requires_human_approval(cfg: dict[str, Any], capability: str) -> bool:
+    return bool(capability_policy(cfg, capability).get("requires_human_approval", False))
 
 
 def build_backend_policy_manifest(cfg: dict[str, Any], capabilities: list[str] | None = None) -> dict[str, Any]:
@@ -689,7 +698,7 @@ def build_backend_policy_manifest(cfg: dict[str, Any], capabilities: list[str] |
             "allowed_capabilities": [str(item) for item in agent.get("allowed_capabilities") or []],
             "allowed_client_cidrs": [str(item) for item in agent.get("allowed_client_cidrs") or []],
         }
-    return {
+    manifest = {
         "schema_version": 1,
         "service": APP_NAME,
         "target": {
@@ -701,6 +710,8 @@ def build_backend_policy_manifest(cfg: dict[str, Any], capabilities: list[str] |
         "agents": agents,
         "capabilities": {name: backend_capability_policy(cfg, name) for name in capability_names},
     }
+    manifest["manifest_sha256"] = sha256_text(json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    return manifest
 
 
 def bounded_int(value: Any, *, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -1544,6 +1555,8 @@ def build_http_forward_payload(payload: dict[str, Any], prompt: str, cfg: dict[s
     policy = capability_policy(cfg, capability)
     if not capability_allows_forward(cfg, capability):
         raise PermissionError(f"capability '{capability}' is not allowed to forward")
+    if capability_requires_human_approval(cfg, capability):
+        raise PermissionError(f"capability '{capability}' requires human approval")
     global_max_tokens = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS)
     configured_max_tokens = bounded_int(policy.get("max_tokens"), default=global_max_tokens, minimum=0, maximum=global_max_tokens)
     if configured_max_tokens <= 0:
@@ -1759,6 +1772,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if inbound.scan.blocked:
             audit.write({"event": "deny", "reason": "scan_block", **audit_base})
             self.write_json(403, {"error": "blocked_by_security_proxy", "request_id": request_id, "scan": inbound.scan.public_dict()})
+            return
+
+        if forward and capability_requires_human_approval(cfg, capability):
+            audit.write({"event": "review_required", "reason": "human_approval_required", **audit_base})
+            self.write_json(403, {"error": "human_approval_required", "request_id": request_id, "scan": inbound.scan.public_dict()})
             return
 
         if forward and forward_requires_review(agent, cfg, inbound.scan, capability):
