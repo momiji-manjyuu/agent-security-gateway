@@ -5,6 +5,7 @@
 - Added response_format schema-content linting for long descriptions and suspicious instruction-like text.
 - Added Windows `msvcrt.locking` audit file-lock fallback and documented file-lock limits.
 - Expanded GitHub Actions CI to Python 3.10, 3.11, and 3.12.
+- Fixed timestamp generation on Python 3.10.
 
 ## [0.1.0] - 2026-05-19
 

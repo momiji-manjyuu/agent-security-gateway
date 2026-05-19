@@ -397,7 +397,7 @@ def hash_token(token: str) -> str:
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def normalize_untrusted_text(text: str, cfg: dict[str, Any]) -> tuple[str, dict[str, int]]:
