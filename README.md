@@ -1,10 +1,17 @@
 # Agent Security Proxy
 
+[![CI](https://github.com/momiji-manjyuu/agent-security-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/momiji-manjyuu/agent-security-proxy/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![Release](https://img.shields.io/github/v/tag/momiji-manjyuu/agent-security-proxy?label=release&sort=semver)](https://github.com/momiji-manjyuu/agent-security-proxy/tags)
+
 Agent Security Proxy は、外部エージェントや子エージェントから届く入力を、連携先の AI エージェント実行環境へ渡す前に検査する軽量なゼロトラスト入口 proxy です。
 
 連携先の AI エージェント本体は頻繁に更新されることがあります。このプロキシは本体のソースツリー外に置き、入力検査、権限境界、監査ログ、出力検査を独立した層として維持するためのものです。
 
 このプロジェクトの中心は「プロンプトインジェクションを完全に検知して防ぐこと」ではなく、プロンプトインジェクションが通る前提でも被害範囲を小さくすることです。本物の API key や高権限 tool を外部 worker に渡さず、検査済みの構造化データだけを backend agent に渡す least-privilege gateway として使う想定です。
+
+> **何をしないか:** prompt injection の完全防止、backend sandbox、TLS/VPN、secret 管理、append-only storage は提供しません。危険な tool、credential、network egress は backend 側と運用側でも分離してください。
 
 ## 何を守るか
 
@@ -71,6 +78,18 @@ backend AI agent runtime は proxy より高権限になり得る前提です。
 - 任意の OpenAI 互換ローカル LLM inspector
 
 ## 全体像
+
+推奨構成は、外部 worker と backend runtime の間に proxy を置き、公開範囲を LAN/VPN/TLS 境界の内側へ閉じる形です。
+
+```mermaid
+flowchart LR
+    W["外部/子エージェント"] --> N["LAN / VPN / TLS boundary"]
+    N --> P["Agent Security Proxy\nAPI key concealment\ncapability gate\ninput/output guard"]
+    P --> B["Backend AI agent runtime\nsandboxed tools\nlimited egress"]
+    P --> A["Audit log\nhash chain + write lock"]
+```
+
+![Architecture diagram](docs/architecture.svg)
 
 ```text
 external/child agent

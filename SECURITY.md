@@ -13,9 +13,12 @@ If advisories are unavailable, open a minimal issue that says a private security
 Useful reports include:
 
 - bypasses that allow caller-controlled `tools`, `tool_choice`, `stream`, or other unsafe OpenAI-compatible fields to reach the backend;
+- bypasses that allow inspect-only or non-forward capabilities to forward requests;
+- validation gaps where undefined capabilities, malformed capability policy, or caller-supplied `response_format` can weaken enforcement;
 - prompt-injection patterns that should be blocked or reviewed but are currently allowed;
 - output guard bypasses for credentials, local paths, private hosts, or sensitive URL query strings;
 - audit hash-chain verification failures;
+- audit write-lock failures that can corrupt concurrent hash-chain writes;
 - configuration validation gaps that make an unsafe deployment easy.
 
 Out of scope:
@@ -26,4 +29,10 @@ Out of scope:
 
 ## Supported Versions
 
-The public `main` branch is the only supported version until tagged releases exist.
+| Version | Supported |
+| --- | --- |
+| `v0.1.x` | Yes |
+| `main` | Best-effort development branch |
+| `< v0.1.0` | No |
+
+Security fixes will normally land on `main` first and then be included in the next tagged release.
