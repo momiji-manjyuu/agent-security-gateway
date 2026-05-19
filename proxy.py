@@ -38,14 +38,40 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback keeps thread safety.
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms.
+    msvcrt = None
+
 
 APP_NAME = "agent-security-proxy"
 DEFAULT_CONFIG_PATH = Path.home() / ".agent-security-proxy" / "config.json"
 OUTPUT_URL_POLICIES = {"no_query_no_fragment", "public_web", "block_all"}
 RESPONSE_FORMAT_TYPES = {"text", "json_object", "json_schema"}
+MAX_RESPONSE_FORMAT_DESCRIPTION_CHARS = 512
+MAX_RESPONSE_FORMAT_SCHEMA_DEPTH = 64
+AUDIT_LOCK_BYTES = 1
 WRITE_TOOL_PATTERN = re.compile(
     r"\b(write|create|update|delete|remove|upload|send|post|publish|commit|merge|push|email|dm|notify|exfiltrate)\b",
     re.IGNORECASE,
+)
+RESPONSE_FORMAT_SUSPICIOUS_TEXT_PATTERNS = (
+    (
+        "ignore_instructions",
+        re.compile(r"\bignore\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+instructions?\b", re.IGNORECASE),
+    ),
+    (
+        "role_reassignment",
+        re.compile(r"\b(?:act\s+as|you\s+are\s+now|developer\s+mode|system\s+prompt|hidden\s+prompt)\b", re.IGNORECASE),
+    ),
+    (
+        "secret_exfiltration",
+        re.compile(r"\b(?:reveal|show|print|dump|exfiltrate|upload|send)\b.{0,80}\b(?:secret|credential|api[_ -]?key|token|password)\b", re.IGNORECASE),
+    ),
+    (
+        "policy_bypass",
+        re.compile(r"\b(?:bypass|disable|turn\s+off|override)\b.{0,80}\b(?:security|policy|guard|audit|logging|sandbox|restriction)\b", re.IGNORECASE),
+    ),
 )
 REQUEST_CONTROL_FIELDS = (
     "tools",
@@ -795,8 +821,55 @@ def fixed_response_format_errors(response_format: dict[str, Any], prefix: str) -
             errors.append(f"{prefix}.json_schema.name must be a non-empty string")
         if not isinstance(schema_config.get("schema"), dict):
             errors.append(f"{prefix}.json_schema.schema must be an object")
+        else:
+            errors.extend(response_format_schema_lint_errors(schema_config, f"{prefix}.json_schema"))
         if "strict" in schema_config and not isinstance(schema_config.get("strict"), bool):
             errors.append(f"{prefix}.json_schema.strict must be a boolean")
+    return errors
+
+
+def normalize_config_lint_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    output: list[str] = []
+    for ch in text:
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        if category.startswith("C") and ch not in "\n\r\t":
+            continue
+        output.append(ch)
+    return "".join(output)
+
+
+def response_format_schema_lint_errors(value: Any, prefix: str) -> list[str]:
+    errors: list[str] = []
+
+    def walk(current: Any, path: str, key: str | None, depth: int) -> None:
+        if depth > MAX_RESPONSE_FORMAT_SCHEMA_DEPTH:
+            errors.append(f"{path} exceeds maximum schema lint depth of {MAX_RESPONSE_FORMAT_SCHEMA_DEPTH}")
+            return
+        if isinstance(current, dict):
+            for child_key, child_value in current.items():
+                child_key_text = str(child_key)
+                walk(child_value, f"{path}.{child_key_text}", child_key_text, depth + 1)
+            return
+        if isinstance(current, list):
+            for index, child_value in enumerate(current):
+                walk(child_value, f"{path}[{index}]", key, depth + 1)
+            return
+        if not isinstance(current, str):
+            return
+
+        normalized = normalize_config_lint_text(current)
+        if key == "description" and len(normalized) > MAX_RESPONSE_FORMAT_DESCRIPTION_CHARS:
+            errors.append(
+                f"{path} must be <= {MAX_RESPONSE_FORMAT_DESCRIPTION_CHARS} characters"
+            )
+        for rule, pattern in RESPONSE_FORMAT_SUSPICIOUS_TEXT_PATTERNS:
+            if pattern.search(normalized):
+                errors.append(f"{path} contains suspicious instruction-like text: {rule}")
+
+    walk(value, prefix, None, 0)
     return errors
 
 
@@ -1000,9 +1073,8 @@ class AuditLogger:
         event = dict(event)
         lock_path = self.path.with_name(self.path.name + ".lock")
         with AUDIT_THREAD_LOCK:
-            with lock_path.open("a+", encoding="utf-8") as lock_fh:
-                if fcntl is not None:
-                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            with lock_path.open("a+b") as lock_fh:
+                acquire_audit_file_lock(lock_fh)
                 try:
                     try:
                         os.chmod(lock_path, stat.S_IRUSR | stat.S_IWUSR)
@@ -1020,9 +1092,30 @@ class AuditLogger:
                     if not existed:
                         os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
                 finally:
-                    if fcntl is not None:
-                        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    release_audit_file_lock(lock_fh)
         return event
+
+
+def acquire_audit_file_lock(lock_fh: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        return
+    if msvcrt is not None:
+        lock_fh.seek(0)
+        if os.fstat(lock_fh.fileno()).st_size < AUDIT_LOCK_BYTES:
+            lock_fh.write(b"\0" * AUDIT_LOCK_BYTES)
+            lock_fh.flush()
+        lock_fh.seek(0)
+        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_LOCK, AUDIT_LOCK_BYTES)
+
+
+def release_audit_file_lock(lock_fh: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        lock_fh.seek(0)
+        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, AUDIT_LOCK_BYTES)
 
 
 def verify_audit_log(path: Path) -> dict[str, Any]:
