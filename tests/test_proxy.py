@@ -271,6 +271,11 @@ class ProxyScannerTests(unittest.TestCase):
         body = proxy.build_http_forward_payload(payload, "wrapped prompt", cfg, "public_readonly_search")
         self.assertEqual(body["max_tokens"], 256)
 
+    def test_http_forward_payload_rejects_inspect_capability(self):
+        payload = {"messages": [{"role": "user", "content": "normal request"}]}
+        with self.assertRaises(PermissionError):
+            proxy.build_http_forward_payload(payload, "wrapped prompt", proxy.DEFAULT_CONFIG, "inspect")
+
     def test_http_forward_payload_uses_configured_backend_tools_only(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
         cfg["capabilities"]["public_readonly_search"]["allowed_tools"] = ["safe_search"]
@@ -299,6 +304,11 @@ class ProxyScannerTests(unittest.TestCase):
         self.assertEqual(manifest["capabilities"]["public_readonly_search"]["capability"], "public_readonly_search")
         self.assertFalse(manifest["capabilities"]["public_readonly_search"]["caller_supplied_tools_forwarded"])
         self.assertNotIn("token_sha256", json.dumps(manifest))
+
+    def test_backend_policy_manifest_marks_inspect_non_forwardable(self):
+        manifest = proxy.build_backend_policy_manifest(proxy.DEFAULT_CONFIG, ["inspect"])
+        self.assertFalse(manifest["capabilities"]["inspect"]["allow_forward"])
+        self.assertEqual(manifest["capabilities"]["inspect"]["max_tokens"], 0)
 
     def test_wrap_metadata_includes_effective_capability_policy(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
@@ -522,6 +532,13 @@ class ProxyScannerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             proxy.validate_config(cfg)
 
+    def test_validate_config_rejects_forward_with_zero_tokens(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg["capabilities"]["inspect"]["allow_forward"] = True
+        cfg["capabilities"]["inspect"]["max_tokens"] = 0
+        with self.assertRaises(ValueError):
+            proxy.validate_config(cfg)
+
     def test_validate_config_rejects_backend_tool_without_allowlist(self):
         cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
         cfg["capabilities"]["public_readonly_search"]["backend_tools"] = [
@@ -637,6 +654,22 @@ class ProxyHTTPTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertIn("DRY_RUN", body["choices"][0]["message"]["content"])
+
+    def test_inspect_capability_cannot_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, token = self.make_config(tmp)
+            base_url = self.start_server(cfg)
+            status, body, _ = self.post_json(
+                base_url,
+                "/v1/chat/completions",
+                {"model": "backend-agent", "messages": [{"role": "user", "content": "just inspect this"}]},
+                token=token,
+                capability="inspect",
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"], "capability_forward_disabled")
+            events = [json.loads(line) for line in Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(events[-1]["reason"], "capability_forward_disabled")
 
     def test_http_review_required_blocks_forward(self):
         with tempfile.TemporaryDirectory() as tmp:

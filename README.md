@@ -232,6 +232,7 @@ agent が capability を名乗れるだけでは、実際の tool、network、to
   "public_readonly_search": {
     "allowed_tools": [],
     "allowed_domains": [],
+    "allow_forward": true,
     "allow_external_write": false,
     "allow_local_files": false,
     "requires_human_approval": false,
@@ -250,6 +251,8 @@ agent が capability を名乗れるだけでは、実際の tool、network、to
 ```
 
 HTTP mode の payload 再構築、review threshold、backend policy manifest にこの policy が反映されます。command mode では backend CLI 側の toolsets、sandbox、network policy と組み合わせて実効的な制限にしてください。
+
+`allow_forward: false` の capability は `/inspect` 用です。その capability を `POST /v1/chat/completions` で使おうとした場合、proxy は backend へ到達する前に `capability_forward_disabled` として拒否します。既定の `inspect` capability は `allow_forward: false` かつ `max_tokens: 0` です。
 
 HTTP mode で `tools` を backend へ渡す必要がある場合は、呼び出し元 payload からコピーせず、proxy config の `backend_tools` と `tool_choice` に定義してください。`backend_tools` を設定する場合、その tool name は同じ capability の `allowed_tools` に明示されている必要があります。write-capable らしい tool を許可する場合は、`allow_external_write: true` と `requires_human_approval: true` を明示してください。
 

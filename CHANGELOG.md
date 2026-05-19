@@ -11,3 +11,4 @@
 - Expanded the red-team corpus with tagged payload cases for tool calls, function arguments, image URLs, and multilingual injection probes.
 - Added audit finding summaries for easier log aggregation.
 - Added backend policy manifest export and stricter validation that backend tools must be explicitly allowlisted by capability.
+- Blocked forward attempts from inspect-only capabilities with explicit `allow_forward` policy.

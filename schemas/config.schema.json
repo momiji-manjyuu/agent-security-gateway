@@ -175,6 +175,9 @@
         "allow_external_write": {
           "type": "boolean"
         },
+        "allow_forward": {
+          "type": "boolean"
+        },
         "allow_local_files": {
           "type": "boolean"
         },

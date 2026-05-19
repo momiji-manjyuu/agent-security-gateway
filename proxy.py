@@ -85,6 +85,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "_default": {
             "allowed_tools": [],
             "allowed_domains": [],
+            "allow_forward": True,
             "allow_external_write": False,
             "allow_local_files": False,
             "allow_response_format": False,
@@ -116,6 +117,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "inspect": {
             "allowed_tools": [],
+            "allow_forward": False,
             "allow_external_write": False,
             "allow_local_files": False,
             "max_tokens": 0,
@@ -646,6 +648,7 @@ def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str,
     policy = capability_policy(cfg, capability)
     return {
         "capability": capability,
+        "allow_forward": bool(policy.get("allow_forward", True)),
         "allowed_tools": [str(item) for item in policy.get("allowed_tools") or []],
         "backend_tool_names": backend_tool_names(policy),
         "allowed_domains": [str(item) for item in policy.get("allowed_domains") or []],
@@ -664,6 +667,13 @@ def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str,
         "caller_supplied_stream_forwarded": False,
         "caller_supplied_model_forwarded": False,
     }
+
+
+def capability_allows_forward(cfg: dict[str, Any], capability: str) -> bool:
+    policy = capability_policy(cfg, capability)
+    if "allow_forward" in policy:
+        return bool(policy.get("allow_forward"))
+    return bounded_int(policy.get("max_tokens"), default=1, minimum=0, maximum=MAX_HTTP_MAX_TOKENS) > 0
 
 
 def build_backend_policy_manifest(cfg: dict[str, Any], capabilities: list[str] | None = None) -> dict[str, Any]:
@@ -791,6 +801,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
             max_tokens_value = bounded_int(max_tokens_raw, default=1_500, minimum=0, maximum=MAX_HTTP_MAX_TOKENS)
             if "max_tokens" in policy and (not max_tokens_ok or max_tokens_value != max_tokens_raw):
                 errors.append(f"capabilities.{name}.max_tokens must be between 0 and {MAX_HTTP_MAX_TOKENS}")
+            allow_forward = bool(policy.get("allow_forward", True))
+            if "allow_forward" in policy and not isinstance(policy.get("allow_forward"), bool):
+                errors.append(f"capabilities.{name}.allow_forward must be a boolean")
+            if allow_forward and max_tokens_value <= 0:
+                errors.append(f"capabilities.{name}.allow_forward=true requires max_tokens > 0")
+            if not allow_forward and isinstance(policy.get("backend_tools"), list) and policy.get("backend_tools"):
+                errors.append(f"capabilities.{name}.allow_forward=false cannot define backend_tools")
             target_http_max = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS)
             if max_tokens_value > target_http_max:
                 errors.append(f"capabilities.{name}.max_tokens must not exceed target.http_max_tokens")
@@ -1525,10 +1542,12 @@ def build_agent_command(prompt: str, cfg: dict[str, Any]) -> list[str]:
 def build_http_forward_payload(payload: dict[str, Any], prompt: str, cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     target = cfg.get("target", {})
     policy = capability_policy(cfg, capability)
+    if not capability_allows_forward(cfg, capability):
+        raise PermissionError(f"capability '{capability}' is not allowed to forward")
     global_max_tokens = bounded_int(target.get("http_max_tokens"), default=1_500, minimum=1, maximum=MAX_HTTP_MAX_TOKENS)
     configured_max_tokens = bounded_int(policy.get("max_tokens"), default=global_max_tokens, minimum=0, maximum=global_max_tokens)
     if configured_max_tokens <= 0:
-        configured_max_tokens = global_max_tokens
+        raise ValueError(f"capability '{capability}' has max_tokens=0 and cannot be forwarded")
     requested_max_tokens = payload.get("max_tokens")
     max_tokens = configured_max_tokens
     if requested_max_tokens is not None:
@@ -1688,6 +1707,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 }
             )
             self.write_json(403, {"error": "capability_denied", "request_id": request_id})
+            return
+
+        if forward and not capability_allows_forward(cfg, capability):
+            audit.write(
+                {
+                    "event": "deny",
+                    "request_id": request_id,
+                    "reason": "capability_forward_disabled",
+                    "agent_id": agent_id,
+                    "trust_tier": agent.get("trust_tier"),
+                    "capability": capability,
+                    "client_ip": client_ip,
+                }
+            )
+            self.write_json(403, {"error": "capability_forward_disabled", "request_id": request_id})
             return
 
         capability_override = (cfg.get("rate_limit", {}).get("capability_overrides") or {}).get(capability)
