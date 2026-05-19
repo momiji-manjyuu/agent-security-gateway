@@ -33,10 +33,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback keeps thread safety.
+    fcntl = None
+
 
 APP_NAME = "agent-security-proxy"
 DEFAULT_CONFIG_PATH = Path.home() / ".agent-security-proxy" / "config.json"
 OUTPUT_URL_POLICIES = {"no_query_no_fragment", "public_web", "block_all"}
+RESPONSE_FORMAT_TYPES = {"text", "json_object", "json_schema"}
 WRITE_TOOL_PATTERN = re.compile(
     r"\b(write|create|update|delete|remove|upload|send|post|publish|commit|merge|push|email|dm|notify|exfiltrate)\b",
     re.IGNORECASE,
@@ -61,6 +67,7 @@ MESSAGE_CONTROL_FIELDS = ("tool_calls", "function_call", "tool_call_id", "name")
 UNTRUSTED_CONTROL_ROLES = {"system", "developer", "tool", "function"}
 MAX_HTTP_MAX_TOKENS = 8_192
 MAX_TIMEOUT_SECONDS = 600
+AUDIT_THREAD_LOCK = threading.RLock()
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -632,6 +639,17 @@ def backend_tool_policy_text(tool: Any) -> str:
     return json.dumps(tool, ensure_ascii=False, sort_keys=True)
 
 
+def configured_capability_names(cfg: dict[str, Any]) -> set[str]:
+    capabilities = cfg.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return set()
+    return {str(name) for name in capabilities.keys() if str(name) != "_default"}
+
+
+def capability_is_defined(cfg: dict[str, Any], capability: str) -> bool:
+    return capability in configured_capability_names(cfg)
+
+
 def capability_policy(cfg: dict[str, Any], capability: str) -> dict[str, Any]:
     policies = cfg.get("capabilities") or {}
     merged: dict[str, Any] = {}
@@ -648,6 +666,7 @@ def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str,
     policy = capability_policy(cfg, capability)
     allow_forward = bool(policy.get("allow_forward", True))
     requires_human_approval = bool(policy.get("requires_human_approval", False))
+    fixed_response_format = policy.get("response_format") if isinstance(policy.get("response_format"), dict) else None
     result = {
         "capability": capability,
         "allow_forward": allow_forward,
@@ -659,6 +678,13 @@ def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str,
         "allow_local_files": bool(policy.get("allow_local_files", False)),
         "allow_response_format": bool(policy.get("allow_response_format", False)),
         "allowed_response_format_types": [str(item) for item in policy.get("allowed_response_format_types") or []],
+        "caller_supplied_response_format_forwarded": False,
+        "fixed_response_format_sha256": (
+            sha256_text(json.dumps(fixed_response_format, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+            if fixed_response_format
+            else None
+        ),
+        "response_format_type": str(fixed_response_format.get("type", "")) if fixed_response_format else None,
         "max_tokens": bounded_int(policy.get("max_tokens"), default=1_500, minimum=0, maximum=MAX_HTTP_MAX_TOKENS),
         "temperature": bounded_float(policy.get("temperature"), default=0.0, minimum=0.0, maximum=2.0),
         "output_url_policy": str(
@@ -688,6 +714,9 @@ def capability_requires_human_approval(cfg: dict[str, Any], capability: str) -> 
 def build_backend_policy_manifest(cfg: dict[str, Any], capabilities: list[str] | None = None) -> dict[str, Any]:
     configured = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
     capability_names = capabilities or [name for name in configured.keys() if name != "_default"]
+    unknown = [str(name) for name in capability_names if str(name) not in configured_capability_names(cfg)]
+    if unknown:
+        raise ValueError("unknown capabilities: " + ", ".join(sorted(unknown)))
     target = cfg.get("target", {}) if isinstance(cfg.get("target"), dict) else {}
     agents: dict[str, Any] = {}
     for agent_id, agent in (cfg.get("agents") or {}).items():
@@ -740,6 +769,26 @@ def bounded_float(value: Any, *, default: float, minimum: float, maximum: float)
     return max(minimum, min(maximum, number))
 
 
+def fixed_response_format_errors(response_format: dict[str, Any], prefix: str) -> list[str]:
+    errors: list[str] = []
+    response_type = str(response_format.get("type", ""))
+    if response_type not in RESPONSE_FORMAT_TYPES:
+        errors.append(f"{prefix}.type must be one of {sorted(RESPONSE_FORMAT_TYPES)}")
+        return errors
+    if response_type == "json_schema":
+        schema_config = response_format.get("json_schema")
+        if not isinstance(schema_config, dict):
+            errors.append(f"{prefix}.json_schema must be an object")
+            return errors
+        if not isinstance(schema_config.get("name"), str) or not schema_config.get("name", "").strip():
+            errors.append(f"{prefix}.json_schema.name must be a non-empty string")
+        if not isinstance(schema_config.get("schema"), dict):
+            errors.append(f"{prefix}.json_schema.schema must be an object")
+        if "strict" in schema_config and not isinstance(schema_config.get("strict"), bool):
+            errors.append(f"{prefix}.json_schema.strict must be a boolean")
+    return errors
+
+
 def validate_config(cfg: dict[str, Any]) -> None:
     errors: list[str] = []
     bind = str(cfg.get("bind", ""))
@@ -782,12 +831,40 @@ def validate_config(cfg: dict[str, Any]) -> None:
             output_policy = str(policy.get("output_url_policy", output_guard.get("output_url_policy", "no_query_no_fragment")))
             if output_policy not in OUTPUT_URL_POLICIES:
                 errors.append(f"capabilities.{name}.output_url_policy must be one of {sorted(OUTPUT_URL_POLICIES)}")
-            for list_field in ("allowed_tools", "allowed_domains", "backend_tools"):
+            for list_field in ("allowed_tools", "allowed_domains", "backend_tools", "allowed_response_format_types"):
                 if list_field in policy and not isinstance(policy[list_field], list):
                     errors.append(f"capabilities.{name}.{list_field} must be an array")
+            for bool_field in (
+                "allow_external_write",
+                "allow_forward",
+                "allow_local_files",
+                "allow_response_format",
+                "requires_human_approval",
+            ):
+                if bool_field in policy and not isinstance(policy.get(bool_field), bool):
+                    errors.append(f"capabilities.{name}.{bool_field} must be a boolean")
             allowed_tools = policy.get("allowed_tools") or []
             if isinstance(allowed_tools, list) and not all(isinstance(item, str) and item.strip() for item in allowed_tools):
                 errors.append(f"capabilities.{name}.allowed_tools must contain non-empty strings")
+            raw_allowed_response_types = policy.get("allowed_response_format_types") or []
+            allowed_response_types = raw_allowed_response_types if isinstance(raw_allowed_response_types, list) else []
+            if isinstance(raw_allowed_response_types, list) and not all(
+                isinstance(item, str) and item in RESPONSE_FORMAT_TYPES for item in raw_allowed_response_types
+            ):
+                errors.append(f"capabilities.{name}.allowed_response_format_types must contain known response format types")
+            if "response_format" in policy and not isinstance(policy.get("response_format"), dict):
+                errors.append(f"capabilities.{name}.response_format must be an object")
+            if bool(policy.get("allow_response_format", False)):
+                fixed_response_format = policy.get("response_format")
+                if not isinstance(fixed_response_format, dict):
+                    errors.append(f"capabilities.{name}.allow_response_format=true requires a fixed response_format object")
+                else:
+                    errors.extend(fixed_response_format_errors(fixed_response_format, f"capabilities.{name}.response_format"))
+                    response_type = str(fixed_response_format.get("type", ""))
+                    if allowed_response_types and response_type not in {str(item) for item in allowed_response_types}:
+                        errors.append(
+                            f"capabilities.{name}.response_format.type must be listed in allowed_response_format_types"
+                        )
             backend_tools = policy.get("backend_tools") or []
             if isinstance(backend_tools, list) and backend_tools:
                 allowed_tool_names = {str(item).strip() for item in allowed_tools if isinstance(item, str)}
@@ -813,8 +890,6 @@ def validate_config(cfg: dict[str, Any]) -> None:
             if "max_tokens" in policy and (not max_tokens_ok or max_tokens_value != max_tokens_raw):
                 errors.append(f"capabilities.{name}.max_tokens must be between 0 and {MAX_HTTP_MAX_TOKENS}")
             allow_forward = bool(policy.get("allow_forward", True))
-            if "allow_forward" in policy and not isinstance(policy.get("allow_forward"), bool):
-                errors.append(f"capabilities.{name}.allow_forward must be a boolean")
             if allow_forward and max_tokens_value <= 0:
                 errors.append(f"capabilities.{name}.allow_forward=true requires max_tokens > 0")
             if not allow_forward and isinstance(policy.get("backend_tools"), list) and policy.get("backend_tools"):
@@ -837,6 +912,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if agents and not isinstance(agents, dict):
         errors.append("agents must be an object")
     elif isinstance(agents, dict):
+        defined_capabilities = configured_capability_names(cfg)
         for agent_id, agent in agents.items():
             if not isinstance(agent, dict):
                 errors.append(f"agents.{agent_id} must be an object")
@@ -844,6 +920,17 @@ def validate_config(cfg: dict[str, Any]) -> None:
             token_hash = str(agent.get("token_sha256", ""))
             if token_hash and not re.fullmatch(r"[a-fA-F0-9]{64}", token_hash):
                 errors.append(f"agents.{agent_id}.token_sha256 must be a 64-character SHA-256 hex digest")
+            allowed_capabilities = agent.get("allowed_capabilities") or []
+            if "allowed_capabilities" in agent and not isinstance(agent.get("allowed_capabilities"), list):
+                errors.append(f"agents.{agent_id}.allowed_capabilities must be an array")
+                allowed_capabilities = []
+            if isinstance(allowed_capabilities, list):
+                for capability in allowed_capabilities:
+                    if not isinstance(capability, str) or not capability.strip():
+                        errors.append(f"agents.{agent_id}.allowed_capabilities must contain non-empty strings")
+                        continue
+                    if capability not in defined_capabilities:
+                        errors.append(f"agents.{agent_id}.allowed_capabilities references undefined capability: {capability}")
             for cidr in agent.get("allowed_client_cidrs") or []:
                 try:
                     ipaddress.ip_network(str(cidr), strict=False)
@@ -900,15 +987,30 @@ class AuditLogger:
 
     def write(self, event: dict[str, Any]) -> dict[str, Any]:
         event = dict(event)
-        event.setdefault("timestamp", utc_now())
-        event["prev_hash"] = self._last_hash()
-        canonical = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        event["event_hash"] = sha256_text(canonical)
-        existed = self.path.exists()
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-        if not existed:
-            os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        with AUDIT_THREAD_LOCK:
+            with lock_path.open("a+", encoding="utf-8") as lock_fh:
+                if fcntl is not None:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    try:
+                        os.chmod(lock_path, stat.S_IRUSR | stat.S_IWUSR)
+                    except FileNotFoundError:
+                        pass
+                    event.setdefault("timestamp", utc_now())
+                    event["prev_hash"] = self._last_hash()
+                    canonical = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                    event["event_hash"] = sha256_text(canonical)
+                    existed = self.path.exists()
+                    with self.path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    if not existed:
+                        os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
         return event
 
 
@@ -1583,12 +1685,9 @@ def build_http_forward_payload(payload: dict[str, Any], prompt: str, cfg: dict[s
         if "tool_choice" in policy:
             body_payload["tool_choice"] = policy["tool_choice"]
 
-    if policy.get("allow_response_format", False) and isinstance(payload.get("response_format"), dict):
-        allowed_types = {str(item) for item in policy.get("allowed_response_format_types", [])}
-        response_format = payload["response_format"]
-        response_type = str(response_format.get("type", ""))
-        if not allowed_types or response_type in allowed_types:
-            body_payload["response_format"] = response_format
+    fixed_response_format = policy.get("response_format")
+    if policy.get("allow_response_format", False) and isinstance(fixed_response_format, dict):
+        body_payload["response_format"] = fixed_response_format
 
     return body_payload
 
@@ -1704,6 +1803,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("request JSON must be an object")
         capability = "inspect" if not forward else get_capability(self.headers, payload)
+
+        if not capability_is_defined(cfg, capability):
+            audit.write(
+                {
+                    "event": "deny",
+                    "request_id": request_id,
+                    "reason": "unknown_capability",
+                    "agent_id": agent_id,
+                    "trust_tier": agent.get("trust_tier"),
+                    "capability": capability,
+                    "client_ip": client_ip,
+                }
+            )
+            self.write_json(403, {"error": "unknown_capability", "request_id": request_id})
+            return
 
         try:
             enforce_capability(agent, capability)
@@ -1893,7 +2007,10 @@ def verify_audit_cli(path: Path) -> None:
 
 def export_backend_policy_cli(config_path: Path, capabilities: list[str] | None) -> None:
     cfg = load_config(config_path)
-    manifest = build_backend_policy_manifest(cfg, capabilities or None)
+    try:
+        manifest = build_backend_policy_manifest(cfg, capabilities or None)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
 
 

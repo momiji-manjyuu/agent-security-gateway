@@ -184,6 +184,9 @@
         "allow_response_format": {
           "type": "boolean"
         },
+        "response_format": {
+          "type": "object"
+        },
         "requires_human_approval": {
           "type": "boolean"
         },

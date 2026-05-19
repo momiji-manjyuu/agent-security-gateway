@@ -13,3 +13,4 @@
 - Added backend policy manifest export and stricter validation that backend tools must be explicitly allowlisted by capability.
 - Blocked forward attempts from inspect-only capabilities with explicit `allow_forward` policy.
 - Enforced `requires_human_approval` as a forward stop and added policy/manifest hashes for backend contract checks.
+- Added audit write locking, undefined capability rejection, and fixed-policy `response_format` forwarding.
