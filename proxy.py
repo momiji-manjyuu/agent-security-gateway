@@ -701,10 +701,21 @@ def backend_capability_policy(cfg: dict[str, Any], capability: str) -> dict[str,
 
 
 def capability_allows_forward(cfg: dict[str, Any], capability: str) -> bool:
+    if not capability_is_defined(cfg, capability):
+        return False
     policy = capability_policy(cfg, capability)
-    if "allow_forward" in policy:
-        return bool(policy.get("allow_forward"))
-    return bounded_int(policy.get("max_tokens"), default=1, minimum=0, maximum=MAX_HTTP_MAX_TOKENS) > 0
+    allow_forward = policy.get("allow_forward", True)
+    if not isinstance(allow_forward, bool):
+        return False
+    if not allow_forward:
+        return False
+    raw_max_tokens = policy.get("max_tokens", 0)
+    if isinstance(raw_max_tokens, bool):
+        return False
+    max_tokens, max_tokens_ok = parse_int(raw_max_tokens, default=0)
+    if not max_tokens_ok:
+        return False
+    return 0 < max_tokens <= MAX_HTTP_MAX_TOKENS
 
 
 def capability_requires_human_approval(cfg: dict[str, Any], capability: str) -> bool:

@@ -63,6 +63,24 @@ class ProxyScannerTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             proxy.enforce_capability(agent, "public_readonly_search")
 
+    def test_capability_allows_forward_defensive_checks(self):
+        cfg = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        self.assertTrue(proxy.capability_allows_forward(cfg, "public_readonly_search"))
+        self.assertFalse(proxy.capability_allows_forward(cfg, "inspect"))
+        self.assertFalse(proxy.capability_allows_forward(cfg, "not_defined"))
+
+        cfg_bad_bool = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg_bad_bool["capabilities"]["public_readonly_search"]["allow_forward"] = "true"
+        self.assertFalse(proxy.capability_allows_forward(cfg_bad_bool, "public_readonly_search"))
+
+        cfg_bad_tokens = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg_bad_tokens["capabilities"]["public_readonly_search"]["max_tokens"] = "lots"
+        self.assertFalse(proxy.capability_allows_forward(cfg_bad_tokens, "public_readonly_search"))
+
+        cfg_excessive_tokens = json.loads(json.dumps(proxy.DEFAULT_CONFIG))
+        cfg_excessive_tokens["capabilities"]["public_readonly_search"]["max_tokens"] = proxy.MAX_HTTP_MAX_TOKENS + 1
+        self.assertFalse(proxy.capability_allows_forward(cfg_excessive_tokens, "public_readonly_search"))
+
     def test_audit_hash_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "audit.jsonl"
