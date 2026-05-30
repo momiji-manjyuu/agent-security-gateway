@@ -1,0 +1,17 @@
+{
+  "model": "asg/pi-web-research",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Collect recent local LLM release notes and return source cards."
+    }
+  ],
+  "metadata": {
+    "route_id": "pi.web_research.chat",
+    "capability": "delegate_web_research",
+    "run_id": "example-run",
+    "task_id": "task-001",
+    "taint": ["trusted_instruction"],
+    "expected_output_schema": "source_cards.v1"
+  }
+}

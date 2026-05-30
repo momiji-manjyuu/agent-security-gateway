@@ -1,6 +1,6 @@
 # Security Policy
 
-Agent Security Proxy is a defense-in-depth boundary, not a complete guarantee against prompt injection or data exfiltration.
+Agent Security Gateway is a defense-in-depth policy boundary, not a complete guarantee against prompt injection, backend compromise, or data exfiltration.
 
 ## Reporting
 
@@ -12,20 +12,23 @@ If advisories are unavailable, open a minimal issue that says a private security
 
 Useful reports include:
 
-- bypasses that allow caller-controlled `tools`, `tool_choice`, `stream`, or other unsafe OpenAI-compatible fields to reach the backend;
-- bypasses that allow inspect-only or non-forward capabilities to forward requests;
-- validation gaps where undefined capabilities, malformed capability policy, or caller-supplied `response_format` can weaken enforcement;
+- route resolution bypasses, route conflict bypasses, or fallback-to-default backend behavior;
+- caller-controlled backend URL or backend credential injection;
+- caller `Authorization` token forwarding to a backend;
+- CIDR, capability, route, run-scope, taint, or caller allowlist bypasses;
 - prompt-injection patterns that should be blocked or reviewed but are currently allowed;
-- output guard bypasses for credentials, local paths, private hosts, or sensitive URL query strings;
+- action guard bypasses for private URLs, metadata endpoints, secret exfiltration, external upload, package install, delete, email, social post, purchase, or release publish;
+- output guard bypasses for credentials, local paths, private hosts, dangerous schemes, or sensitive URL query strings;
 - audit hash-chain verification failures;
 - audit write-lock failures that can corrupt concurrent hash-chain writes;
-- configuration validation gaps that make an unsafe deployment easy.
+- configuration validation gaps that make unsafe deployment easy.
 
 Out of scope:
 
-- reports that require a malicious operator with full write access to the proxy configuration and runtime files;
+- reports that require a malicious operator with full write access to gateway configuration and runtime files;
 - benchmark-only claims without a concrete bypass or reproducible corpus entry;
-- attacks against the backend AI agent runtime when the proxy correctly blocks or strips the relevant input.
+- attacks against backend AI agent runtimes when the gateway correctly blocks or strips the relevant input;
+- absence of TLS/VPN/mTLS, WORM storage, or host firewalling in the gateway process itself.
 
 ## Supported Versions
 
@@ -35,4 +38,4 @@ Out of scope:
 | `main` | Best-effort development branch |
 | `< v0.1.0` | No |
 
-Security fixes will normally land on `main` first and then be included in the next tagged release.
+Security fixes normally land on `main` first and then ship in the next tagged release.

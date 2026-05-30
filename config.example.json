@@ -1,172 +1,324 @@
 {
-  "agents": {
-    "local-agent": {
-      "allowed_capabilities": [
-        "inspect",
-        "coordination_result",
-        "public_readonly_search",
-        "submit_result"
-      ],
-      "allowed_client_cidrs": [
-        "127.0.0.1/32"
-      ],
-      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "trust_tier": "local_trusted"
-    },
-    "external-worker-01": {
-      "allowed_capabilities": [
-        "inspect",
-        "public_readonly_search",
-        "submit_result",
-        "coordination_result"
-      ],
-      "allowed_client_cidrs": [
-        "192.0.2.0/24",
-        "127.0.0.1/32"
-      ],
-      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "trust_tier": "external_readonly"
-    }
-  },
-  "audit_log": "/Users/example/.agent-security-proxy/audit.jsonl",
-  "audit": {
-    "include_findings": true,
-    "include_structured_extract": false
-  },
+  "audit_log": "~/.agent-security-gateway/audit.jsonl",
+  "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
   "bind": "127.0.0.1",
   "block_risk_score": 8,
-  "capabilities": {
-    "_default": {
-      "allow_external_write": false,
-      "allow_forward": true,
-      "allow_local_files": false,
-      "allow_response_format": false,
-      "allowed_domains": [],
-      "allowed_tools": [],
-      "max_tokens": 1500,
-      "output_url_policy": "no_query_no_fragment",
-      "requires_human_approval": false,
-      "temperature": 0
+  "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
+  "max_body_bytes": 524288,
+  "port": 8788,
+  "require_known_run_id": false,
+  "review_risk_score": 4,
+  "agents": {
+    "mac_gpt55": {
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "trust_tier": "privileged_core",
+      "allowed_client_cidrs": [
+        "192.168.10.10/32",
+        "127.0.0.1/32"
+      ],
+      "allowed_capabilities": [
+        "delegate_web_research",
+        "request_sandbox_verification",
+        "search_trusted_knowledge",
+        "submit_task",
+        "generate_image",
+        "request_gpu_benchmark",
+        "inspect"
+      ],
+      "allowed_routes": [
+        "security.inspect_only",
+        "pi.web_research.chat",
+        "ubuntu2.sandbox.verify",
+        "ubuntu1.knowledge.search_trusted",
+        "windows_image.comfyui.generate",
+        "rtx3090.local_llm.benchmark"
+      ]
     },
-    "coordination_result": {
-      "allow_external_write": false,
-      "allow_local_files": false,
-      "allowed_tools": [],
-      "max_tokens": 1200
+    "pi_research_1": {
+      "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "trust_tier": "web_dmz",
+      "allowed_client_cidrs": [
+        "192.168.30.11/32",
+        "127.0.0.1/32"
+      ],
+      "allowed_capabilities": [
+        "submit_source_card",
+        "inspect"
+      ],
+      "allowed_routes": [
+        "security.inspect_only",
+        "ubuntu1.knowledge.submit_source_card"
+      ]
     },
-    "inspect": {
-      "allow_external_write": false,
-      "allow_forward": false,
-      "allow_local_files": false,
-      "allowed_tools": [],
-      "max_tokens": 0
-    },
-    "public_readonly_search": {
-      "allow_external_write": false,
-      "allow_local_files": false,
-      "allowed_domains": [],
-      "allowed_tools": [],
-      "max_tokens": 1200,
-      "output_url_policy": "public_web"
-    },
-    "submit_result": {
-      "allow_external_write": false,
-      "allow_local_files": false,
-      "allowed_tools": [],
-      "max_tokens": 800,
-      "requires_review_above_risk": 4
+    "ubuntu_verify_2": {
+      "token_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "trust_tier": "execution_sandbox",
+      "allowed_client_cidrs": [
+        "192.168.40.12/32",
+        "127.0.0.1/32"
+      ],
+      "allowed_capabilities": [
+        "submit_verification_result",
+        "submit_benchmark_result",
+        "inspect"
+      ],
+      "allowed_routes": [
+        "security.inspect_only",
+        "ubuntu1.knowledge.submit_verification_result"
+      ]
     }
   },
-  "kill_switch_file": "/Users/example/.agent-security-proxy/KILL_SWITCH",
-  "llm_inspector": {
-    "api_key_env": "",
-    "base_url": "http://127.0.0.1:1234/v1",
-    "block_score": 0.82,
-    "enabled": false,
-    "fail_closed": true,
-    "inspect_blocked": false,
-    "max_chars": 3000,
-    "max_tokens": 1500,
-    "min_risk_score": 0,
-    "model": "local-security-inspector",
-    "no_think": true,
-    "provider": "openai_compatible",
-    "require_api_key": false,
-    "timeout_seconds": 60
+  "routes": {
+    "security.inspect_only": {
+      "kind": "inspect_only",
+      "description": "Inspect payloads without forwarding to any backend.",
+      "aliases": [
+        "asg/inspect-only"
+      ],
+      "allowed_callers": [
+        "*"
+      ],
+      "required_capability": "inspect",
+      "input_policy": {
+        "accepted_taint": [
+          "trusted_instruction",
+          "human_approved",
+          "untrusted_web",
+          "untrusted_pdf",
+          "untrusted_github",
+          "sandbox_output",
+          "model_output",
+          "reviewed_untrusted_summary",
+          "reviewed_prompt_matrix",
+          "promoted_knowledge"
+        ],
+        "allow_missing_taint": true
+      }
+    },
+    "pi.web_research.chat": {
+      "kind": "openai_chat_completions",
+      "description": "Delegate web research to the Pi web DMZ worker.",
+      "aliases": [
+        "asg/pi-web-research"
+      ],
+      "backend": {
+        "mode": "http",
+        "base_url": "http://pi1-agent.internal:8000/v1",
+        "path": "/chat/completions",
+        "api_key_env": "PI1_AGENT_BACKEND_KEY",
+        "timeout_seconds": 180,
+        "model_rewrite": "pi-web-research-agent"
+      },
+      "allowed_callers": [
+        "mac_gpt55"
+      ],
+      "required_capability": "delegate_web_research",
+      "input_policy": {
+        "accepted_taint": [
+          "trusted_instruction"
+        ],
+        "allow_raw_external_content": false,
+        "max_messages": 20
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "ubuntu1.knowledge.submit_source_card": {
+      "kind": "http_json",
+      "description": "Submit reviewed source cards into the trusted knowledge staging area.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://ubuntu1-knowledge.internal:8801",
+        "path": "/api/staging/source-card",
+        "method": "POST",
+        "api_key_env": "UBUNTU1_STAGING_BACKEND_KEY",
+        "timeout_seconds": 60
+      },
+      "allowed_callers": [
+        "pi_research_1"
+      ],
+      "required_capability": "submit_source_card",
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web"
+        ],
+        "allow_raw_external_content": false,
+        "require_message_type": "source_card"
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "ubuntu1.knowledge.submit_verification_result": {
+      "kind": "http_json",
+      "description": "Submit sandbox verification results into trusted staging.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://ubuntu1-knowledge.internal:8801",
+        "path": "/api/staging/verification-result",
+        "method": "POST",
+        "api_key_env": "UBUNTU1_STAGING_BACKEND_KEY",
+        "timeout_seconds": 60
+      },
+      "allowed_callers": [
+        "ubuntu_verify_2"
+      ],
+      "required_capability": "submit_verification_result",
+      "input_policy": {
+        "accepted_taint": [
+          "sandbox_output"
+        ],
+        "allow_raw_external_content": false
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "ubuntu1.knowledge.search_trusted": {
+      "kind": "http_json",
+      "description": "Search trusted knowledge only.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://ubuntu1-knowledge.internal:8801",
+        "path": "/api/search/trusted",
+        "method": "POST",
+        "api_key_env": "UBUNTU1_KB_BACKEND_KEY",
+        "timeout_seconds": 60
+      },
+      "allowed_callers": [
+        "mac_gpt55"
+      ],
+      "required_capability": "search_trusted_knowledge",
+      "input_policy": {
+        "accepted_taint": [
+          "trusted_instruction",
+          "promoted_knowledge"
+        ]
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "ubuntu2.sandbox.verify": {
+      "kind": "openai_chat_completions",
+      "description": "Ask the Ubuntu execution sandbox to verify code or OSS behavior.",
+      "aliases": [
+        "asg/ubuntu2-sandbox-verifier"
+      ],
+      "backend": {
+        "mode": "http",
+        "base_url": "http://ubuntu2-agent.internal:8000/v1",
+        "path": "/chat/completions",
+        "api_key_env": "UBUNTU2_AGENT_BACKEND_KEY",
+        "timeout_seconds": 300,
+        "model_rewrite": "ubuntu2-verifier-agent"
+      },
+      "allowed_callers": [
+        "mac_gpt55"
+      ],
+      "required_capability": "request_sandbox_verification",
+      "input_policy": {
+        "accepted_taint": [
+          "trusted_instruction",
+          "reviewed_untrusted_summary"
+        ],
+        "require_structured_task": true
+      },
+      "action_policy": {
+        "forbid_shell_from_chat": true,
+        "forbid_external_upload": true,
+        "forbid_private_network_targets": true,
+        "approval_required_for": [
+          "host_package_install",
+          "external_upload",
+          "privileged_command",
+          "delete_operation"
+        ]
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "windows_image.comfyui.generate": {
+      "kind": "http_json",
+      "description": "Submit image generation jobs to the Windows image node.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://windows-image.internal:8188",
+        "path": "/prompt",
+        "method": "POST",
+        "api_key_env": "WINDOWS_IMAGE_BACKEND_KEY",
+        "timeout_seconds": 300
+      },
+      "allowed_callers": [
+        "mac_gpt55"
+      ],
+      "required_capability": "generate_image",
+      "input_policy": {
+        "accepted_taint": [
+          "trusted_instruction",
+          "reviewed_prompt_matrix"
+        ],
+        "disallow_external_urls": true,
+        "max_batch_size": 32
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "rtx3090.local_llm.benchmark": {
+      "kind": "http_json",
+      "description": "Run local LLM benchmark jobs on the RTX3090 Windows node.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://rtx3090-windows.internal:8091",
+        "path": "/api/benchmarks",
+        "method": "POST",
+        "api_key_env": "RTX3090_BACKEND_KEY",
+        "timeout_seconds": 300
+      },
+      "allowed_callers": [
+        "mac_gpt55"
+      ],
+      "required_capability": "request_gpu_benchmark",
+      "input_policy": {
+        "accepted_taint": [
+          "trusted_instruction",
+          "reviewed_untrusted_summary"
+        ]
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    }
   },
-  "max_body_bytes": 262144,
-  "normalize": {
-    "max_content_chars": 40000,
-    "strip_control_chars": true,
-    "strip_format_chars": true,
-    "strip_html_comments": true,
-    "unicode_nfkc": true
-  },
-  "port": 8787,
-  "output_guard": {
-    "allowed_domains": [],
-    "block_local_paths": true,
-    "block_on_review": true,
-    "block_risk_score": 8,
-    "disallow_dangerous_schemes": true,
-    "disallow_ip_literals": true,
-    "disallow_private_hosts": true,
-    "disallow_url_fragment": true,
-    "disallow_url_query": true,
-    "disallow_userinfo": true,
-    "enabled": true,
-    "flag_encoded_paths": true,
-    "flag_punycode_hosts": true,
-    "flag_shorteners": true,
-    "max_content_chars": 40000,
-    "output_url_policy": "no_query_no_fragment",
-    "review_risk_score": 4,
-    "shortener_hosts": [
-      "bit.ly",
-      "buff.ly",
-      "goo.gl",
-      "is.gd",
-      "ow.ly",
-      "t.co",
-      "tinyurl.com"
-    ],
-    "strip_control_chars": true,
-    "strip_format_chars": true,
-    "unicode_nfkc": true
-  },
-  "rate_limit": {
-    "capability_overrides": {},
-    "enabled": true,
-    "max_requests": 120,
-    "window_seconds": 60
-  },
-  "review_policy": {
-    "block_forward": true
-  },
-  "review_risk_score": 4,
-  "structured_extract": {
-    "max_claims": 12,
-    "max_excerpt_chars": 240,
-    "max_recommendations": 12,
-    "max_suspicious_instructions": 12,
-    "max_urls": 20
-  },
-  "target": {
-    "allow_ignore_rules": false,
-    "dry_run": true,
-    "forward_raw_content": false,
-    "checkpoints": true,
-    "agent_bin": "/opt/agent-runtime/bin/agent",
-    "http_api_key_env": "BACKEND_AGENT_API_KEY",
-    "http_base_url": "http://127.0.0.1:8642/v1",
-    "http_max_tokens": 1500,
-    "http_model": "backend-agent",
-    "ignore_rules": false,
-    "ignore_user_config": false,
-    "max_turns": 2,
-    "mode": "command",
-    "source": "agent-security-proxy",
-    "timeout_seconds": 180,
-    "toolsets": []
+  "runs": {
+    "example-run": {
+      "user_intent": "example local AI research run",
+      "allowed_routes": [
+        "pi.web_research.chat",
+        "ubuntu1.knowledge.search_trusted"
+      ],
+      "denied_routes": [
+        "windows_image.comfyui.generate",
+        "rtx3090.local_llm.benchmark"
+      ],
+      "expires_at": "2099-01-01T00:00:00Z"
+    }
   }
 }

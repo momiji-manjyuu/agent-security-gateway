@@ -1,0 +1,18 @@
+{
+  "route_id": "ubuntu2.sandbox.verify",
+  "capability": "request_sandbox_verification",
+  "run_id": "example-run",
+  "task_id": "task-verify-001",
+  "taint": ["reviewed_untrusted_summary"],
+  "task": {
+    "objective": "Verify the behavior of a candidate OSS package in a sandbox.",
+    "inputs": [],
+    "constraints": {
+      "network": "disabled",
+      "external_upload": false
+    },
+    "output_contract": {
+      "format": "json"
+    }
+  }
+}

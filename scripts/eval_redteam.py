@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a small red-team corpus against Agent Security Proxy scanners."""
+"""Run a small red-team corpus against the gateway scanner stack."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def expectation_met(decision: str, expected: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate the proxy scanners against a JSONL corpus.")
+    parser = argparse.ArgumentParser(description="Evaluate the gateway scanners against a JSONL corpus.")
     parser.add_argument("--corpus", type=Path, default=ROOT / "tests" / "redteam_corpus.jsonl")
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of a table.")

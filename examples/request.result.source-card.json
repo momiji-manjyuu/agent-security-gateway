@@ -1,0 +1,15 @@
+{
+  "route_id": "ubuntu1.knowledge.submit_source_card",
+  "capability": "submit_source_card",
+  "run_id": "example-run",
+  "task_id": "task-001",
+  "taint": ["untrusted_web"],
+  "message_type": "source_card",
+  "source_card": {
+    "source_id": "src-example",
+    "url": "https://example.com",
+    "title": "Example",
+    "claims": [],
+    "injection_flags": []
+  }
+}

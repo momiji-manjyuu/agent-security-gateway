@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Security Gateway result packet",
+  "type": "object",
+  "required": ["route_id", "capability", "taint"],
+  "additionalProperties": true,
+  "properties": {
+    "route_id": {"type": "string"},
+    "capability": {"type": "string"},
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "taint": {"type": "array", "items": {"type": "string"}},
+    "message_type": {"type": "string"},
+    "result": {"type": "object"}
+  }
+}

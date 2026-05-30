@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Security Gateway sandbox job",
+  "type": "object",
+  "required": ["objective", "artifact_refs"],
+  "additionalProperties": true,
+  "properties": {
+    "objective": {"type": "string"},
+    "artifact_refs": {"type": "array"},
+    "constraints": {"type": "object"},
+    "expected_outputs": {"type": "object"}
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8788,
+  "audit_log": "~/.agent-security-gateway/audit.jsonl",
+  "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
+  "agents": {
+    "mac_gpt55": {
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "trust_tier": "privileged_core",
+      "allowed_client_cidrs": ["127.0.0.1/32"],
+      "allowed_capabilities": ["inspect"],
+      "allowed_routes": ["security.inspect_only"]
+    }
+  },
+  "routes": {
+    "security.inspect_only": {
+      "kind": "inspect_only",
+      "aliases": ["asg/inspect-only"],
+      "allowed_callers": ["*"],
+      "required_capability": "inspect",
+      "input_policy": {
+        "accepted_taint": ["trusted_instruction", "untrusted_web", "sandbox_output", "model_output"],
+        "allow_missing_taint": true
+      }
+    }
+  }
+}

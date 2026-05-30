@@ -2,7 +2,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.user.agent-security-proxy</string>
+  <string>com.user.agent-security-gateway</string>
   <key>ProgramArguments</key>
   <array>
     <string>__ROOT__/scripts/start.sh</string>
@@ -19,9 +19,9 @@
   <string>__ROOT__</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>ASP_CONFIG</key>
+    <key>ASG_CONFIG</key>
     <string>__RUNTIME_DIR__/config.json</string>
-    <key>ASP_PYTHON</key>
+    <key>ASG_PYTHON</key>
     <string>__PYTHON_BIN__</string>
   </dict>
 </dict>

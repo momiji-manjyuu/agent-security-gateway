@@ -1,15 +1,15 @@
 #!/bin/zsh
 set -euo pipefail
 
-LABEL="com.user.agent-security-proxy"
-CONFIG_PATH="${ASP_CONFIG:-$HOME/.agent-security-proxy/config.json}"
-PYTHON_BIN="${ASP_PYTHON:-/usr/local/bin/python3}"
+LABEL="com.user.agent-security-gateway"
+CONFIG_PATH="${ASG_CONFIG:-$HOME/.agent-security-gateway/config.json}"
+PYTHON_BIN="${ASG_PYTHON:-python3}"
 BASE_URL="$("$PYTHON_BIN" - "$CONFIG_PATH" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+cfg = json.loads(Path(sys.argv[1]).expanduser().read_text(encoding="utf-8"))
 print(f"http://{cfg['bind']}:{cfg['port']}")
 PY
 )"

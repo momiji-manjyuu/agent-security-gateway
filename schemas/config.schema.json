@@ -1,9 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.com/agent-security-proxy/config.schema.json",
-  "title": "Agent Security Proxy config",
+  "$id": "https://example.com/agent-security-gateway/config.schema.json",
+  "title": "Agent Security Gateway config",
   "type": "object",
   "additionalProperties": true,
+  "required": [
+    "bind",
+    "port",
+    "agents",
+    "routes"
+  ],
   "properties": {
     "bind": {
       "type": "string",
@@ -13,27 +19,11 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 65535,
-      "default": 8787
-    },
-    "allow_public_bind": {
-      "type": "boolean",
-      "default": false
-    },
-    "allow_unauthenticated_localhost": {
-      "type": "boolean",
-      "default": false
+      "default": 8788
     },
     "max_body_bytes": {
       "type": "integer",
       "minimum": 1
-    },
-    "block_risk_score": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "review_risk_score": {
-      "type": "integer",
-      "minimum": 0
     },
     "kill_switch_file": {
       "type": "string"
@@ -41,89 +31,37 @@
     "audit_log": {
       "type": "string"
     },
+    "require_known_run_id": {
+      "type": "boolean"
+    },
     "agents": {
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/agent"
       }
     },
-    "capabilities": {
+    "routes": {
       "type": "object",
       "additionalProperties": {
-        "$ref": "#/$defs/capability"
+        "$ref": "#/$defs/route"
       }
     },
-    "target": {
-      "$ref": "#/$defs/target"
-    },
-    "output_guard": {
-      "$ref": "#/$defs/output_guard"
-    },
-    "rate_limit": {
-      "$ref": "#/$defs/rate_limit"
-    },
-    "llm_inspector": {
-      "$ref": "#/$defs/llm_inspector"
-    },
-    "audit": {
+    "runs": {
       "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "include_structured_extract": {
-          "type": "boolean"
-        },
-        "include_findings": {
-          "type": "boolean"
-        }
-      }
-    },
-    "normalize": {
-      "$ref": "#/$defs/normalization"
-    },
-    "structured_extract": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "max_claims": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_recommendations": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_suspicious_instructions": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_urls": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_excerpt_chars": {
-          "type": "integer",
-          "minimum": 1
-        }
-      }
-    },
-    "review_policy": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "block_forward": {
-          "type": "boolean"
-        }
+      "additionalProperties": {
+        "$ref": "#/$defs/run_scope"
       }
     }
   },
   "$defs": {
     "agent": {
       "type": "object",
-      "additionalProperties": true,
       "required": [
         "token_sha256",
-        "allowed_capabilities"
+        "allowed_capabilities",
+        "allowed_routes"
       ],
+      "additionalProperties": true,
       "properties": {
         "token_sha256": {
           "type": "string",
@@ -132,346 +70,90 @@
         "trust_tier": {
           "type": "string"
         },
-        "allowed_capabilities": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
         "allowed_client_cidrs": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
-        "allow_forward_on_review": {
-          "type": "boolean"
+        "allowed_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
-    "capability": {
+    "route": {
       "type": "object",
+      "required": [
+        "kind",
+        "allowed_callers",
+        "required_capability"
+      ],
       "additionalProperties": true,
       "properties": {
-        "allowed_tools": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "backend_tools": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "tool_choice": {},
-        "allowed_domains": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "allow_external_write": {
-          "type": "boolean"
-        },
-        "allow_forward": {
-          "type": "boolean"
-        },
-        "allow_local_files": {
-          "type": "boolean"
-        },
-        "allow_response_format": {
-          "type": "boolean"
-        },
-        "response_format": {
-          "$ref": "#/$defs/response_format"
-        },
-        "requires_human_approval": {
-          "type": "boolean"
-        },
-        "allowed_response_format_types": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "max_tokens": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 8192
-        },
-        "temperature": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 2
-        },
-        "http_model": {
-          "type": "string"
-        },
-        "output_url_policy": {
+        "kind": {
           "enum": [
-            "no_query_no_fragment",
-            "public_web",
-            "block_all"
+            "inspect_only",
+            "openai_chat_completions",
+            "http_json",
+            "command"
           ]
         },
-        "requires_review_above_risk": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "response_format": {
-      "type": "object",
-      "additionalProperties": true,
-      "properties": {
-        "type": {
-          "enum": [
-            "text",
-            "json_object",
-            "json_schema"
-          ]
-        },
-        "json_schema": {
-          "type": "object",
-          "additionalProperties": true,
-          "properties": {
-            "name": {
-              "type": "string",
-              "minLength": 1
-            },
-            "strict": {
-              "type": "boolean"
-            },
-            "description": {
-              "type": "string",
-              "maxLength": 512
-            },
-            "schema": {
-              "$ref": "#/$defs/json_schema_node"
-            }
-          }
-        }
-      }
-    },
-    "json_schema_node": {
-      "if": {
-        "type": "object"
-      },
-      "then": {
-        "properties": {
-          "description": {
-            "type": "string",
-            "maxLength": 512
-          }
-        },
-        "additionalProperties": {
-          "$ref": "#/$defs/json_schema_node"
-        }
-      },
-      "else": {
-        "if": {
-          "type": "array"
-        },
-        "then": {
-          "items": {
-            "$ref": "#/$defs/json_schema_node"
-          }
-        }
-      }
-    },
-    "target": {
-      "type": "object",
-      "additionalProperties": true,
-      "properties": {
-        "mode": {
-          "enum": [
-            "command",
-            "http"
-          ]
-        },
-        "dry_run": {
-          "type": "boolean"
-        },
-        "agent_bin": {
-          "type": "string"
-        },
-        "source": {
-          "type": "string"
-        },
-        "max_turns": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "toolsets": {
+        "aliases": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
-        "ignore_rules": {
-          "type": "boolean"
-        },
-        "allow_ignore_rules": {
-          "type": "boolean"
-        },
-        "ignore_user_config": {
-          "type": "boolean"
-        },
-        "checkpoints": {
-          "type": "boolean"
-        },
-        "timeout_seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 600
-        },
-        "http_base_url": {
-          "type": "string",
-          "format": "uri"
-        },
-        "http_model": {
-          "type": "string"
-        },
-        "http_max_tokens": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 8192
-        },
-        "http_api_key_env": {
-          "type": "string"
-        },
-        "forward_raw_content": {
-          "type": "boolean"
-        }
-      }
-    },
-    "output_guard": {
-      "type": "object",
-      "additionalProperties": true,
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        },
-        "output_url_policy": {
-          "enum": [
-            "no_query_no_fragment",
-            "public_web",
-            "block_all"
-          ]
-        },
-        "allowed_domains": {
+        "allowed_callers": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
-        "block_risk_score": {
-          "type": "integer",
-          "minimum": 0
+        "required_capability": {
+          "type": "string"
         },
-        "review_risk_score": {
-          "type": "integer",
-          "minimum": 0
+        "backend": {
+          "type": "object"
         },
-        "block_on_review": {
-          "type": "boolean"
+        "input_policy": {
+          "type": "object"
         },
-        "shortener_hosts": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      }
-    },
-    "rate_limit": {
-      "type": "object",
-      "additionalProperties": true,
-      "properties": {
-        "enabled": {
-          "type": "boolean"
+        "action_policy": {
+          "type": "object"
         },
-        "window_seconds": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "max_requests": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "capability_overrides": {
+        "output_policy": {
           "type": "object"
         }
       }
     },
-    "llm_inspector": {
+    "run_scope": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "enabled": {
-          "type": "boolean"
+        "allowed_routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
-        "provider": {
+        "denied_routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expires_at": {
           "type": "string"
-        },
-        "base_url": {
-          "type": "string",
-          "format": "uri"
-        },
-        "api_key_env": {
-          "type": "string"
-        },
-        "require_api_key": {
-          "type": "boolean"
-        },
-        "model": {
-          "type": "string"
-        },
-        "timeout_seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 600
-        },
-        "fail_closed": {
-          "type": "boolean"
-        },
-        "max_chars": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "max_tokens": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 8192
-        },
-        "block_score": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        }
-      }
-    },
-    "normalization": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "unicode_nfkc": {
-          "type": "boolean"
-        },
-        "strip_format_chars": {
-          "type": "boolean"
-        },
-        "strip_control_chars": {
-          "type": "boolean"
-        },
-        "strip_html_comments": {
-          "type": "boolean"
-        },
-        "max_content_chars": {
-          "type": "integer",
-          "minimum": 1
         }
       }
     }

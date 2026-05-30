@@ -1,0 +1,86 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8788,
+  "audit_log": "~/.agent-security-gateway/audit.jsonl",
+  "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
+  "agents": {
+    "mac_gpt55": {
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "trust_tier": "privileged_core",
+      "allowed_client_cidrs": ["127.0.0.1/32", "192.168.10.10/32"],
+      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge"],
+      "allowed_routes": ["security.inspect_only", "pi.web_research.chat", "ubuntu1.knowledge.search_trusted"]
+    },
+    "pi_research_1": {
+      "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "trust_tier": "web_dmz",
+      "allowed_client_cidrs": ["127.0.0.1/32", "192.168.30.11/32"],
+      "allowed_capabilities": ["inspect", "submit_source_card"],
+      "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card"]
+    }
+  },
+  "routes": {
+    "security.inspect_only": {
+      "kind": "inspect_only",
+      "aliases": ["asg/inspect-only"],
+      "allowed_callers": ["*"],
+      "required_capability": "inspect",
+      "input_policy": {
+        "accepted_taint": ["trusted_instruction", "untrusted_web", "sandbox_output", "model_output"],
+        "allow_missing_taint": true
+      }
+    },
+    "pi.web_research.chat": {
+      "kind": "openai_chat_completions",
+      "aliases": ["asg/pi-web-research"],
+      "backend": {
+        "mode": "http",
+        "base_url": "http://pi1-agent.internal:8000/v1",
+        "path": "/chat/completions",
+        "api_key_env": "PI1_AGENT_BACKEND_KEY",
+        "timeout_seconds": 180,
+        "model_rewrite": "pi-web-research-agent"
+      },
+      "allowed_callers": ["mac_gpt55"],
+      "required_capability": "delegate_web_research",
+      "input_policy": {
+        "accepted_taint": ["trusted_instruction"],
+        "allow_missing_taint": false
+      }
+    },
+    "ubuntu1.knowledge.search_trusted": {
+      "kind": "http_json",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://ubuntu1-knowledge.internal:8801",
+        "path": "/api/search/trusted",
+        "method": "POST",
+        "api_key_env": "UBUNTU1_KB_BACKEND_KEY",
+        "timeout_seconds": 60
+      },
+      "allowed_callers": ["mac_gpt55"],
+      "required_capability": "search_trusted_knowledge",
+      "input_policy": {
+        "accepted_taint": ["trusted_instruction", "promoted_knowledge"],
+        "allow_missing_taint": false
+      }
+    },
+    "ubuntu1.knowledge.submit_source_card": {
+      "kind": "http_json",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://ubuntu1-knowledge.internal:8801",
+        "path": "/api/staging/source-card",
+        "method": "POST",
+        "api_key_env": "UBUNTU1_STAGING_BACKEND_KEY",
+        "timeout_seconds": 60
+      },
+      "allowed_callers": ["pi_research_1"],
+      "required_capability": "submit_source_card",
+      "input_policy": {
+        "accepted_taint": ["untrusted_web"],
+        "allow_missing_taint": false
+      }
+    }
+  }
+}

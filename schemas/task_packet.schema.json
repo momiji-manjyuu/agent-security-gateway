@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Security Gateway task packet",
+  "type": "object",
+  "required": ["route_id", "capability", "task", "taint"],
+  "additionalProperties": true,
+  "properties": {
+    "route_id": {"type": "string"},
+    "capability": {"type": "string"},
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "taint": {"type": "array", "items": {"type": "string"}},
+    "task": {
+      "type": "object",
+      "required": ["objective"],
+      "additionalProperties": true,
+      "properties": {
+        "objective": {"type": "string"},
+        "inputs": {"type": "array"},
+        "constraints": {"type": "object"},
+        "output_contract": {"type": "object"}
+      }
+    }
+  }
+}

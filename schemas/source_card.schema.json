@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Security Gateway source card",
+  "type": "object",
+  "required": ["source_id", "url", "title", "claims"],
+  "additionalProperties": true,
+  "properties": {
+    "source_id": {"type": "string"},
+    "url": {"type": "string"},
+    "title": {"type": "string"},
+    "claims": {"type": "array"},
+    "injection_flags": {"type": "array"}
+  }
+}

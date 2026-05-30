@@ -1,12 +1,12 @@
 #!/bin/zsh
 set -euo pipefail
 
-LABEL="com.user.agent-security-proxy"
+LABEL="com.user.agent-security-gateway"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/launchd/$LABEL.plist"
 DST="$HOME/Library/LaunchAgents/$LABEL.plist"
-RUNTIME_DIR="${ASP_RUNTIME_DIR:-$HOME/.agent-security-proxy}"
-PYTHON_BIN="${ASP_PYTHON:-/usr/local/bin/python3}"
+RUNTIME_DIR="${ASG_RUNTIME_DIR:-$HOME/.agent-security-gateway}"
+PYTHON_BIN="${ASG_PYTHON:-python3}"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$RUNTIME_DIR/logs"
 sed \
