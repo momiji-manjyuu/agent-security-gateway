@@ -6,6 +6,10 @@
 - Added route-based policy resolution for multi-backend AI systems.
 - Added `gateway.py` with `/healthz`, `/inspect`, `/routes`, `/v1/chat/completions`, `/v1/tasks`, `/v1/results`, and `/v1/approvals`.
 - Added route conflict detection, model alias routing, run-level scope, taint enforcement, action guard, and route-owned backend credentials.
+- Hardened `/v1/approvals` so only human/operator callers with `approve_action` can create target approvals, and target agents cannot self-approve.
+- Split non-approvable action guard categories from approvable categories and require category coverage in approval records.
+- Enforced route input policy fields including `max_messages`, `require_message_type`, `require_structured_task`, `allow_raw_external_content`, `disallow_external_urls`, and `max_batch_size`.
+- Added `/readyz` and canonical backend HMAC signing over method, path, body hash, ASG identity headers, and timestamp.
 - Preserved deterministic scanner, Unicode normalization, output guard, LLM inspector hook, kill switch, rate limit, and hash-chained JSONL audit logs from the proxy codebase.
 - Replaced runtime paths and scripts with `~/.agent-security-gateway` and `ASG_*`.
 - Added gateway config examples, request examples, schema references, migration notes, and security-first agent instructions.

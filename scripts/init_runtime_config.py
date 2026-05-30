@@ -52,7 +52,7 @@ def dry_run_backend(enabled_forward: bool, base_url: str, path: str, api_key_env
     }
 
 
-def build_config(args: argparse.Namespace, mac_token: str, pi_token: str) -> dict:
+def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_token: str) -> dict:
     cfg = json.loads(json.dumps(gateway.DEFAULT_CONFIG))
     bind_cidr = f"{args.bind}/32" if args.bind != "127.0.0.1" else "127.0.0.1/32"
     external_cidrs = args.external_cidr or []
@@ -69,9 +69,14 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str) -> dic
         "mac_gpt55": {
             "token_sha256": gateway.hash_token(mac_token),
             "trust_tier": "privileged_core",
-            "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge"],
+            "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "generate_image"],
             "allowed_client_cidrs": sorted({"127.0.0.1/32", bind_cidr}),
-            "allowed_routes": ["security.inspect_only", "pi.web_research.chat", "ubuntu1.knowledge.search_trusted"],
+            "allowed_routes": [
+                "security.inspect_only",
+                "pi.web_research.chat",
+                "ubuntu1.knowledge.search_trusted",
+                "windows_image.comfyui.generate",
+            ],
         },
         "pi_research_1": {
             "token_sha256": gateway.hash_token(pi_token),
@@ -79,6 +84,13 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str) -> dic
             "allowed_capabilities": ["inspect", "submit_source_card"],
             "allowed_client_cidrs": sorted({"127.0.0.1/32", *external_cidrs}),
             "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card"],
+        },
+        "human_operator": {
+            "token_sha256": gateway.hash_token(human_token),
+            "trust_tier": "human_control",
+            "allowed_capabilities": ["inspect", "approve_action"],
+            "allowed_client_cidrs": sorted({"127.0.0.1/32", bind_cidr}),
+            "allowed_routes": ["security.inspect_only", "security.approvals.create"],
         },
     }
     cfg["routes"].update(
@@ -111,7 +123,26 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str) -> dic
                 "backend": dry_run_backend(args.enable_forward, args.knowledge_backend_url, "/api/staging/source-card", "UBUNTU1_STAGING_BACKEND_KEY", 60),
                 "allowed_callers": ["pi_research_1"],
                 "required_capability": "submit_source_card",
-                "input_policy": {"accepted_taint": ["untrusted_web"], "allow_missing_taint": False},
+                "input_policy": {
+                    "accepted_taint": ["untrusted_web"],
+                    "allow_missing_taint": False,
+                    "require_message_type": "source_card",
+                    "allow_raw_external_content": False,
+                },
+                "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
+            },
+            "windows_image.comfyui.generate": {
+                "kind": "http_json",
+                "description": "Submit image generation jobs to a Windows image node.",
+                "backend": dry_run_backend(args.enable_forward, args.image_backend_url, "/prompt", "WINDOWS_IMAGE_BACKEND_KEY", 300),
+                "allowed_callers": ["mac_gpt55"],
+                "required_capability": "generate_image",
+                "input_policy": {
+                    "accepted_taint": ["trusted_instruction", "reviewed_prompt_matrix"],
+                    "allow_missing_taint": False,
+                    "disallow_external_urls": True,
+                    "max_batch_size": 32,
+                },
                 "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
             },
         }
@@ -138,6 +169,7 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--pi-backend-url", default="http://pi1-agent.internal:8000/v1")
     parser.add_argument("--knowledge-backend-url", default="http://ubuntu1-knowledge.internal:8801")
+    parser.add_argument("--image-backend-url", default="http://windows-image.internal:8188")
     args = parser.parse_args()
 
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -148,7 +180,8 @@ def main() -> int:
 
     mac_token = load_or_create_token(token_dir / "mac_gpt55.token", overwrite=args.force)
     pi_token = load_or_create_token(token_dir / "pi_research_1.token", overwrite=args.force)
-    cfg = build_config(args, mac_token, pi_token)
+    human_token = load_or_create_token(token_dir / "human_operator.token", overwrite=args.force)
+    cfg = build_config(args, mac_token, pi_token, human_token)
 
     config_path = args.runtime_dir / "config.json"
     if config_path.exists() and not args.force:
@@ -163,6 +196,7 @@ def main() -> int:
     print("token files are under tokens/ and raw token values were not printed")
     print(f"export ASG_CONFIG={config_path}")
     print(f"export ASG_AGENT_TOKEN=\"$(cat {token_dir / 'mac_gpt55.token'})\"")
+    print(f"human_operator_token_file={token_dir / 'human_operator.token'}")
     print("scripts/start.sh")
     print(f"python3 scripts/smoke_test.py --base-url http://{args.bind}:{args.port}")
     return 0

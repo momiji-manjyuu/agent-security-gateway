@@ -46,6 +46,19 @@ DEFAULT_APPROVAL_STORE = RUNTIME_DIR / "approvals.jsonl"
 MAX_TIMEOUT_SECONDS = 600
 ROUTE_KINDS = {"inspect_only", "openai_chat_completions", "http_json", "command"}
 PUBLIC_ROUTE_FIELDS = ("description", "kind", "required_capability", "allowed_capabilities", "aliases")
+NON_APPROVABLE_ACTION_CATEGORIES = {
+    "caller_controlled_backend",
+    "private_network_target",
+    "metadata_endpoint",
+    "dangerous_uri_scheme",
+    "secret_exfiltration",
+}
+APPROVABLE_ACTION_CATEGORIES = {
+    "host_package_install",
+    "external_upload",
+    "privileged_command",
+    "delete_operation",
+}
 CALLER_BACKEND_FIELD_NAMES = {
     "target_url",
     "backend_url",
@@ -56,10 +69,43 @@ CALLER_BACKEND_FIELD_NAMES = {
     "backend_endpoint",
     "x-target-url",
 }
+RAW_EXTERNAL_CONTENT_KEYS = {
+    "raw_content",
+    "raw_html",
+    "html",
+    "body_html",
+    "full_text",
+    "page_text",
+    "document_text",
+    "source_text",
+    "raw_document",
+    "raw_page",
+    "raw_markdown",
+    "transcript_raw",
+}
+BATCH_SIZE_KEYS = {
+    "batch_size",
+    "n",
+    "count",
+    "num_images",
+    "num_prompts",
+    "samples",
+}
+BATCH_LIST_KEYS = {
+    "prompts",
+    "prompt_matrix",
+    "items",
+    "jobs",
+    "requests",
+}
+SHELL_LIKE_PATTERN = re.compile(
+    r"\b(?:curl|wget|bash|zsh|sh|sudo|rm\s+-rf|python\s+-c|pip\s+install|npm\s+install|apt(?:-get)?\s+install|brew\s+install)\b",
+    re.IGNORECASE,
+)
 DANGEROUS_ACTION_PATTERNS: list[tuple[str, str, int, str]] = [
     ("secret_exfiltration", r"\b(read|open|cat|show|print|dump|send|upload)\b.{0,100}(\.env|id_rsa|credentials?|auth\.json|private key|api[_ -]?key|token)", 10, "secret exfiltration request"),
     ("curl_pipe_shell", r"\bcurl\b[^\n|]{0,200}\|\s*(sh|bash|zsh)\b", 10, "curl piped into a shell"),
-    ("sudo", r"\bsudo\b", 9, "sudo is disallowed"),
+    ("privileged_command", r"\bsudo\b", 9, "sudo is disallowed"),
     ("host_package_install", r"\b(apt|apt-get|brew|yum|dnf|pacman|pip|npm|pnpm|yarn)\s+(install|add)\b", 9, "host package install is disallowed"),
     ("external_upload", r"\b(upload|post|publish|send)\b.{0,80}\b(http|https|external|slack|discord|twitter|x\.com|github|gist|s3|drive)\b", 8, "external upload or publish is disallowed"),
     ("email_send", r"\b(email|mail|smtp)\b.{0,80}\b(send|deliver|forward)\b|\b(send|forward)\b.{0,80}\b(email|mail)\b", 8, "email sending is disallowed"),
@@ -123,7 +169,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "block_private_urls": True,
                 "block_internal_paths": True,
             },
-        }
+        },
+        "security.approvals.create": {
+            "kind": "inspect_only",
+            "description": "Create a human/operator approval artifact for a target agent action.",
+            "aliases": ["asg/approvals-create"],
+            "allowed_callers": ["human_operator"],
+            "required_capability": "approve_action",
+            "input_policy": {
+                "accepted_taint": ["human_approved"],
+                "allow_missing_taint": True,
+            },
+            "output_policy": {
+                "block_secrets": True,
+                "block_private_urls": True,
+                "block_internal_paths": True,
+            },
+        },
     },
     "runs": {},
 }
@@ -584,6 +646,105 @@ def enforce_taint_policy(decision: RouteDecision) -> None:
         raise GatewayError(403, "taint_denied", f"route '{decision.route_id}' does not accept taint: {', '.join(rejected)}")
 
 
+def payload_message_type(payload: dict[str, Any]) -> str:
+    meta = metadata(payload)
+    value = payload.get("message_type")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    meta_value = meta.get("message_type")
+    return meta_value.strip() if isinstance(meta_value, str) and meta_value.strip() else ""
+
+
+def enforce_input_policy(payload: dict[str, Any], decision: RouteDecision) -> None:
+    policy = decision.route.get("input_policy", {})
+    if not isinstance(policy, dict):
+        raise GatewayError(403, "input_policy_denied", "route input_policy is invalid")
+
+    if "max_messages" in policy:
+        max_messages, ok = parse_int(policy.get("max_messages"), default=0)
+        if not ok or max_messages < 0:
+            raise GatewayError(403, "input_policy_denied", "route max_messages policy is invalid")
+        messages = payload.get("messages")
+        if isinstance(messages, list) and len(messages) > max_messages:
+            raise GatewayError(403, "input_policy_denied", f"route allows at most {max_messages} messages")
+
+    required_message_type = policy.get("require_message_type")
+    if isinstance(required_message_type, str) and required_message_type.strip():
+        if payload_message_type(payload) != required_message_type.strip():
+            raise GatewayError(403, "input_policy_denied", f"route requires message_type '{required_message_type.strip()}'")
+
+    if policy.get("require_structured_task"):
+        if not structured_task_allowed(payload):
+            raise GatewayError(403, "input_policy_denied", "route requires a structured task packet")
+
+    if policy.get("allow_raw_external_content") is False:
+        for path, _ in recursive_items(payload):
+            key = path.rsplit(".", 1)[-1]
+            if "[" in key:
+                key = key.rsplit("[", 1)[0]
+            if key.lower() in RAW_EXTERNAL_CONTENT_KEYS:
+                raise GatewayError(403, "input_policy_denied", f"raw external content field is not allowed: {key}")
+
+    if policy.get("disallow_external_urls"):
+        for _, value in recursive_items(payload):
+            if isinstance(value, str) and security.URL_PATTERN.search(value):
+                raise GatewayError(403, "input_policy_denied", "external URLs are not allowed on this route")
+
+    if "max_batch_size" in policy:
+        max_batch_size, ok = parse_int(policy.get("max_batch_size"), default=0)
+        if not ok or max_batch_size < 1:
+            raise GatewayError(403, "input_policy_denied", "route max_batch_size policy is invalid")
+        enforce_batch_size_policy(payload, max_batch_size)
+
+    if policy.get("forbid_shell_from_chat") or decision.route.get("action_policy", {}).get("forbid_shell_from_chat"):
+        if chat_messages_contain_shell(payload):
+            raise GatewayError(403, "input_policy_denied", "shell-like commands in chat messages are not allowed on this route")
+
+
+def structured_task_allowed(payload: dict[str, Any]) -> bool:
+    task = payload.get("task")
+    if isinstance(task, dict):
+        objective = task.get("objective")
+        if not isinstance(objective, str) or not objective.strip():
+            return False
+        if "constraints" in task and not isinstance(task.get("constraints"), dict):
+            return False
+        if "output_contract" in task and not isinstance(task.get("output_contract"), dict):
+            return False
+        return True
+    return payload_message_type(payload) == "task_instruction" and isinstance(payload.get("messages"), list)
+
+
+def enforce_batch_size_policy(payload: dict[str, Any], max_batch_size: int) -> None:
+    for path, value in recursive_items(payload):
+        key = path.rsplit(".", 1)[-1].lower()
+        if "[" in key:
+            key = key.rsplit("[", 1)[0]
+        if key in BATCH_SIZE_KEYS:
+            if isinstance(value, bool):
+                raise GatewayError(403, "input_policy_denied", f"batch size field must be an integer: {key}")
+            number, ok = parse_int(value, default=0)
+            if not ok:
+                raise GatewayError(403, "input_policy_denied", f"batch size field must be an integer: {key}")
+            if number > max_batch_size:
+                raise GatewayError(403, "input_policy_denied", f"batch size exceeds route maximum {max_batch_size}")
+        if key in BATCH_LIST_KEYS and isinstance(value, list) and len(value) > max_batch_size:
+            raise GatewayError(403, "input_policy_denied", f"batch list exceeds route maximum {max_batch_size}")
+
+
+def chat_messages_contain_shell(payload: dict[str, Any]) -> bool:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        text = security.content_to_text(message.get("content"))
+        if SHELL_LIKE_PATTERN.search(text):
+            return True
+    return False
+
+
 def scan_inbound(payload: dict[str, Any], cfg: dict[str, Any]) -> security.InboundScan:
     return security.scan_inbound_payload(payload, cfg)
 
@@ -661,14 +822,27 @@ def approval_store_path(cfg: dict[str, Any]) -> Path:
     return expand_path(str(cfg.get("approval_store", DEFAULT_APPROVAL_STORE)))
 
 
-def approval_record_valid(record: dict[str, Any], decision: RouteDecision, verified: VerifiedAgent, action_hash: str) -> bool:
-    if record.get("agent_id") != verified.agent_id:
+def approval_record_valid(
+    record: dict[str, Any],
+    decision: RouteDecision,
+    verified: VerifiedAgent,
+    action_hash: str,
+    required_categories: set[str],
+) -> bool:
+    if not isinstance(record.get("approver_agent_id"), str) or not record.get("approver_agent_id", "").strip():
         return False
-    if record.get("route_id") != decision.route_id:
+    if record.get("target_agent_id") != verified.agent_id:
         return False
-    if record.get("capability") != decision.capability:
+    if record.get("target_route_id") != decision.route_id:
+        return False
+    if record.get("target_capability") != decision.capability:
         return False
     if record.get("normalized_action_hash") != action_hash:
+        return False
+    approved = record.get("approved_categories")
+    if not isinstance(approved, list) or not approved or not all(isinstance(item, str) and item.strip() for item in approved):
+        return False
+    if not required_categories.issubset({str(item).strip() for item in approved}):
         return False
     try:
         if parse_datetime(str(record.get("expires_at"))) < dt.datetime.now(dt.timezone.utc):
@@ -678,7 +852,13 @@ def approval_record_valid(record: dict[str, Any], decision: RouteDecision, verif
     return True
 
 
-def has_approval(cfg: dict[str, Any], decision: RouteDecision, verified: VerifiedAgent, action_hash: str) -> bool:
+def has_approval(
+    cfg: dict[str, Any],
+    decision: RouteDecision,
+    verified: VerifiedAgent,
+    action_hash: str,
+    required_categories: set[str],
+) -> bool:
     path = approval_store_path(cfg)
     if not path.exists():
         return False
@@ -690,7 +870,7 @@ def has_approval(cfg: dict[str, Any], decision: RouteDecision, verified: Verifie
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(record, dict) and approval_record_valid(record, decision, verified, action_hash):
+            if isinstance(record, dict) and approval_record_valid(record, decision, verified, action_hash, required_categories):
                 return True
     return False
 
@@ -706,11 +886,20 @@ def enforce_action_guard(
     policy = decision.route.get("action_policy", {})
     approval_categories = {str(item) for item in policy.get("approval_required_for", [])} if isinstance(policy, dict) else set()
     finding_keys = {finding.category.removeprefix("action_guard:") for finding in result.findings}
-    if approval_categories and finding_keys & approval_categories:
-        if has_approval(cfg, decision, verified, result.normalized_action_hash):
-            return
-        raise GatewayError(403, "approval_required", "action requires a matching approval artifact")
-    raise GatewayError(403, "blocked_by_action_guard", "request was blocked by action guard")
+    if finding_keys & NON_APPROVABLE_ACTION_CATEGORIES:
+        raise GatewayError(403, "blocked_by_action_guard", "request contains a non-approvable action guard finding")
+
+    approvable_findings = finding_keys & APPROVABLE_ACTION_CATEGORIES
+    unknown_findings = finding_keys - NON_APPROVABLE_ACTION_CATEGORIES - APPROVABLE_ACTION_CATEGORIES
+    if unknown_findings:
+        raise GatewayError(403, "blocked_by_action_guard", "request contains an unknown action guard finding")
+    if not approvable_findings:
+        raise GatewayError(403, "blocked_by_action_guard", "request was blocked by action guard")
+    if not approvable_findings.issubset(approval_categories):
+        raise GatewayError(403, "blocked_by_action_guard", "route does not allow approval for this action category")
+    if has_approval(cfg, decision, verified, result.normalized_action_hash, approvable_findings):
+        return
+    raise GatewayError(403, "approval_required", "action requires a matching approval artifact")
 
 
 def backend_headers(
@@ -719,12 +908,16 @@ def backend_headers(
     verified: VerifiedAgent,
     body: bytes,
     backend: dict[str, Any],
+    backend_path: str,
 ) -> dict[str, str]:
+    body_sha256 = hashlib.sha256(body).hexdigest()
+    timestamp = utc_now()
     headers = {
         "Content-Type": "application/json",
         "X-ASG-Agent-Id": verified.agent_id,
         "X-ASG-Route-Id": decision.route_id,
-        "X-ASG-Request-SHA256": sha256_text(body.decode("utf-8", errors="replace")),
+        "X-ASG-Request-SHA256": body_sha256,
+        "X-ASG-Timestamp": timestamp,
     }
     if decision.run_id:
         headers["X-ASG-Run-Id"] = decision.run_id
@@ -737,7 +930,19 @@ def backend_headers(
     hmac_env = str(cfg.get("backend_hmac_key_env", "") or "")
     hmac_key = os.environ.get(hmac_env, "") if hmac_env else ""
     if hmac_key:
-        signature = hmac.new(hmac_key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        canonical = "\n".join(
+            [
+                "POST",
+                backend_path or "/",
+                body_sha256,
+                headers["X-ASG-Agent-Id"],
+                headers["X-ASG-Route-Id"],
+                headers.get("X-ASG-Run-Id", ""),
+                headers.get("X-ASG-Task-Id", ""),
+                timestamp,
+            ]
+        )
+        signature = hmac.new(hmac_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
         headers["X-ASG-Signature"] = "sha256=" + signature
     return headers
 
@@ -791,9 +996,10 @@ def forward_http_json(
     if backend.get("dry_run") or str(backend.get("base_url", "")).startswith("mock://"):
         return 200, {"ok": True, "dry_run": True, "route_id": decision.route_id}
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    headers = backend_headers(cfg, decision, verified, body, backend)
+    url = backend_url(backend, "/")
+    headers = backend_headers(cfg, decision, verified, body, backend, urllib.parse.urlsplit(url).path or "/")
     request = urllib.request.Request(
-        backend_url(backend, "/"),
+        url,
         data=body,
         method="POST",
         headers=headers,
@@ -823,9 +1029,10 @@ def forward_openai_chat(
         return 200, openai_response("DRY_RUN: request accepted by Agent Security Gateway but not forwarded.", decision.route_id)
     body_payload = build_openai_backend_payload(payload, decision)
     body = json.dumps(body_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    headers = backend_headers(cfg, decision, verified, body, backend)
+    url = backend_url(backend, "/chat/completions")
+    headers = backend_headers(cfg, decision, verified, body, backend, urllib.parse.urlsplit(url).path or "/")
     request = urllib.request.Request(
-        backend_url(backend, "/chat/completions"),
+        url,
         data=body,
         method="POST",
         headers=headers,
@@ -956,6 +1163,26 @@ def public_route(route_id: str, route: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def readiness_status(cfg: dict[str, Any]) -> dict[str, Any]:
+    checks: dict[str, Any] = {
+        "config_loaded": isinstance(cfg, dict),
+        "routes_present": bool(cfg.get("routes")),
+        "audit_parent_writable": False,
+        "approval_parent_writable": False,
+        "kill_switch_inactive": not expand_path(str(cfg.get("kill_switch_file", DEFAULT_KILL_SWITCH))).exists(),
+    }
+    audit_parent = expand_path(str(cfg.get("audit_log", DEFAULT_AUDIT_PATH))).parent
+    approval_parent = approval_store_path(cfg).parent
+    checks["audit_parent_writable"] = audit_parent.exists() and os.access(audit_parent, os.W_OK)
+    checks["approval_parent_writable"] = approval_parent.exists() and os.access(approval_parent, os.W_OK)
+    return {
+        "ok": all(bool(value) for value in checks.values()),
+        "app": APP_NAME,
+        "version": VERSION,
+        "checks": checks,
+    }
+
+
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
     server_version = "AgentSecurityGateway/" + VERSION
 
@@ -971,6 +1198,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "routes": len(cfg.get("routes") or {}),
                 },
             )
+            return
+        if self.path == "/readyz":
+            cfg = self.server.config  # type: ignore[attr-defined]
+            ready = readiness_status(cfg)
+            self.write_json(200 if ready["ok"] else 503, ready)
             return
         if self.path == "/routes":
             self.handle_routes()
@@ -1064,6 +1296,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             decision = resolve_route_decision(self.headers, payload, cfg)
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
+            enforce_input_policy(payload, decision)
             inbound = scan_inbound(payload, cfg)
             action = action_guard(self.headers, payload)
             event = {
@@ -1124,22 +1357,66 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
+        decision: RouteDecision | None = None
         try:
             self.check_kill_switch(cfg, request_id, client_ip)
             payload = self.read_json_body(cfg)
             verified = verify_agent(self.headers, cfg, client_ip)
-            required = ("approval_id", "agent_id", "route_id", "capability", "normalized_action_hash", "approved_by", "expires_at")
+            decision = resolve_route_decision(self.headers, payload, cfg)
+            if decision.route_id != "security.approvals.create":
+                raise GatewayError(403, "route_denied", "/v1/approvals requires route 'security.approvals.create'")
+            enforce_route_policy(verified, decision, cfg)
+            enforce_input_policy(payload, decision)
+
+            required = (
+                "approval_id",
+                "target_agent_id",
+                "target_route_id",
+                "target_capability",
+                "normalized_action_hash",
+                "approved_by",
+                "expires_at",
+            )
             missing = [field for field in required if not isinstance(payload.get(field), str) or not payload.get(field, "").strip()]
             if missing:
                 raise GatewayError(400, "invalid_json", "approval is missing required fields: " + ", ".join(missing))
-            if payload["agent_id"] != verified.agent_id:
-                raise GatewayError(403, "capability_denied", "approval agent_id must match authenticated agent")
-            if payload["route_id"] not in set(str(item) for item in verified.agent.get("allowed_routes") or []):
-                raise GatewayError(403, "route_denied", "approval route is not allowed for this agent")
-            if payload["capability"] not in set(str(item) for item in verified.agent.get("allowed_capabilities") or []):
-                raise GatewayError(403, "capability_denied", "approval capability is not allowed for this agent")
+            approved_categories = payload.get("approved_categories")
+            if not isinstance(approved_categories, list) or not approved_categories or not all(
+                isinstance(item, str) and item.strip() for item in approved_categories
+            ):
+                raise GatewayError(400, "invalid_json", "approved_categories must be a non-empty string array")
+            approved_category_set = {str(item).strip() for item in approved_categories}
+            if not approved_category_set.issubset(APPROVABLE_ACTION_CATEGORIES):
+                raise GatewayError(400, "invalid_json", "approved_categories contains a non-approvable category")
+            if payload["target_agent_id"] == verified.agent_id:
+                raise GatewayError(403, "self_approval_denied", "agents cannot approve their own actions")
+            target_agent = (cfg.get("agents") or {}).get(payload["target_agent_id"])
+            if not isinstance(target_agent, dict):
+                raise GatewayError(400, "invalid_json", "unknown target_agent_id")
+            if payload["target_route_id"] not in (cfg.get("routes") or {}):
+                raise GatewayError(404, "unknown_route", "unknown target_route_id")
+            if payload["target_route_id"] not in set(str(item) for item in target_agent.get("allowed_routes") or []):
+                raise GatewayError(403, "route_denied", "target agent is not allowed to use target_route_id")
+            if payload["target_capability"] not in set(str(item) for item in target_agent.get("allowed_capabilities") or []):
+                raise GatewayError(403, "capability_denied", "target agent is not allowed to use target_capability")
             parse_datetime(payload["expires_at"])
-            record = {field: payload[field] for field in required}
+            inbound = scan_inbound(payload, cfg)
+            if inbound.scan.blocked:
+                raise GatewayError(403, "blocked_by_input_guard", "approval payload was blocked by input guard")
+            record = {
+                "approval_id": payload["approval_id"],
+                "approver_agent_id": verified.agent_id,
+                "approver_trust_tier": verified.agent.get("trust_tier"),
+                "target_agent_id": payload["target_agent_id"],
+                "target_route_id": payload["target_route_id"],
+                "target_capability": payload["target_capability"],
+                "normalized_action_hash": payload["normalized_action_hash"],
+                "approved_categories": sorted(approved_category_set),
+                "approved_by": payload["approved_by"],
+                "expires_at": payload["expires_at"],
+                "created_at": utc_now(),
+                "reason": str(payload.get("reason", "")),
+            }
             path = approval_store_path(cfg)
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:
@@ -1148,10 +1425,23 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
             except FileNotFoundError:
                 pass
-            write_audit(cfg, {"event": "approval", "decision": "stored", **audit_base(request_id, verified, client_ip), "approval_id": record["approval_id"], "route_id": record["route_id"], "capability": record["capability"]})
+            write_audit(
+                cfg,
+                {
+                    "event": "approval",
+                    "decision": "stored",
+                    **audit_base(request_id, verified, client_ip, decision),
+                    "approval_id": record["approval_id"],
+                    "target_agent_id": record["target_agent_id"],
+                    "target_route_id": record["target_route_id"],
+                    "target_capability": record["target_capability"],
+                    "approved_categories": record["approved_categories"],
+                    "scan": security.public_scan_for_audit(inbound.scan, cfg),
+                },
+            )
             self.write_json(200, {"ok": True, "request_id": request_id, "approval_id": record["approval_id"]})
         except GatewayError as exc:
-            self.deny(cfg, exc, request_id, client_ip, verified, None)
+            self.deny(cfg, exc, request_id, client_ip, verified, decision)
         except Exception as exc:  # noqa: BLE001
             self.internal_error(cfg, exc, request_id, client_ip)
 

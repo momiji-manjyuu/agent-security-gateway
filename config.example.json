@@ -66,6 +66,22 @@
         "security.inspect_only",
         "ubuntu1.knowledge.submit_verification_result"
       ]
+    },
+    "human_operator": {
+      "token_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "trust_tier": "human_control",
+      "allowed_client_cidrs": [
+        "127.0.0.1/32",
+        "192.168.10.10/32"
+      ],
+      "allowed_capabilities": [
+        "inspect",
+        "approve_action"
+      ],
+      "allowed_routes": [
+        "security.inspect_only",
+        "security.approvals.create"
+      ]
     }
   },
   "routes": {
@@ -93,6 +109,28 @@
           "promoted_knowledge"
         ],
         "allow_missing_taint": true
+      }
+    },
+    "security.approvals.create": {
+      "kind": "inspect_only",
+      "description": "Create a human/operator approval artifact for a target agent action.",
+      "aliases": [
+        "asg/approvals-create"
+      ],
+      "allowed_callers": [
+        "human_operator"
+      ],
+      "required_capability": "approve_action",
+      "input_policy": {
+        "accepted_taint": [
+          "human_approved"
+        ],
+        "allow_missing_taint": true
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
       }
     },
     "pi.web_research.chat": {

@@ -17,6 +17,13 @@
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.30.11/32"],
       "allowed_capabilities": ["inspect", "submit_source_card"],
       "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card"]
+    },
+    "human_operator": {
+      "token_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "trust_tier": "human_control",
+      "allowed_client_cidrs": ["127.0.0.1/32", "192.168.10.10/32"],
+      "allowed_capabilities": ["inspect", "approve_action"],
+      "allowed_routes": ["security.inspect_only", "security.approvals.create"]
     }
   },
   "routes": {
@@ -27,6 +34,16 @@
       "required_capability": "inspect",
       "input_policy": {
         "accepted_taint": ["trusted_instruction", "untrusted_web", "sandbox_output", "model_output"],
+        "allow_missing_taint": true
+      }
+    },
+    "security.approvals.create": {
+      "kind": "inspect_only",
+      "aliases": ["asg/approvals-create"],
+      "allowed_callers": ["human_operator"],
+      "required_capability": "approve_action",
+      "input_policy": {
+        "accepted_taint": ["human_approved"],
         "allow_missing_taint": true
       }
     },
@@ -79,7 +96,9 @@
       "required_capability": "submit_source_card",
       "input_policy": {
         "accepted_taint": ["untrusted_web"],
-        "allow_missing_taint": false
+        "allow_missing_taint": false,
+        "require_message_type": "source_card",
+        "allow_raw_external_content": false
       }
     }
   }

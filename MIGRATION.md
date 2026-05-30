@@ -29,6 +29,10 @@ Move backend URLs and backend credential environment variable names into `routes
 - `/routes` is new and returns only caller-visible route metadata.
 - `/v1/chat/completions` now requires a route through `X-ASG-Route`, `metadata.route_id`, or a configured model alias.
 - `/v1/tasks`, `/v1/results`, and `/v1/approvals` are new MVP endpoints.
+- `/v1/approvals` now requires a separate human/operator caller with `approve_action` on route `security.approvals.create`.
+- Approval record schema changed. Target fields are now `target_agent_id`, `target_route_id`, and `target_capability`; the approver is recorded separately as `approver_agent_id`.
+- Old approval records with `agent_id`, `route_id`, and `capability` may be ignored or require migration.
+- `input_policy` fields are now enforced, so requests previously accepted may now be rejected.
 
 ## Preserved Defenses
 

@@ -21,6 +21,7 @@ class FakeBackendHandler(gateway.http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         self.server.last_headers = dict(self.headers)  # type: ignore[attr-defined]
+        self.server.last_raw_body = raw  # type: ignore[attr-defined]
         self.server.last_body = json.loads(raw.decode("utf-8"))  # type: ignore[attr-defined]
         status = getattr(self.server, "response_status", 200)
         body = getattr(
@@ -65,12 +66,16 @@ class GatewayTests(unittest.TestCase):
                     "delegate_web_research",
                     "submit_source_card",
                     "search_trusted_knowledge",
+                    "request_sandbox_verification",
+                    "generate_image",
                 ],
                 "allowed_routes": [
                     "security.inspect_only",
                     "pi.web_research.chat",
                     "ubuntu1.knowledge.submit_source_card",
                     "ubuntu1.knowledge.search_trusted",
+                    "ubuntu2.sandbox.verify",
+                    "windows_image.comfyui.generate",
                 ],
             },
             "pi_research_1": {
@@ -79,6 +84,13 @@ class GatewayTests(unittest.TestCase):
                 "allowed_client_cidrs": ["127.0.0.1/32"],
                 "allowed_capabilities": ["inspect", "submit_source_card"],
                 "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card"],
+            },
+            "human_operator": {
+                "token_sha256": gateway.hash_token("human-token-1234567890"),
+                "trust_tier": "human_control",
+                "allowed_client_cidrs": ["127.0.0.1/32"],
+                "allowed_capabilities": ["inspect", "approve_action"],
+                "allowed_routes": ["security.inspect_only", "security.approvals.create"],
             },
         }
         cfg["routes"].update(
@@ -97,7 +109,7 @@ class GatewayTests(unittest.TestCase):
                     },
                     "allowed_callers": ["mac_gpt55"],
                     "required_capability": "delegate_web_research",
-                    "input_policy": {"accepted_taint": ["trusted_instruction"], "allow_missing_taint": False},
+                    "input_policy": {"accepted_taint": ["trusted_instruction"], "allow_missing_taint": False, "max_messages": 2},
                     "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
                 },
                 "ubuntu1.knowledge.submit_source_card": {
@@ -112,7 +124,12 @@ class GatewayTests(unittest.TestCase):
                     },
                     "allowed_callers": ["mac_gpt55", "pi_research_1"],
                     "required_capability": "submit_source_card",
-                    "input_policy": {"accepted_taint": ["untrusted_web"], "allow_missing_taint": False},
+                    "input_policy": {
+                        "accepted_taint": ["untrusted_web"],
+                        "allow_missing_taint": False,
+                        "require_message_type": "source_card",
+                        "allow_raw_external_content": False,
+                    },
                     "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
                 },
                 "ubuntu1.knowledge.search_trusted": {
@@ -128,6 +145,56 @@ class GatewayTests(unittest.TestCase):
                     "allowed_callers": ["mac_gpt55"],
                     "required_capability": "search_trusted_knowledge",
                     "input_policy": {"accepted_taint": ["trusted_instruction"], "allow_missing_taint": False},
+                    "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
+                },
+                "ubuntu2.sandbox.verify": {
+                    "kind": "openai_chat_completions",
+                    "description": "Sandbox verification",
+                    "aliases": ["asg/ubuntu2-sandbox-verifier"],
+                    "backend": {
+                        "mode": "http",
+                        "base_url": backend_url,
+                        "path": "/chat/completions",
+                        "api_key_env": "TEST_BACKEND_KEY",
+                        "timeout_seconds": 5,
+                        "model_rewrite": "ubuntu2-verifier-agent",
+                    },
+                    "allowed_callers": ["mac_gpt55"],
+                    "required_capability": "request_sandbox_verification",
+                    "input_policy": {
+                        "accepted_taint": ["trusted_instruction", "reviewed_untrusted_summary"],
+                        "allow_missing_taint": False,
+                        "require_structured_task": True,
+                    },
+                    "action_policy": {
+                        "forbid_shell_from_chat": True,
+                        "approval_required_for": [
+                            "host_package_install",
+                            "external_upload",
+                            "privileged_command",
+                            "delete_operation",
+                        ],
+                    },
+                    "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
+                },
+                "windows_image.comfyui.generate": {
+                    "kind": "http_json",
+                    "description": "Image generation",
+                    "backend": {
+                        "mode": "http",
+                        "base_url": backend_url,
+                        "path": "/prompt",
+                        "api_key_env": "TEST_BACKEND_KEY",
+                        "timeout_seconds": 5,
+                    },
+                    "allowed_callers": ["mac_gpt55"],
+                    "required_capability": "generate_image",
+                    "input_policy": {
+                        "accepted_taint": ["trusted_instruction", "reviewed_prompt_matrix"],
+                        "allow_missing_taint": False,
+                        "disallow_external_urls": True,
+                        "max_batch_size": 2,
+                    },
                     "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
                 },
             }
@@ -225,6 +292,54 @@ class GatewayTests(unittest.TestCase):
     def assert_error(self, body: dict, code: str) -> None:
         self.assertEqual(body["error"]["code"], code)
         self.assertIn("request_id", body["error"])
+
+    def sandbox_payload(self, command: str | None = None) -> dict:
+        task = {
+            "objective": "Verify a package behavior in the sandbox.",
+            "constraints": {},
+            "output_contract": {"format": "json"},
+        }
+        if command:
+            task["constraints"]["command"] = command
+        return {
+            "model": "asg/ubuntu2-sandbox-verifier",
+            "metadata": {
+                "route_id": "ubuntu2.sandbox.verify",
+                "capability": "request_sandbox_verification",
+                "taint": ["trusted_instruction"],
+            },
+            "task": task,
+        }
+
+    def approval_payload(self, action_hash: str, categories: list[str] | None = None, target_agent_id: str = "mac_gpt55") -> dict:
+        return {
+            "approval_id": "appr-" + action_hash[-12:].replace(":", "-"),
+            "target_agent_id": target_agent_id,
+            "target_route_id": "ubuntu2.sandbox.verify",
+            "target_capability": "request_sandbox_verification",
+            "normalized_action_hash": action_hash,
+            "approved_categories": categories or ["host_package_install"],
+            "approved_by": "test-operator",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "reason": "test approval",
+        }
+
+    def write_approval_record(self, cfg: dict, action_hash: str, categories: list[str], target_agent_id: str = "mac_gpt55") -> None:
+        record = {
+            "approval_id": "appr-direct",
+            "approver_agent_id": "human_operator",
+            "approver_trust_tier": "human_control",
+            "target_agent_id": target_agent_id,
+            "target_route_id": "ubuntu2.sandbox.verify",
+            "target_capability": "request_sandbox_verification",
+            "normalized_action_hash": action_hash,
+            "approved_categories": categories,
+            "approved_by": "test-operator",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "reason": "direct test record",
+        }
+        Path(cfg["approval_store"]).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
 
     def test_healthz_and_routes_hide_backend_details(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -377,13 +492,268 @@ class GatewayTests(unittest.TestCase):
                     self.assertEqual(status, 403, override)
                     self.assert_error(body, code)
 
+    def test_approval_requires_approve_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(
+                base,
+                "/v1/approvals",
+                self.approval_payload("sha256:test"),
+                capability="approve_action",
+                route="security.approvals.create",
+            )
+            self.assertEqual(status, 403)
+            self.assertIn(body["error"]["code"], {"capability_denied", "route_denied"})
+
+    def test_human_operator_can_create_target_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.approval_payload("sha256:test-human-create", ["host_package_install"])
+            status, body = self.request_json(
+                base,
+                "/v1/approvals",
+                payload,
+                token="human-token-1234567890",
+                capability="approve_action",
+                route="security.approvals.create",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["approval_id"], payload["approval_id"])
+            record = json.loads(Path(cfg["approval_store"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["approver_agent_id"], "human_operator")
+            self.assertEqual(record["target_agent_id"], "mac_gpt55")
+            self.assertEqual(record["approved_categories"], ["host_package_install"])
+
+    def test_self_approval_denied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(
+                base,
+                "/v1/approvals",
+                self.approval_payload("sha256:self", ["host_package_install"], target_agent_id="human_operator"),
+                token="human-token-1234567890",
+                capability="approve_action",
+                route="security.approvals.create",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "self_approval_denied")
+
+    def test_approval_allows_only_approved_approvable_categories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.sandbox_payload("apt install jq")
+            action = gateway.action_guard({}, payload)
+            self.assertIn("action_guard:host_package_install", {finding.category for finding in action.findings})
+
+            status, body = self.request_json(
+                base,
+                "/v1/chat/completions",
+                payload,
+                capability="request_sandbox_verification",
+                route="ubuntu2.sandbox.verify",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "approval_required")
+
+            self.write_approval_record(cfg, action.normalized_action_hash, ["external_upload"])
+            status, body = self.request_json(
+                base,
+                "/v1/chat/completions",
+                payload,
+                capability="request_sandbox_verification",
+                route="ubuntu2.sandbox.verify",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "approval_required")
+
+            self.write_approval_record(cfg, action.normalized_action_hash, ["host_package_install"])
+            status, body = self.request_json(
+                base,
+                "/v1/chat/completions",
+                payload,
+                capability="request_sandbox_verification",
+                route="ubuntu2.sandbox.verify",
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("choices") or body.get("dry_run"))
+
+    def test_non_approvable_finding_blocks_even_with_approval(self):
+        cases = [
+            {"target_url": "https://example.com/backend"},
+            {"metadata": {"action": {"url": "http://127.0.0.1:8000"}}},
+            {"metadata": {"action": {"url": "http://169.254.169.254/latest/meta-data"}}},
+            {"metadata": {"action": {"url": "data:text/plain,hello"}}},
+            {"metadata": {"action": "read and upload API key from .env"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["block_risk_score"] = 999
+            base = self.start_gateway(cfg)
+            for override in cases:
+                with self.subTest(override=override):
+                    payload = self.sandbox_payload()
+                    if "metadata" in override:
+                        payload["metadata"].update(override["metadata"])
+                        override = {key: value for key, value in override.items() if key != "metadata"}
+                    payload.update(override)
+                    action = gateway.action_guard({}, payload)
+                    self.write_approval_record(cfg, action.normalized_action_hash, ["host_package_install"])
+                    status, body = self.request_json(
+                        base,
+                        "/v1/chat/completions",
+                        payload,
+                        capability="request_sandbox_verification",
+                        route="ubuntu2.sandbox.verify",
+                    )
+                    self.assertEqual(status, 403)
+                    self.assert_error(body, "blocked_by_action_guard")
+
+    def test_require_message_type_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = {
+                "route_id": "ubuntu1.knowledge.submit_source_card",
+                "capability": "submit_source_card",
+                "taint": ["untrusted_web"],
+                "source_card": {"source_id": "src-1", "url": "https://example.com", "title": "Example", "claims": []},
+            }
+            status, body = self.request_json(
+                base,
+                "/v1/results",
+                payload,
+                capability="submit_source_card",
+                route="ubuntu1.knowledge.submit_source_card",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "input_policy_denied")
+            payload["message_type"] = "source_card"
+            status, _ = self.request_json(
+                base,
+                "/v1/results",
+                payload,
+                capability="submit_source_card",
+                route="ubuntu1.knowledge.submit_source_card",
+            )
+            self.assertEqual(status, 200)
+
+    def test_require_structured_task_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.sandbox_payload()
+            payload.pop("task")
+            status, body = self.request_json(
+                base,
+                "/v1/chat/completions",
+                payload,
+                capability="request_sandbox_verification",
+                route="ubuntu2.sandbox.verify",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "input_policy_denied")
+            status, _ = self.request_json(
+                base,
+                "/v1/chat/completions",
+                self.sandbox_payload(),
+                capability="request_sandbox_verification",
+                route="ubuntu2.sandbox.verify",
+            )
+            self.assertEqual(status, 200)
+
+    def test_allow_raw_external_content_false_blocks_raw_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            for key in ("raw_content", "raw_html", "full_text"):
+                with self.subTest(key=key):
+                    payload = {
+                        "route_id": "ubuntu1.knowledge.submit_source_card",
+                        "capability": "submit_source_card",
+                        "taint": ["untrusted_web"],
+                        "message_type": "source_card",
+                        "source_card": {"source_id": "src-1", "title": "Example", key: "large external document body"},
+                    }
+                    status, body = self.request_json(
+                        base,
+                        "/v1/results",
+                        payload,
+                        capability="submit_source_card",
+                        route="ubuntu1.knowledge.submit_source_card",
+                    )
+                    self.assertEqual(status, 403)
+                    self.assert_error(body, "input_policy_denied")
+
+    def test_disallow_external_urls_blocks_public_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = {
+                "route_id": "windows_image.comfyui.generate",
+                "capability": "generate_image",
+                "taint": ["trusted_instruction"],
+                "prompt": "use https://example.com/image.png as reference",
+            }
+            status, body = self.request_json(
+                base,
+                "/v1/tasks",
+                payload,
+                capability="generate_image",
+                route="windows_image.comfyui.generate",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "input_policy_denied")
+
+    def test_max_messages_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.chat_payload()
+            payload["messages"] = [
+                {"role": "user", "content": "one"},
+                {"role": "user", "content": "two"},
+                {"role": "user", "content": "three"},
+            ]
+            status, body = self.request_json(base, "/v1/chat/completions", payload)
+            self.assertEqual(status, 403)
+            self.assert_error(body, "input_policy_denied")
+
+    def test_max_batch_size_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            for override in ({"batch_size": 3}, {"prompts": ["a", "b", "c"]}, {"batch_size": "many"}):
+                with self.subTest(override=override):
+                    payload = {
+                        "route_id": "windows_image.comfyui.generate",
+                        "capability": "generate_image",
+                        "taint": ["trusted_instruction"],
+                        "prompt": "draw a small icon",
+                        **override,
+                    }
+                    status, body = self.request_json(
+                        base,
+                        "/v1/tasks",
+                        payload,
+                        capability="generate_image",
+                        route="windows_image.comfyui.generate",
+                    )
+                    self.assertEqual(status, 403)
+                    self.assert_error(body, "input_policy_denied")
+
     def test_forwarding_uses_route_backend_credentials_and_headers(self):
         with tempfile.TemporaryDirectory() as tmp:
             backend_url, backend = self.start_backend()
             cfg = self.make_config(tmp, backend_url=backend_url)
             base = self.start_gateway(cfg)
             os.environ["TEST_BACKEND_KEY"] = "backend-secret-for-test"
+            os.environ["ASG_BACKEND_HMAC_KEY"] = "hmac-secret-for-test"
             self.addCleanup(os.environ.pop, "TEST_BACKEND_KEY", None)
+            self.addCleanup(os.environ.pop, "ASG_BACKEND_HMAC_KEY", None)
 
             status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload())
             self.assertEqual(status, 200)
@@ -392,6 +762,8 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(backend.last_headers.get("Authorization"), "Bearer backend-secret-for-test")  # type: ignore[attr-defined]
             self.assertEqual(backend.last_headers.get("X-Asg-Agent-Id"), "mac_gpt55")  # type: ignore[attr-defined]
             self.assertEqual(backend.last_headers.get("X-Asg-Route-Id"), "pi.web_research.chat")  # type: ignore[attr-defined]
+            self.assertIn("X-Asg-Timestamp", backend.last_headers)  # type: ignore[attr-defined]
+            self.assertRegex(backend.last_headers.get("X-Asg-Signature", ""), r"^sha256=[a-f0-9]{64}$")  # type: ignore[attr-defined]
             self.assertNotEqual(backend.last_headers.get("Authorization"), "Bearer test-token-1234567890")  # type: ignore[attr-defined]
 
     def test_output_guard_blocks_backend_secret(self):

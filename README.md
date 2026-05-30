@@ -124,6 +124,10 @@ Capability resolution is `X-Agent-Capability`, then `metadata.capability`. `/ins
 
 Returns app name, version, and route count.
 
+### `GET /readyz`
+
+Readiness check. It verifies config is loaded, at least one route exists, audit and approval parent directories are writable, and the kill switch is inactive. It returns `503` when the gateway should not receive traffic.
+
 ### `POST /inspect`
 
 Authenticated inspection only. It scans input, normalizes text, extracts structured findings, and returns action guard findings without backend forwarding.
@@ -208,18 +212,25 @@ curl -s http://127.0.0.1:8788/v1/results \
 
 ### `POST /v1/approvals`
 
-Stores a file-backed approval artifact:
+Stores a file-backed human/operator approval artifact. This endpoint requires a separate caller token with `approve_action` capability and route `security.approvals.create`; target agents cannot approve their own actions.
 
-```json
-{
-  "approval_id": "appr-example",
-  "agent_id": "mac_gpt55",
-  "route_id": "ubuntu2.sandbox.verify",
-  "capability": "request_sandbox_verification",
-  "normalized_action_hash": "sha256:...",
-  "approved_by": "kiyoshi",
-  "expires_at": "2026-12-31T00:00:00Z"
-}
+```bash
+curl -s http://127.0.0.1:8788/v1/approvals \
+  -H "Authorization: Bearer $HUMAN_OPERATOR_TOKEN" \
+  -H "X-Agent-Capability: approve_action" \
+  -H "X-ASG-Route: security.approvals.create" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "approval_id": "appr-example",
+    "target_agent_id": "mac_gpt55",
+    "target_route_id": "ubuntu2.sandbox.verify",
+    "target_capability": "request_sandbox_verification",
+    "normalized_action_hash": "sha256:...",
+    "approved_categories": ["host_package_install"],
+    "approved_by": "kiyoshi",
+    "expires_at": "2026-12-31T00:00:00Z",
+    "reason": "temporary sandbox verification approval"
+  }'
 ```
 
 ## Backend Forwarding
@@ -238,9 +249,12 @@ Backend requests include:
 - `X-ASG-Run-Id`
 - `X-ASG-Task-Id`
 - `X-ASG-Request-SHA256`
+- `X-ASG-Timestamp`
 - optional `X-ASG-Signature` when `ASG_BACKEND_HMAC_KEY` is set
 
 The gateway strips caller `Authorization` and uses only the backend key from `route.backend.api_key_env`.
+
+When HMAC signing is enabled, the signature covers a canonical string containing method, backend path, body SHA-256, agent ID, route ID, run ID, task ID, and timestamp. Backends should verify timestamp freshness, body hash, route ID, agent ID, and HMAC before trusting ASG headers.
 
 ## Run Scope
 
@@ -265,6 +279,17 @@ Common taints:
 
 Routes accept only taints listed in `route.input_policy.accepted_taint`, unless `allow_missing_taint` is true.
 
+## Input Policy Enforcement
+
+`route.input_policy` is enforced before input scanning and backend forwarding:
+
+- `max_messages`: rejects `messages` arrays above the configured length.
+- `require_message_type`: requires top-level `message_type` or `metadata.message_type` to match.
+- `require_structured_task`: requires a top-level `task` object with non-empty `task.objective`; `task.constraints` and `task.output_contract` must be objects when present. `metadata.message_type == "task_instruction"` with `messages` is allowed only for compatibility. Strict deployments should use task packets.
+- `allow_raw_external_content: false`: rejects raw external body keys such as `raw_content`, `raw_html`, `html`, `full_text`, `page_text`, `document_text`, `source_text`, `raw_document`, `raw_page`, `raw_markdown`, and `transcript_raw`.
+- `disallow_external_urls: true`: rejects any `http://` or `https://` URL in the payload.
+- `max_batch_size`: rejects oversized numeric batch fields (`batch_size`, `n`, `count`, `num_images`, `num_prompts`, `samples`) and oversized list fields (`prompts`, `prompt_matrix`, `items`, `jobs`, `requests`).
+
 ## Action Guard
 
 The action guard blocks backend URL selection by callers and risky API/tool intent, including:
@@ -277,7 +302,28 @@ The action guard blocks backend URL selection by callers and risky API/tool inte
 - external upload, social post, email, purchase/payment
 - delete operations, `git push`, merge, release publish
 
-Approval artifacts can be used for specific high-risk categories, but the MVP remains conservative.
+Approval artifacts can be used only for these approvable categories:
+
+- `host_package_install`
+- `external_upload`
+- `privileged_command`
+- `delete_operation`
+
+These categories are non-approvable and always blocked, even with an approval artifact:
+
+- `caller_controlled_backend`
+- `private_network_target`
+- `metadata_endpoint`
+- `dangerous_uri_scheme`
+- `secret_exfiltration`
+
+Unknown action guard categories are blocked by default.
+
+## Approval Model
+
+Approvals are not created by the target agent. `/v1/approvals` requires a separate human/operator token with `approve_action` and route `security.approvals.create`. The generated `human_operator.token` must not be copied into AI agents or worker nodes.
+
+Mac/GPT-5.5 can request routes, but it cannot approve its own high-risk actions by default. An approval record targets a specific `target_agent_id`, `target_route_id`, `target_capability`, `normalized_action_hash`, and `approved_categories`. A matching approval must cover every approvable finding on the request, and it must not be expired.
 
 ## Output Guard
 
@@ -319,6 +365,8 @@ Validate config:
 ```bash
 python3 gateway.py --config ~/.agent-security-gateway/config.json validate-config
 ```
+
+Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 
 ## Runtime Paths
 

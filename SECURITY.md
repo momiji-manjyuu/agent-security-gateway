@@ -16,6 +16,10 @@ Useful reports include:
 - caller-controlled backend URL or backend credential injection;
 - caller `Authorization` token forwarding to a backend;
 - CIDR, capability, route, run-scope, taint, or caller allowlist bypasses;
+- approval self-approval bypasses or ways for a target AI agent to create its own high-risk action approval;
+- approval category confusion, including approvals that cover categories they did not explicitly approve;
+- bypasses for non-approvable action categories such as caller-controlled backend URLs, private network targets, metadata endpoints, dangerous URI schemes, or secret exfiltration;
+- `route.input_policy` bypasses, including raw external content reaching trusted routes, external URLs reaching `disallow_external_urls` routes, structured task requirement bypass, message type bypass, message count bypass, or batch size bypass;
 - prompt-injection patterns that should be blocked or reviewed but are currently allowed;
 - action guard bypasses for private URLs, metadata endpoints, secret exfiltration, external upload, package install, delete, email, social post, purchase, or release publish;
 - output guard bypasses for credentials, local paths, private hosts, dangerous schemes, or sensitive URL query strings;
