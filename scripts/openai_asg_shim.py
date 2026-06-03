@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""OpenAI-compatible shim that forwards worker traffic through ASG.
+
+The shim is intended to run on worker hosts whose local agent runtime can only
+talk to a plain OpenAI-compatible base URL. It receives local OpenAI requests,
+adds the fixed ASG identity headers and route metadata, and forwards the request
+to Agent Security Gateway.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import http.server
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+APP_NAME = "openai-asg-shim"
+VERSION = "0.1.0"
+DEFAULT_MAX_BODY_BYTES = 524_288
+DEFAULT_TIMEOUT_SECONDS = 300
+
+
+class ShimError(Exception):
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+@dataclasses.dataclass(frozen=True)
+class ShimConfig:
+    bind: str
+    port: int
+    asg_base_url: str
+    asg_token: str
+    route_id: str
+    capability: str
+    taint: list[str]
+    model_id: str
+    model_alias: str
+    timeout_seconds: float
+    max_body_bytes: int
+    strip_tooling: bool
+    allowed_message_roles: set[str]
+
+
+def _env(name: str, default: str = "") -> str:
+    value = os.environ.get(name, default)
+    return value.strip() if isinstance(value, str) else default
+
+
+def _read_token() -> str:
+    token = _env("ASG_SHIM_TOKEN")
+    token_file = _env("ASG_SHIM_TOKEN_FILE")
+    if token and token_file:
+        raise ShimError(500, "invalid_config", "set ASG_SHIM_TOKEN or ASG_SHIM_TOKEN_FILE, not both")
+    if token:
+        return token
+    if token_file:
+        try:
+            return Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ShimError(500, "invalid_config", "could not read ASG_SHIM_TOKEN_FILE") from exc
+    raise ShimError(500, "invalid_config", "ASG_SHIM_TOKEN_FILE or ASG_SHIM_TOKEN is required")
+
+
+def _parse_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = _env(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ShimError(500, "invalid_config", f"{name} must be an integer") from exc
+    if value < minimum or value > maximum:
+        raise ShimError(500, "invalid_config", f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _parse_taint(value: str) -> list[str]:
+    result = [item.strip() for item in value.split(",") if item.strip()]
+    if not result:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_TAINT must contain at least one taint")
+    return result
+
+
+def _parse_bool(name: str, default: bool) -> bool:
+    raw = _env(name, "true" if default else "false").lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ShimError(500, "invalid_config", f"{name} must be a boolean")
+
+
+def _parse_roles(value: str) -> set[str]:
+    roles = {item.strip().lower() for item in value.split(",") if item.strip()}
+    if not roles:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_ALLOWED_MESSAGE_ROLES must not be empty")
+    return roles
+
+
+def load_config_from_env() -> ShimConfig:
+    asg_base_url = _env("ASG_SHIM_ASG_BASE_URL").rstrip("/")
+    route_id = _env("ASG_SHIM_ROUTE_ID")
+    capability = _env("ASG_SHIM_CAPABILITY")
+    if not asg_base_url:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_ASG_BASE_URL is required")
+    parsed = urllib.parse.urlsplit(asg_base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_ASG_BASE_URL must be an absolute http(s) URL")
+    if not route_id:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_ROUTE_ID is required")
+    if not capability:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_CAPABILITY is required")
+    port = _parse_int("ASG_SHIM_PORT", 18088, minimum=1, maximum=65_535)
+    timeout_seconds = _parse_int("ASG_SHIM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS, minimum=1, maximum=600)
+    max_body_bytes = _parse_int("ASG_SHIM_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, minimum=1, maximum=50 * 1024 * 1024)
+    model_alias = _env("ASG_SHIM_MODEL_ALIAS")
+    model_id = _env("ASG_SHIM_MODEL_ID", model_alias or route_id)
+    return ShimConfig(
+        bind=_env("ASG_SHIM_BIND", "127.0.0.1"),
+        port=port,
+        asg_base_url=asg_base_url,
+        asg_token=_read_token(),
+        route_id=route_id,
+        capability=capability,
+        taint=_parse_taint(_env("ASG_SHIM_TAINT", "trusted_instruction")),
+        model_id=model_id,
+        model_alias=model_alias,
+        timeout_seconds=float(timeout_seconds),
+        max_body_bytes=max_body_bytes,
+        strip_tooling=_parse_bool("ASG_SHIM_STRIP_TOOLING", True),
+        allowed_message_roles=_parse_roles(_env("ASG_SHIM_ALLOWED_MESSAGE_ROLES", "user,assistant")),
+    )
+
+
+def json_error(code: str, message: str, request_id: str) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "request_id": request_id}}
+
+
+def model_list(config: ShimConfig) -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": config.model_id,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": APP_NAME,
+            }
+        ],
+    }
+
+
+def build_asg_payload(payload: dict[str, Any], config: ShimConfig) -> dict[str, Any]:
+    outbound = dict(payload)
+    if config.strip_tooling:
+        outbound = strip_tooling_fields(outbound, config.allowed_message_roles)
+    metadata = outbound.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    metadata["route_id"] = config.route_id
+    metadata["capability"] = config.capability
+    metadata["taint"] = list(config.taint)
+    outbound["metadata"] = metadata
+    if config.model_alias:
+        outbound["model"] = config.model_alias
+    return outbound
+
+
+def strip_tooling_fields(payload: dict[str, Any], allowed_roles: set[str]) -> dict[str, Any]:
+    blocked_request_fields = {
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+        "parallel_tool_calls",
+    }
+    blocked_message_fields = {
+        "tool_calls",
+        "function_call",
+        "tool_call_id",
+        "name",
+    }
+    sanitized = {key: value for key, value in payload.items() if key not in blocked_request_fields}
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        clean_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).lower()
+            if role not in allowed_roles:
+                continue
+            clean_message = {key: value for key, value in message.items() if key not in blocked_message_fields}
+            clean_messages.append(clean_message)
+        sanitized["messages"] = clean_messages
+    return sanitized
+
+
+def forward_chat(payload: dict[str, Any], config: ShimConfig, request_id: str) -> tuple[int, dict[str, Any]]:
+    outbound = build_asg_payload(payload, config)
+    body = json.dumps(outbound, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + config.asg_token,
+        "Content-Type": "application/json",
+        "X-ASG-Route": config.route_id,
+        "X-Agent-Capability": config.capability,
+        "X-Request-ID": request_id,
+    }
+    request = urllib.request.Request(
+        config.asg_base_url + "/v1/chat/completions",
+        data=body,
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw.strip() else {}
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+            return response.status, parsed
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw.strip() else {}
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+            return exc.code, parsed
+        finally:
+            exc.close()
+    except (socket.timeout, TimeoutError) as exc:
+        raise ShimError(504, "asg_timeout", "ASG request timed out") from exc
+    except urllib.error.URLError as exc:
+        raise ShimError(502, "asg_error", f"ASG request failed: {type(exc).__name__}") from exc
+    except json.JSONDecodeError as exc:
+        raise ShimError(502, "asg_error", "ASG response was not valid JSON") from exc
+
+
+class ShimHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "OpenAIASGShim/" + VERSION
+
+    def do_GET(self) -> None:  # noqa: N802
+        request_id = self.headers.get("X-Request-ID") or "shim_" + uuid.uuid4().hex
+        config = self.server.config  # type: ignore[attr-defined]
+        if self.path in {"/healthz", "/readyz"}:
+            self.write_json(200, {"ok": True, "app": APP_NAME, "version": VERSION})
+            return
+        if self.path == "/v1/models":
+            self.write_json(200, model_list(config))
+            return
+        self.write_json(404, json_error("not_found", "not found", request_id))
+
+    def do_POST(self) -> None:  # noqa: N802
+        request_id = self.headers.get("X-Request-ID") or "shim_" + uuid.uuid4().hex
+        config = self.server.config  # type: ignore[attr-defined]
+        try:
+            if self.path != "/v1/chat/completions":
+                raise ShimError(404, "not_found", "not found")
+            payload = self.read_json_body(config)
+            status, body = forward_chat(payload, config, request_id)
+            if status == 200 and payload.get("stream") is True:
+                self.write_openai_stream(body)
+                return
+            self.write_json(status, body)
+        except ShimError as exc:
+            self.write_json(exc.status, json_error(exc.code, exc.message, request_id))
+        except Exception:  # noqa: BLE001
+            self.write_json(500, json_error("internal_error", "internal error", request_id))
+
+    def read_json_body(self, config: ShimConfig) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ShimError(400, "invalid_json", "invalid Content-Length") from exc
+        if length < 0 or length > config.max_body_bytes:
+            raise ShimError(413, "request_too_large", "request body is too large")
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ShimError(400, "invalid_json", "request body must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ShimError(400, "invalid_json", "request body must be a JSON object")
+        return payload
+
+    def write_json(self, status: int, body: dict[str, Any]) -> None:
+        encoded = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def write_openai_stream(self, body: dict[str, Any]) -> None:
+        chunks = openai_stream_chunks(body)
+        encoded = b"".join(("data: " + json.dumps(chunk, ensure_ascii=False, sort_keys=True) + "\n\n").encode("utf-8") for chunk in chunks)
+        encoded += b"data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("[%s] %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), fmt % args))
+
+
+class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    config: ShimConfig
+
+
+def openai_stream_chunks(body: dict[str, Any]) -> list[dict[str, Any]]:
+    response_id = str(body.get("id") or "chatcmpl-" + uuid.uuid4().hex[:24])
+    created = int(body.get("created") or time.time())
+    model = str(body.get("model") or "")
+    chunks: list[dict[str, Any]] = []
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return [
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        ]
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        index = int(choice.get("index", 0))
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message, dict) else ""
+        role = message.get("role") if isinstance(message, dict) else "assistant"
+        if content:
+            chunks.append(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": index, "delta": {"role": role or "assistant", "content": str(content)}, "finish_reason": None}],
+                }
+            )
+        chunks.append(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": index, "delta": {}, "finish_reason": choice.get("finish_reason") or "stop"}],
+            }
+        )
+    return chunks
+
+
+def serve(config: ShimConfig) -> None:
+    server = ThreadingHTTPServer((config.bind, config.port), ShimHandler)
+    server.config = config
+    print(f"{APP_NAME} listening on http://{config.bind}:{config.port}", flush=True)
+    server.serve_forever()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="OpenAI-compatible ASG forwarding shim")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("serve")
+    sub.add_parser("validate-config")
+    args = parser.parse_args(argv)
+
+    config = load_config_from_env()
+    if args.command == "validate-config":
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "app": APP_NAME,
+                    "asg_base_url": config.asg_base_url,
+                    "route_id": config.route_id,
+                    "capability": config.capability,
+                    "model_id": config.model_id,
+                    "bind": config.bind,
+                    "port": config.port,
+                    "strip_tooling": config.strip_tooling,
+                    "allowed_message_roles": sorted(config.allowed_message_roles),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "serve":
+        serve(config)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -366,6 +366,25 @@ Validate config:
 python3 gateway.py --config ~/.agent-security-gateway/config.json validate-config
 ```
 
+Run a worker-side OpenAI-compatible shim when a worker runtime cannot attach ASG
+headers or metadata itself:
+
+```bash
+export ASG_SHIM_ASG_BASE_URL="http://192.168.1.60:8788"
+export ASG_SHIM_ROUTE_ID="mac.local_llm.chat"
+export ASG_SHIM_CAPABILITY="delegate_local_llm"
+export ASG_SHIM_TAINT="trusted_instruction"
+export ASG_SHIM_MODEL_ALIAS="asg/mac-local-llm"
+export ASG_SHIM_TOKEN_FILE="$HOME/.agent-security-gateway-shim/token"
+python3 scripts/openai_asg_shim.py serve
+```
+
+Point the worker's OpenAI-compatible client at the shim, not at the protected
+backend directly. The shim always injects the configured route, capability, and
+taint before forwarding to ASG. By default it also strips tool/function fields
+and keeps only `user`/`assistant` messages so worker model traffic does not
+smuggle caller-controlled route or tool policy into ASG-protected routes.
+
 Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 
 ## Runtime Paths
