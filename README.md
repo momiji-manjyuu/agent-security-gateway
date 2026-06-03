@@ -222,14 +222,14 @@ Example Mac notification route:
 
 ```json
 "mac.result_receipt.notify": {
-  "kind": "http_json",
+  "kind": "openai_chat_completions",
   "backend": {
     "mode": "http",
-    "base_url": "http://mac-controller.internal:8789",
-    "path": "/asg/result-receipts",
-    "method": "POST",
-    "api_key_env": "MAC_RESULT_RECEIPT_BACKEND_KEY",
-    "timeout_seconds": 30
+    "base_url": "http://mac-controller.internal:8642/v1",
+    "path": "/chat/completions",
+    "api_key_env": "MAC_HERMES_BACKEND_KEY",
+    "timeout_seconds": 120,
+    "model_rewrite": "hermes-agent"
   },
   "allowed_callers": ["pi_research_1", "ubuntu_verify_2"],
   "required_capability": "notify_audited_result",
@@ -279,8 +279,28 @@ Route kinds:
 - `command`: supported but disabled unless a command route explicitly sets `enabled: true`.
 
 For `/v1/results` routes with `report_policy.forward_audit_receipt: true`,
-`http_json` sends the generated audit receipt as the backend body. This keeps
-raw worker report text out of Mac/controller notification routes.
+`http_json` sends the generated audit receipt as the backend body. For
+`openai_chat_completions`, the gateway converts the generated receipt into a
+short OpenAI-compatible chat message before forwarding. Both modes keep raw
+worker report text out of Mac/controller notification routes.
+
+Trusted controller routes that need to instruct a worker to call known internal
+ASG endpoints can opt in to narrow scanner exceptions:
+
+```json
+"input_policy": {
+  "accepted_taint": ["trusted_instruction"],
+  "allowed_private_instruction_hosts": ["192.168.1.60"],
+  "allow_defensive_secret_instructions": true
+},
+"output_policy": {
+  "block_on_review": false
+}
+```
+
+These settings are route-local. They do not allow caller-controlled backend
+URLs, do not forward caller credentials, and do not bypass blocking output
+findings such as secrets or local paths.
 
 Backend requests include:
 
@@ -428,7 +448,9 @@ smuggle caller-controlled route or tool policy into ASG-protected routes.
 
 For a worker that should keep model calls on a normal backend and use the shim
 only when reporting to the Mac/controller, point the worker at the shim only for
-that reporting path and set the ASG path to `/v1/results`:
+that reporting path and set the ASG path to `/v1/results`. Configure the ASG
+route backend to the Mac Hermes API server on port `8642`; the worker still only
+talks to ASG:
 
 ```bash
 export ASG_SHIM_ASG_BASE_URL="http://192.168.1.60:8788"
@@ -447,7 +469,8 @@ In `/v1/results` mode, the shim accepts OpenAI-compatible
 into an ASG result packet, and returns a normal OpenAI chat completion whose
 message content is the ASG audit receipt JSON.
 
-Run a minimal Mac/controller receipt backend with:
+Run a minimal Mac/controller receipt backend only when you want receipt JSONL
+storage instead of Hermes notification:
 
 ```bash
 export ASG_RECEIPT_COLLECTOR_BIND="192.168.1.10"
@@ -457,9 +480,11 @@ export ASG_RECEIPT_COLLECTOR_TOKEN_FILE="$HOME/.agent-security-gateway/receipt-c
 python3 scripts/result_receipt_collector.py serve
 ```
 
-Set the ASG route backend `api_key_env` to an environment variable containing
-the same token. The collector accepts only `POST /asg/result-receipts` payloads
-whose `receipt_type` is `asg_result_audit`.
+For the Hermes notification route, set the ASG route backend `api_key_env` to an
+environment variable containing the Mac Hermes API key. For the optional JSONL
+collector route, set it to the collector token instead. The collector accepts
+only `POST /asg/result-receipts` payloads whose `receipt_type` is
+`asg_result_audit`.
 
 Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 

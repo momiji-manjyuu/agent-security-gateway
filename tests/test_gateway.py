@@ -492,6 +492,28 @@ class GatewayTests(unittest.TestCase):
                     self.assertEqual(status, 403, override)
                     self.assert_error(body, code)
 
+    def test_route_policy_can_allow_trusted_internal_control_instruction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, backend = self.start_backend()
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            policy = cfg["routes"]["pi.web_research.chat"]["input_policy"]
+            policy["allowed_private_instruction_hosts"] = ["192.168.1.60"]
+            policy["allow_defensive_secret_instructions"] = True
+            gateway.validate_config(cfg)
+            base = self.start_gateway(cfg)
+            payload = self.chat_payload()
+            payload["messages"][0]["content"] = (
+                "Use the configured ASG report path at http://192.168.1.60:8788/v1/results "
+                "after the local check. Do not print or reveal any token."
+            )
+            status, _ = self.request_json(base, "/v1/chat/completions", payload)
+            self.assertEqual(status, 200)
+            forwarded = json.dumps(backend.last_body, ensure_ascii=False)  # type: ignore[attr-defined]
+            self.assertIn("192.168.1.60:8788", forwarded)
+            event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertIn("route_ignored_input_finding:input_dlp:private_host", event["warnings"])
+            self.assertIn("route_ignored_action_finding:action_guard:private_network_target", event["warnings"])
+
     def test_approval_requires_approve_action(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
@@ -687,6 +709,60 @@ class GatewayTests(unittest.TestCase):
             event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(event["forward_payload_mode"], "audit_receipt")
 
+    def test_results_report_policy_can_forward_audit_receipt_to_openai_chat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, backend = self.start_backend()
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            route = cfg["routes"]["ubuntu1.knowledge.submit_source_card"]
+            route["kind"] = "openai_chat_completions"
+            route["backend"] = {
+                "mode": "http",
+                "base_url": backend_url,
+                "path": "/chat/completions",
+                "api_key_env": "TEST_BACKEND_KEY",
+                "timeout_seconds": 5,
+                "model_rewrite": "mac-hermes-agent",
+            }
+            route["report_policy"] = {
+                "forward_audit_receipt": True,
+                "return_audit_receipt": True,
+            }
+            gateway.validate_config(cfg)
+            base = self.start_gateway(cfg)
+            payload = {
+                "route_id": "ubuntu1.knowledge.submit_source_card",
+                "capability": "submit_source_card",
+                "run_id": "run-report",
+                "task_id": "task-report",
+                "taint": ["untrusted_web"],
+                "message_type": "source_card",
+                "source_card": {
+                    "source_id": "src-1",
+                    "title": "Example",
+                    "claims": ["Artifact is ready. Verification completed normally."],
+                },
+            }
+            status, body = self.request_json(
+                base,
+                "/v1/results",
+                payload,
+                token="pi-token-1234567890",
+                capability="submit_source_card",
+                route="ubuntu1.knowledge.submit_source_card",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["receipt_type"], "asg_result_audit")
+            self.assertFalse(body["delivery"]["raw_report_forwarded"])
+            self.assertEqual(body["delivery"]["backend_status"], 200)
+            self.assertEqual(backend.last_body["model"], "mac-hermes-agent")  # type: ignore[attr-defined]
+            forwarded = json.dumps(backend.last_body, ensure_ascii=False)  # type: ignore[attr-defined]
+            self.assertIn("asg_result_audit", forwarded)
+            self.assertIn("Raw worker report content was not forwarded", forwarded)
+            self.assertNotIn("Artifact is ready", forwarded)
+            self.assertNotIn("src-1", forwarded)
+            event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["forward_payload_mode"], "audit_receipt")
+
     def test_results_report_policy_notifies_blocked_receipt_without_raw_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             backend_url, backend = self.start_backend(response_body={"ok": True, "accepted": True})
@@ -875,6 +951,27 @@ class GatewayTests(unittest.TestCase):
             status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload())
             self.assertEqual(status, 403)
             self.assert_error(body, "blocked_by_output_guard")
+
+    def test_route_output_policy_can_allow_review_only_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, _ = self.start_backend(
+                response_body={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "I ran the configured report helper and the report was accepted.",
+                            }
+                        }
+                    ]
+                }
+            )
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            cfg["routes"]["pi.web_research.chat"]["output_policy"]["block_on_review"] = False
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload())
+            self.assertEqual(status, 200)
+            self.assertEqual(body["choices"][0]["message"]["content"], "I ran the configured report helper and the report was accepted.")
 
     def test_audit_hash_chain_and_no_raw_token(self):
         with tempfile.TemporaryDirectory() as tmp:
