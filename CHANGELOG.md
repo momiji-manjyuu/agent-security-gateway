@@ -12,6 +12,7 @@
 - Added `/readyz` and canonical backend HMAC signing over method, path, body hash, ASG identity headers, and timestamp.
 - Added `/v1/results` audit receipt forwarding for Mac/controller notification routes so worker reports can trigger follow-up checks without forwarding raw report content.
 - Added `scripts/openai_asg_shim.py` so workers with plain OpenAI-compatible clients can forward through ASG with fixed route, capability, and taint metadata, including `/v1/results` mode for report-only Mac/controller contact.
+- Added `scripts/result_receipt_collector.py` as a minimal authenticated Mac/controller backend for storing ASG result audit receipts.
 - Preserved deterministic scanner, Unicode normalization, output guard, LLM inspector hook, kill switch, rate limit, and hash-chained JSONL audit logs from the proxy codebase.
 - Replaced runtime paths and scripts with `~/.agent-security-gateway` and `ASG_*`.
 - Added gateway config examples, request examples, schema references, migration notes, and security-first agent instructions.

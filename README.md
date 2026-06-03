@@ -447,6 +447,20 @@ In `/v1/results` mode, the shim accepts OpenAI-compatible
 into an ASG result packet, and returns a normal OpenAI chat completion whose
 message content is the ASG audit receipt JSON.
 
+Run a minimal Mac/controller receipt backend with:
+
+```bash
+export ASG_RECEIPT_COLLECTOR_BIND="192.168.1.10"
+export ASG_RECEIPT_COLLECTOR_PORT="8789"
+export ASG_RECEIPT_COLLECTOR_STORE="$HOME/.agent-security-gateway/result-receipts.jsonl"
+export ASG_RECEIPT_COLLECTOR_TOKEN_FILE="$HOME/.agent-security-gateway/receipt-collector.token"
+python3 scripts/result_receipt_collector.py serve
+```
+
+Set the ASG route backend `api_key_env` to an environment variable containing
+the same token. The collector accepts only `POST /asg/result-receipts` payloads
+whose `receipt_type` is `asg_result_audit`.
+
 Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 
 ## Runtime Paths
