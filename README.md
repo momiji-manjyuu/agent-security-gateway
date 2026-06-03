@@ -291,7 +291,18 @@ ASG endpoints can opt in to narrow scanner exceptions:
 "input_policy": {
   "accepted_taint": ["trusted_instruction"],
   "allowed_private_instruction_hosts": ["192.168.1.60"],
-  "allow_defensive_secret_instructions": true
+  "allow_defensive_secret_instructions": true,
+  "allow_scanner_findings": [
+    "input_dlp:local_path",
+    "prompt_injection:tool_escalation"
+  ],
+  "allow_action_guard_findings": [
+    "action_guard:curl_pipe_shell",
+    "action_guard:privileged_command",
+    "action_guard:host_package_install",
+    "action_guard:delete_operation",
+    "action_guard:git_publish"
+  ]
 },
 "output_policy": {
   "block_on_review": false
@@ -299,8 +310,11 @@ ASG endpoints can opt in to narrow scanner exceptions:
 ```
 
 These settings are route-local. They do not allow caller-controlled backend
-URLs, do not forward caller credentials, and do not bypass blocking output
-findings such as secrets or local paths.
+URLs, do not forward caller credentials, do not disable append-only audit logs,
+and do not bypass blocking output findings such as secrets or local paths. Use
+`allow_action_guard_findings` only for routes where the caller is a trusted
+controller and the backend worker is expected to carry out local destructive
+maintenance or repository operations.
 
 Backend requests include:
 

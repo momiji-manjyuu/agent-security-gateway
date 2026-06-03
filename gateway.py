@@ -912,14 +912,20 @@ def action_guard(headers: Any, payload: dict[str, Any]) -> ActionGuardResult:
 
 
 def route_allows_action_finding(decision: RouteDecision, finding: security.Finding, text: str) -> bool:
-    policy = route_input_policy(decision)
-    allowed = policy.get("allow_action_guard_findings") or []
-    if isinstance(allowed, list) and finding.category in {str(item) for item in allowed}:
-        return True
     if finding.category == "action_guard:private_network_target":
         return route_allows_private_instruction_hosts(decision, text)
     if finding.category == "action_guard:secret_exfiltration":
         return route_allows_defensive_secret_instruction(decision, text)
+    if finding.category in {
+        "action_guard:caller_controlled_backend",
+        "action_guard:metadata_endpoint",
+        "action_guard:dangerous_uri_scheme",
+    }:
+        return False
+    policy = route_input_policy(decision)
+    allowed = policy.get("allow_action_guard_findings") or []
+    if isinstance(allowed, list) and finding.category in {str(item) for item in allowed}:
+        return True
     return False
 
 
