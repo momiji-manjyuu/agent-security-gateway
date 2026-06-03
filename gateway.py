@@ -46,6 +46,12 @@ DEFAULT_APPROVAL_STORE = RUNTIME_DIR / "approvals.jsonl"
 MAX_TIMEOUT_SECONDS = 600
 ROUTE_KINDS = {"inspect_only", "openai_chat_completions", "http_json", "command"}
 PUBLIC_ROUTE_FIELDS = ("description", "kind", "required_capability", "allowed_capabilities", "aliases")
+REPORT_POLICY_BOOL_FIELDS = {
+    "forward_audit_receipt",
+    "return_audit_receipt",
+    "include_structured_extract",
+    "notify_on_block",
+}
 NON_APPROVABLE_ACTION_CATEGORIES = {
     "caller_controlled_backend",
     "private_network_target",
@@ -347,6 +353,16 @@ def validate_config(cfg: dict[str, Any]) -> None:
         input_policy = route.get("input_policy", {})
         if input_policy is not None and not isinstance(input_policy, dict):
             errors.append(f"routes.{route_id}.input_policy must be an object")
+        report_policy = route.get("report_policy", {})
+        if report_policy is not None and not isinstance(report_policy, dict):
+            errors.append(f"routes.{route_id}.report_policy must be an object")
+            report_policy = {}
+        if isinstance(report_policy, dict):
+            for field in REPORT_POLICY_BOOL_FIELDS:
+                if field in report_policy and not isinstance(report_policy.get(field), bool):
+                    errors.append(f"routes.{route_id}.report_policy.{field} must be a boolean")
+            if report_policy.get("forward_audit_receipt") and kind != "http_json":
+                errors.append(f"routes.{route_id}.report_policy.forward_audit_receipt requires kind 'http_json'")
         backend = route.get("backend", {})
         if kind != "inspect_only":
             if not isinstance(backend, dict):
@@ -1151,6 +1167,74 @@ def audit_base(
     return event
 
 
+def route_report_policy(route: dict[str, Any]) -> dict[str, Any]:
+    policy = route.get("report_policy", {})
+    return policy if isinstance(policy, dict) else {}
+
+
+def report_policy_enabled(path: str, decision: RouteDecision, field: str) -> bool:
+    if path != "/v1/results":
+        return False
+    return bool(route_report_policy(decision.route).get(field, False))
+
+
+def report_policy_notify_on_block(path: str, decision: RouteDecision) -> bool:
+    if path != "/v1/results":
+        return False
+    policy = route_report_policy(decision.route)
+    if "notify_on_block" in policy:
+        return bool(policy.get("notify_on_block"))
+    return bool(policy.get("forward_audit_receipt", False))
+
+
+def result_audit_receipt(
+    *,
+    request_id: str,
+    verified: VerifiedAgent,
+    client_ip: str,
+    decision: RouteDecision,
+    inbound: security.InboundScan,
+    action: ActionGuardResult,
+    cfg: dict[str, Any],
+    receipt_decision: str,
+    reason: str | None = None,
+    forward_payload_mode: str = "raw",
+    backend_status: int | None = None,
+    include_structured_extract: bool = False,
+) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "ok": receipt_decision == "allow",
+        "receipt_type": "asg_result_audit",
+        "decision": receipt_decision,
+        "request_id": request_id,
+        "agent_id": verified.agent_id,
+        "trust_tier": verified.agent.get("trust_tier"),
+        "client_ip": client_ip,
+        "route_id": decision.route_id,
+        "route_kind": decision.route.get("kind"),
+        "capability": decision.capability,
+        "run_id": decision.run_id,
+        "task_id": decision.task_id,
+        "taint": decision.taint,
+        "warnings": decision.warnings,
+        "content_sha256": inbound.scan.normalized_sha256,
+        "content_length": len(inbound.extracted_text),
+        "scan": security.public_scan_for_audit(inbound.scan, cfg),
+        "action_guard": action.public_dict(),
+        "delivery": {
+            "forward_payload_mode": forward_payload_mode,
+            "raw_report_forwarded": forward_payload_mode == "raw",
+        },
+    }
+    if reason:
+        receipt["reason"] = reason
+    if backend_status is not None:
+        receipt["delivery"]["backend_status"] = backend_status
+    if include_structured_extract:
+        receipt["structured_extract"] = inbound.structured_extract
+    return receipt
+
+
 def write_audit(cfg: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     return security.AuditLogger(expand_path(str(cfg["audit_log"]))).write(event)
 
@@ -1306,21 +1390,96 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 "scan": security.public_scan_for_audit(inbound.scan, cfg),
                 "action_guard": action.public_dict(),
             }
+            include_receipt_structured = report_policy_enabled(self.path, decision, "include_structured_extract")
+            forward_receipt = report_policy_enabled(self.path, decision, "forward_audit_receipt")
+            return_receipt = report_policy_enabled(self.path, decision, "return_audit_receipt")
+            notify_on_block = report_policy_notify_on_block(self.path, decision)
             if inbound.scan.blocked:
-                write_audit(cfg, {"event": "deny", "reason": "blocked_by_input_guard", **event})
-                self.write_json(403, json_error("blocked_by_input_guard", "request was blocked by input guard", request_id))
+                receipt, delivery = self.maybe_deliver_block_receipt(
+                    cfg,
+                    request_id,
+                    client_ip,
+                    verified,
+                    decision,
+                    inbound,
+                    action,
+                    "deny",
+                    "blocked_by_input_guard",
+                    notify_on_block,
+                    include_receipt_structured,
+                )
+                audit_event = {"event": "deny", "reason": "blocked_by_input_guard", **event}
+                if delivery is not None:
+                    audit_event["receipt_delivery"] = delivery
+                write_audit(cfg, audit_event)
+                if return_receipt:
+                    self.write_json(403, receipt)
+                else:
+                    self.write_json(403, json_error("blocked_by_input_guard", "request was blocked by input guard", request_id))
                 return
             if inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get("block_on_review", cfg.get("review_policy", {}).get("block_forward", False))):
-                write_audit(cfg, {"event": "review_required", "reason": "manual_review_required", **event})
-                self.write_json(403, json_error("manual_review_required", "request requires manual review", request_id))
+                receipt, delivery = self.maybe_deliver_block_receipt(
+                    cfg,
+                    request_id,
+                    client_ip,
+                    verified,
+                    decision,
+                    inbound,
+                    action,
+                    "review_required",
+                    "manual_review_required",
+                    notify_on_block,
+                    include_receipt_structured,
+                )
+                audit_event = {"event": "review_required", "reason": "manual_review_required", **event}
+                if delivery is not None:
+                    audit_event["receipt_delivery"] = delivery
+                write_audit(cfg, audit_event)
+                if return_receipt:
+                    self.write_json(403, receipt)
+                else:
+                    self.write_json(403, json_error("manual_review_required", "request requires manual review", request_id))
                 return
             try:
                 enforce_action_guard(cfg, decision, verified, action)
             except GatewayError as exc:
-                write_audit(cfg, {"event": "deny", "reason": exc.code, **event})
-                self.write_json(exc.status, json_error(exc.code, exc.message, request_id))
+                receipt, delivery = self.maybe_deliver_block_receipt(
+                    cfg,
+                    request_id,
+                    client_ip,
+                    verified,
+                    decision,
+                    inbound,
+                    action,
+                    "deny",
+                    exc.code,
+                    notify_on_block,
+                    include_receipt_structured,
+                )
+                audit_event = {"event": "deny", "reason": exc.code, **event}
+                if delivery is not None:
+                    audit_event["receipt_delivery"] = delivery
+                write_audit(cfg, audit_event)
+                if return_receipt:
+                    self.write_json(exc.status, receipt)
+                else:
+                    self.write_json(exc.status, json_error(exc.code, exc.message, request_id))
                 return
-            upstream_status, upstream = self.forward(payload, cfg, decision, verified)
+            forward_payload_mode = "audit_receipt" if forward_receipt else "raw"
+            receipt = result_audit_receipt(
+                request_id=request_id,
+                verified=verified,
+                client_ip=client_ip,
+                decision=decision,
+                inbound=inbound,
+                action=action,
+                cfg=cfg,
+                receipt_decision="allow",
+                forward_payload_mode=forward_payload_mode,
+                include_structured_extract=include_receipt_structured,
+            )
+            forward_payload = receipt if forward_receipt else payload
+            upstream_status, upstream = self.forward(forward_payload, cfg, decision, verified)
             output_scan = enforce_output_guard(upstream, cfg, decision)
             if output_guard_blocks(output_scan, cfg):
                 write_audit(
@@ -1330,11 +1489,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                         "reason": "blocked_by_output_guard",
                         **event,
                         "backend_status": upstream_status,
+                        "forward_payload_mode": forward_payload_mode,
                         "output_scan": security.public_scan_for_audit(output_scan, cfg),
                     },
                 )
                 self.write_json(403, json_error("blocked_by_output_guard", "backend output was blocked by output guard", request_id))
                 return
+            receipt["delivery"]["backend_status"] = upstream_status
             write_audit(
                 cfg,
                 {
@@ -1342,10 +1503,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "decision": "forward",
                     **event,
                     "backend_status": upstream_status,
+                    "forward_payload_mode": forward_payload_mode,
                     "output_scan": security.public_scan_for_audit(output_scan, cfg),
                 },
             )
-            self.write_json(200, upstream)
+            self.write_json(200, receipt if return_receipt else upstream)
         except GatewayError as exc:
             extra_event: dict[str, Any] | None = None
             self.deny(cfg, exc, request_id, client_ip, verified, decision, extra_event)
@@ -1468,6 +1630,63 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if kind == "command":
             return forward_command(payload, decision)
         raise GatewayError(502, "backend_error", f"unsupported route kind: {kind}")
+
+    def deliver_result_audit_receipt(
+        self,
+        receipt: dict[str, Any],
+        cfg: dict[str, Any],
+        decision: RouteDecision,
+        verified: VerifiedAgent,
+    ) -> dict[str, Any]:
+        upstream_status, upstream = self.forward(receipt, cfg, decision, verified)
+        output_scan = enforce_output_guard(upstream, cfg, decision)
+        delivery = {
+            "ok": True,
+            "backend_status": upstream_status,
+            "output_scan": security.public_scan_for_audit(output_scan, cfg),
+        }
+        if output_guard_blocks(output_scan, cfg):
+            raise GatewayError(403, "blocked_by_output_guard", "result audit receipt backend output was blocked by output guard")
+        return delivery
+
+    def maybe_deliver_block_receipt(
+        self,
+        cfg: dict[str, Any],
+        request_id: str,
+        client_ip: str,
+        verified: VerifiedAgent,
+        decision: RouteDecision,
+        inbound: security.InboundScan,
+        action: ActionGuardResult,
+        receipt_decision: str,
+        reason: str,
+        notify_on_block: bool,
+        include_structured_extract: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        receipt = result_audit_receipt(
+            request_id=request_id,
+            verified=verified,
+            client_ip=client_ip,
+            decision=decision,
+            inbound=inbound,
+            action=action,
+            cfg=cfg,
+            receipt_decision=receipt_decision,
+            reason=reason,
+            forward_payload_mode="audit_receipt" if notify_on_block else "none",
+            include_structured_extract=include_structured_extract,
+        )
+        if not notify_on_block:
+            return receipt, None
+        try:
+            delivery = self.deliver_result_audit_receipt(receipt, cfg, decision, verified)
+        except GatewayError as exc:
+            delivery = {"ok": False, "error": exc.code, "status": exc.status}
+        if "backend_status" in delivery:
+            receipt["delivery"]["backend_status"] = delivery["backend_status"]
+        if "error" in delivery:
+            receipt["delivery"]["error"] = delivery["error"]
+        return receipt, delivery
 
     def check_kill_switch(self, cfg: dict[str, Any], request_id: str, client_ip: str) -> None:
         if expand_path(str(cfg["kill_switch_file"])).exists():

@@ -131,6 +131,23 @@
         "action_policy": {
           "type": "object"
         },
+        "report_policy": {
+          "type": "object",
+          "properties": {
+            "forward_audit_receipt": {
+              "type": "boolean"
+            },
+            "return_audit_receipt": {
+              "type": "boolean"
+            },
+            "include_structured_extract": {
+              "type": "boolean"
+            },
+            "notify_on_block": {
+              "type": "boolean"
+            }
+          }
+        },
         "output_policy": {
           "type": "object"
         }

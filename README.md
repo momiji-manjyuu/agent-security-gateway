@@ -186,6 +186,14 @@ Structured task packet endpoint. It uses the same policy pipeline as chat comple
 ### `POST /v1/results`
 
 Low-trust workers submit results to staging routes through the same policy pipeline.
+For Mac/controller notifications, configure a result route with
+`report_policy.forward_audit_receipt: true`. In that mode the gateway scans the
+worker payload and forwards only an `asg_result_audit` receipt to the backend,
+not the raw worker report. The receipt includes route/run/task metadata,
+content hash, scan summary, action-guard summary, and optional structured
+extract. If `notify_on_block` is not set, it defaults to true when
+`forward_audit_receipt` is true, so blocked/review-stopped reports can still
+notify the Mac with a safe discard receipt.
 
 ```bash
 curl -s http://127.0.0.1:8788/v1/results \
@@ -208,6 +216,34 @@ curl -s http://127.0.0.1:8788/v1/results \
       "injection_flags": []
     }
   }'
+```
+
+Example Mac notification route:
+
+```json
+"mac.result_receipt.notify": {
+  "kind": "http_json",
+  "backend": {
+    "mode": "http",
+    "base_url": "http://mac-controller.internal:8789",
+    "path": "/asg/result-receipts",
+    "method": "POST",
+    "api_key_env": "MAC_RESULT_RECEIPT_BACKEND_KEY",
+    "timeout_seconds": 30
+  },
+  "allowed_callers": ["pi_research_1", "ubuntu_verify_2"],
+  "required_capability": "notify_audited_result",
+  "input_policy": {
+    "accepted_taint": ["untrusted_web", "sandbox_output", "model_output"],
+    "allow_raw_external_content": false
+  },
+  "report_policy": {
+    "forward_audit_receipt": true,
+    "return_audit_receipt": true,
+    "include_structured_extract": false,
+    "notify_on_block": true
+  }
+}
 ```
 
 ### `POST /v1/approvals`
@@ -241,6 +277,10 @@ Route kinds:
 - `openai_chat_completions`: POSTs JSON to `route.backend.base_url + route.backend.path`; rewrites model with `model_rewrite` when configured.
 - `http_json`: POSTs JSON to configured backend path.
 - `command`: supported but disabled unless a command route explicitly sets `enabled: true`.
+
+For `/v1/results` routes with `report_policy.forward_audit_receipt: true`,
+`http_json` sends the generated audit receipt as the backend body. This keeps
+raw worker report text out of Mac/controller notification routes.
 
 Backend requests include:
 
@@ -371,6 +411,7 @@ headers or metadata itself:
 
 ```bash
 export ASG_SHIM_ASG_BASE_URL="http://192.168.1.60:8788"
+export ASG_SHIM_ASG_PATH="/v1/chat/completions"
 export ASG_SHIM_ROUTE_ID="mac.local_llm.chat"
 export ASG_SHIM_CAPABILITY="delegate_local_llm"
 export ASG_SHIM_TAINT="trusted_instruction"
@@ -384,6 +425,27 @@ backend directly. The shim always injects the configured route, capability, and
 taint before forwarding to ASG. By default it also strips tool/function fields
 and keeps only `user`/`assistant` messages so worker model traffic does not
 smuggle caller-controlled route or tool policy into ASG-protected routes.
+
+For a worker that should keep model calls on a normal backend and use the shim
+only when reporting to the Mac/controller, point the worker at the shim only for
+that reporting path and set the ASG path to `/v1/results`:
+
+```bash
+export ASG_SHIM_ASG_BASE_URL="http://192.168.1.60:8788"
+export ASG_SHIM_ASG_PATH="/v1/results"
+export ASG_SHIM_ROUTE_ID="mac.result_receipt.notify"
+export ASG_SHIM_CAPABILITY="notify_audited_result"
+export ASG_SHIM_TAINT="model_output"
+export ASG_SHIM_MODEL_ALIAS="asg/mac-result-receipt"
+export ASG_SHIM_RESULT_MESSAGE_TYPE="worker_report"
+export ASG_SHIM_TOKEN_FILE="$HOME/.agent-security-gateway-shim/token"
+python3 scripts/openai_asg_shim.py serve
+```
+
+In `/v1/results` mode, the shim accepts OpenAI-compatible
+`/v1/chat/completions` requests locally, converts the stripped chat messages
+into an ASG result packet, and returns a normal OpenAI chat completion whose
+message content is the ASG audit receipt JSON.
 
 Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 

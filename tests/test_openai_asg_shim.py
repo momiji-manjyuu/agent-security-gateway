@@ -21,15 +21,25 @@ class FakeASGHandler(shim.http.server.BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
+        self.server.last_path = self.path  # type: ignore[attr-defined]
         self.server.last_headers = dict(self.headers)  # type: ignore[attr-defined]
         self.server.last_body = json.loads(raw.decode("utf-8"))  # type: ignore[attr-defined]
-        encoded = json.dumps(
-            {
+        if self.path == "/v1/results":
+            response_body = {
+                "ok": True,
+                "receipt_type": "asg_result_audit",
+                "decision": "allow",
+                "request_id": "req-result",
+                "route_id": "mac.result_receipt.notify",
+                "delivery": {"raw_report_forwarded": False, "backend_status": 200},
+            }
+        else:
+            response_body = {
                 "id": "chatcmpl-test",
                 "object": "chat.completion",
                 "choices": [{"message": {"role": "assistant", "content": "shim ok"}}],
             }
-        ).encode("utf-8")
+        encoded = json.dumps(response_body).encode("utf-8")
         self.send_response(getattr(self.server, "response_status", 200))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
@@ -84,12 +94,14 @@ class OpenAIASGShimTests(unittest.TestCase):
             bind="127.0.0.1",
             port=0,
             asg_base_url=asg_base_url,
+            asg_path="/v1/chat/completions",
             asg_token="shim-token",
             route_id="mac.local_llm.chat",
             capability="delegate_local_llm",
             taint=["trusted_instruction"],
             model_id="asg/mac-local-llm",
             model_alias="asg/mac-local-llm",
+            result_message_type="worker_report",
             timeout_seconds=5,
             max_body_bytes=8192,
             strip_tooling=True,
@@ -124,11 +136,65 @@ class OpenAIASGShimTests(unittest.TestCase):
         self.assertEqual(fake_asg.last_headers["X-Agent-Capability"], "delegate_local_llm")  # type: ignore[attr-defined]
         self.assertEqual(fake_asg.last_headers["X-Request-Id"], "req-test")  # type: ignore[attr-defined]
         outbound = fake_asg.last_body  # type: ignore[attr-defined]
+        self.assertEqual(fake_asg.last_path, "/v1/chat/completions")  # type: ignore[attr-defined]
         self.assertEqual(outbound["model"], "asg/mac-local-llm")
         self.assertEqual(outbound["metadata"]["route_id"], "mac.local_llm.chat")
         self.assertEqual(outbound["metadata"]["capability"], "delegate_local_llm")
         self.assertEqual(outbound["metadata"]["taint"], ["trusted_instruction"])
         self.assertEqual(outbound["metadata"]["run_id"], "run-1")
+
+    def test_results_mode_wraps_chat_input_as_audited_result(self):
+        asg_base, fake_asg = self.start_fake_asg()
+        config = self.make_config(asg_base)
+        config = shim.dataclasses.replace(
+            config,
+            asg_path="/v1/results",
+            route_id="mac.result_receipt.notify",
+            capability="notify_audited_result",
+            taint=["model_output"],
+            model_id="asg/mac-result-receipt",
+            model_alias="asg/mac-result-receipt",
+            result_message_type="worker_report",
+        )
+        base = self.start_shim(config)
+        payload = {
+            "model": "caller-model",
+            "messages": [
+                {"role": "system", "content": "private control prompt"},
+                {"role": "user", "content": "work completed"},
+                {"role": "tool", "content": "hidden tool output"},
+            ],
+            "metadata": {
+                "route_id": "caller.route",
+                "capability": "caller_capability",
+                "taint": ["untrusted_web"],
+                "run_id": "run-1",
+                "task_id": "task-1",
+            },
+        }
+        status, body = self.request_json(base, "/v1/chat/completions", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["object"], "chat.completion")
+        receipt = json.loads(body["choices"][0]["message"]["content"])
+        self.assertEqual(receipt["receipt_type"], "asg_result_audit")
+        self.assertFalse(receipt["delivery"]["raw_report_forwarded"])
+
+        self.assertEqual(fake_asg.last_path, "/v1/results")  # type: ignore[attr-defined]
+        self.assertEqual(fake_asg.last_headers["X-Asg-Route"], "mac.result_receipt.notify")  # type: ignore[attr-defined]
+        self.assertEqual(fake_asg.last_headers["X-Agent-Capability"], "notify_audited_result")  # type: ignore[attr-defined]
+        outbound = fake_asg.last_body  # type: ignore[attr-defined]
+        self.assertEqual(outbound["route_id"], "mac.result_receipt.notify")
+        self.assertEqual(outbound["capability"], "notify_audited_result")
+        self.assertEqual(outbound["taint"], ["model_output"])
+        self.assertEqual(outbound["message_type"], "worker_report")
+        self.assertEqual(outbound["messages"], [{"role": "user", "content": "work completed"}])
+        self.assertEqual(outbound["run_id"], "run-1")
+        self.assertEqual(outbound["task_id"], "task-1")
+        self.assertEqual(outbound["metadata"]["route_id"], "mac.result_receipt.notify")
+        self.assertEqual(outbound["metadata"]["capability"], "notify_audited_result")
+        self.assertEqual(outbound["metadata"]["taint"], ["model_output"])
+        self.assertEqual(outbound["metadata"]["source_model"], "caller-model")
+        self.assertNotIn("model", outbound)
 
     def test_chat_forwarding_strips_tooling_and_control_roles_by_default(self):
         asg_base, fake_asg = self.start_fake_asg()

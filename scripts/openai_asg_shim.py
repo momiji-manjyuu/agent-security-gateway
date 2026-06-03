@@ -29,6 +29,7 @@ APP_NAME = "openai-asg-shim"
 VERSION = "0.1.0"
 DEFAULT_MAX_BODY_BYTES = 524_288
 DEFAULT_TIMEOUT_SECONDS = 300
+ALLOWED_ASG_PATHS = {"/v1/chat/completions", "/v1/results"}
 
 
 class ShimError(Exception):
@@ -44,12 +45,14 @@ class ShimConfig:
     bind: str
     port: int
     asg_base_url: str
+    asg_path: str
     asg_token: str
     route_id: str
     capability: str
     taint: list[str]
     model_id: str
     model_alias: str
+    result_message_type: str
     timeout_seconds: float
     max_body_bytes: int
     strip_tooling: bool
@@ -110,6 +113,16 @@ def _parse_roles(value: str) -> set[str]:
     return roles
 
 
+def _parse_asg_path(value: str) -> str:
+    path = value.strip() or "/v1/chat/completions"
+    if not path.startswith("/"):
+        path = "/" + path
+    if path not in ALLOWED_ASG_PATHS:
+        allowed = ", ".join(sorted(ALLOWED_ASG_PATHS))
+        raise ShimError(500, "invalid_config", f"ASG_SHIM_ASG_PATH must be one of: {allowed}")
+    return path
+
+
 def load_config_from_env() -> ShimConfig:
     asg_base_url = _env("ASG_SHIM_ASG_BASE_URL").rstrip("/")
     route_id = _env("ASG_SHIM_ROUTE_ID")
@@ -123,6 +136,10 @@ def load_config_from_env() -> ShimConfig:
         raise ShimError(500, "invalid_config", "ASG_SHIM_ROUTE_ID is required")
     if not capability:
         raise ShimError(500, "invalid_config", "ASG_SHIM_CAPABILITY is required")
+    asg_path = _parse_asg_path(_env("ASG_SHIM_ASG_PATH", "/v1/chat/completions"))
+    result_message_type = _env("ASG_SHIM_RESULT_MESSAGE_TYPE", "worker_report")
+    if not result_message_type:
+        raise ShimError(500, "invalid_config", "ASG_SHIM_RESULT_MESSAGE_TYPE must not be empty")
     port = _parse_int("ASG_SHIM_PORT", 18088, minimum=1, maximum=65_535)
     timeout_seconds = _parse_int("ASG_SHIM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS, minimum=1, maximum=600)
     max_body_bytes = _parse_int("ASG_SHIM_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, minimum=1, maximum=50 * 1024 * 1024)
@@ -132,12 +149,14 @@ def load_config_from_env() -> ShimConfig:
         bind=_env("ASG_SHIM_BIND", "127.0.0.1"),
         port=port,
         asg_base_url=asg_base_url,
+        asg_path=asg_path,
         asg_token=_read_token(),
         route_id=route_id,
         capability=capability,
         taint=_parse_taint(_env("ASG_SHIM_TAINT", "trusted_instruction")),
         model_id=model_id,
         model_alias=model_alias,
+        result_message_type=result_message_type,
         timeout_seconds=float(timeout_seconds),
         max_body_bytes=max_body_bytes,
         strip_tooling=_parse_bool("ASG_SHIM_STRIP_TOOLING", True),
@@ -181,6 +200,59 @@ def build_asg_payload(payload: dict[str, Any], config: ShimConfig) -> dict[str, 
     return outbound
 
 
+def build_asg_result_payload(payload: dict[str, Any], config: ShimConfig) -> dict[str, Any]:
+    outbound = strip_tooling_fields(payload, config.allowed_message_roles) if config.strip_tooling else dict(payload)
+    metadata = outbound.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    if isinstance(payload.get("model"), str) and payload.get("model"):
+        metadata["source_model"] = payload["model"]
+    metadata["route_id"] = config.route_id
+    metadata["capability"] = config.capability
+    metadata["taint"] = list(config.taint)
+
+    result: dict[str, Any] = {
+        "route_id": config.route_id,
+        "capability": config.capability,
+        "taint": list(config.taint),
+        "message_type": config.result_message_type,
+        "metadata": metadata,
+    }
+    messages = outbound.get("messages")
+    if isinstance(messages, list):
+        result["messages"] = messages
+    for field in ("run_id", "task_id", "user"):
+        value = outbound.get(field)
+        if isinstance(value, str) and value.strip():
+            result[field] = value.strip()
+            continue
+        meta_value = metadata.get(field)
+        if isinstance(meta_value, str) and meta_value.strip():
+            result[field] = meta_value.strip()
+    if "input" in outbound and "messages" not in result:
+        result["input"] = outbound["input"]
+    return result
+
+
+def openai_result_response(body: dict[str, Any], config: ShimConfig, request_id: str) -> dict[str, Any]:
+    response_id = str(body.get("request_id") or request_id).removeprefix("req_")
+    return {
+        "id": "chatcmpl-asg-" + response_id[:24],
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": config.model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(body, ensure_ascii=False, sort_keys=True),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
 def strip_tooling_fields(payload: dict[str, Any], allowed_roles: set[str]) -> dict[str, Any]:
     blocked_request_fields = {
         "tools",
@@ -212,7 +284,7 @@ def strip_tooling_fields(payload: dict[str, Any], allowed_roles: set[str]) -> di
 
 
 def forward_chat(payload: dict[str, Any], config: ShimConfig, request_id: str) -> tuple[int, dict[str, Any]]:
-    outbound = build_asg_payload(payload, config)
+    outbound = build_asg_result_payload(payload, config) if config.asg_path == "/v1/results" else build_asg_payload(payload, config)
     body = json.dumps(outbound, ensure_ascii=False, sort_keys=True).encode("utf-8")
     headers = {
         "Authorization": "Bearer " + config.asg_token,
@@ -222,7 +294,7 @@ def forward_chat(payload: dict[str, Any], config: ShimConfig, request_id: str) -
         "X-Request-ID": request_id,
     }
     request = urllib.request.Request(
-        config.asg_base_url + "/v1/chat/completions",
+        config.asg_base_url + config.asg_path,
         data=body,
         method="POST",
         headers=headers,
@@ -233,6 +305,8 @@ def forward_chat(payload: dict[str, Any], config: ShimConfig, request_id: str) -
             parsed = json.loads(raw) if raw.strip() else {}
             if not isinstance(parsed, dict):
                 parsed = {"value": parsed}
+            if config.asg_path == "/v1/results":
+                parsed = openai_result_response(parsed, config, request_id)
             return response.status, parsed
     except urllib.error.HTTPError as exc:
         try:
@@ -397,9 +471,11 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": True,
                     "app": APP_NAME,
                     "asg_base_url": config.asg_base_url,
+                    "asg_path": config.asg_path,
                     "route_id": config.route_id,
                     "capability": config.capability,
                     "model_id": config.model_id,
+                    "result_message_type": config.result_message_type,
                     "bind": config.bind,
                     "port": config.port,
                     "strip_tooling": config.strip_tooling,

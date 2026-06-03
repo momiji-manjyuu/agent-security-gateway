@@ -43,11 +43,13 @@
       ],
       "allowed_capabilities": [
         "submit_source_card",
+        "notify_audited_result",
         "inspect"
       ],
       "allowed_routes": [
         "security.inspect_only",
-        "ubuntu1.knowledge.submit_source_card"
+        "ubuntu1.knowledge.submit_source_card",
+        "mac.result_receipt.notify"
       ]
     },
     "ubuntu_verify_2": {
@@ -60,11 +62,13 @@
       "allowed_capabilities": [
         "submit_verification_result",
         "submit_benchmark_result",
+        "notify_audited_result",
         "inspect"
       ],
       "allowed_routes": [
         "security.inspect_only",
-        "ubuntu1.knowledge.submit_verification_result"
+        "ubuntu1.knowledge.submit_verification_result",
+        "mac.result_receipt.notify"
       ]
     },
     "human_operator": {
@@ -212,6 +216,42 @@
           "sandbox_output"
         ],
         "allow_raw_external_content": false
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "mac.result_receipt.notify": {
+      "kind": "http_json",
+      "description": "Notify the Mac controller with an audited worker-result receipt, never the raw worker report.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://mac-controller.internal:8789",
+        "path": "/asg/result-receipts",
+        "method": "POST",
+        "api_key_env": "MAC_RESULT_RECEIPT_BACKEND_KEY",
+        "timeout_seconds": 30
+      },
+      "allowed_callers": [
+        "pi_research_1",
+        "ubuntu_verify_2"
+      ],
+      "required_capability": "notify_audited_result",
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "sandbox_output",
+          "model_output"
+        ],
+        "allow_raw_external_content": false
+      },
+      "report_policy": {
+        "forward_audit_receipt": true,
+        "return_audit_receipt": true,
+        "include_structured_extract": false,
+        "notify_on_block": true
       },
       "output_policy": {
         "block_secrets": true,

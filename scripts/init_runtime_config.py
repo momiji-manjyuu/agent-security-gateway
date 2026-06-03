@@ -81,9 +81,9 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
         "pi_research_1": {
             "token_sha256": gateway.hash_token(pi_token),
             "trust_tier": "web_dmz",
-            "allowed_capabilities": ["inspect", "submit_source_card"],
+            "allowed_capabilities": ["inspect", "submit_source_card", "notify_audited_result"],
             "allowed_client_cidrs": sorted({"127.0.0.1/32", *external_cidrs}),
-            "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card"],
+            "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card", "mac.result_receipt.notify"],
         },
         "human_operator": {
             "token_sha256": gateway.hash_token(human_token),
@@ -131,6 +131,25 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
                 },
                 "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
             },
+            "mac.result_receipt.notify": {
+                "kind": "http_json",
+                "description": "Notify the Mac controller with an audited result receipt, not the raw worker report.",
+                "backend": dry_run_backend(args.enable_forward, args.mac_receipt_backend_url, "/asg/result-receipts", "MAC_RESULT_RECEIPT_BACKEND_KEY", 30),
+                "allowed_callers": ["pi_research_1"],
+                "required_capability": "notify_audited_result",
+                "input_policy": {
+                    "accepted_taint": ["untrusted_web", "sandbox_output", "model_output"],
+                    "allow_missing_taint": False,
+                    "allow_raw_external_content": False,
+                },
+                "report_policy": {
+                    "forward_audit_receipt": True,
+                    "return_audit_receipt": True,
+                    "include_structured_extract": False,
+                    "notify_on_block": True,
+                },
+                "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
+            },
             "windows_image.comfyui.generate": {
                 "kind": "http_json",
                 "description": "Submit image generation jobs to a Windows image node.",
@@ -170,6 +189,7 @@ def main() -> int:
     parser.add_argument("--pi-backend-url", default="http://pi1-agent.internal:8000/v1")
     parser.add_argument("--knowledge-backend-url", default="http://ubuntu1-knowledge.internal:8801")
     parser.add_argument("--image-backend-url", default="http://windows-image.internal:8188")
+    parser.add_argument("--mac-receipt-backend-url", default="http://mac-controller.internal:8789")
     args = parser.parse_args()
 
     args.runtime_dir.mkdir(parents=True, exist_ok=True)

@@ -15,8 +15,8 @@
       "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "trust_tier": "web_dmz",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.30.11/32"],
-      "allowed_capabilities": ["inspect", "submit_source_card"],
-      "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card"]
+      "allowed_capabilities": ["inspect", "submit_source_card", "notify_audited_result"],
+      "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card", "mac.result_receipt.notify"]
     },
     "human_operator": {
       "token_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
@@ -99,6 +99,30 @@
         "allow_missing_taint": false,
         "require_message_type": "source_card",
         "allow_raw_external_content": false
+      }
+    },
+    "mac.result_receipt.notify": {
+      "kind": "http_json",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://mac-controller.internal:8789",
+        "path": "/asg/result-receipts",
+        "method": "POST",
+        "api_key_env": "MAC_RESULT_RECEIPT_BACKEND_KEY",
+        "timeout_seconds": 30
+      },
+      "allowed_callers": ["pi_research_1"],
+      "required_capability": "notify_audited_result",
+      "input_policy": {
+        "accepted_taint": ["untrusted_web", "sandbox_output", "model_output"],
+        "allow_missing_taint": false,
+        "allow_raw_external_content": false
+      },
+      "report_policy": {
+        "forward_audit_receipt": true,
+        "return_audit_receipt": true,
+        "include_structured_extract": false,
+        "notify_on_block": true
       }
     }
   }
