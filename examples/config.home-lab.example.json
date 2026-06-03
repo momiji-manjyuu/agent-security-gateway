@@ -102,14 +102,14 @@
       }
     },
     "mac.result_receipt.notify": {
-      "kind": "http_json",
+      "kind": "openai_chat_completions",
       "backend": {
         "mode": "http",
-        "base_url": "http://mac-controller.internal:8789",
-        "path": "/asg/result-receipts",
-        "method": "POST",
-        "api_key_env": "MAC_RESULT_RECEIPT_BACKEND_KEY",
-        "timeout_seconds": 30
+        "base_url": "http://mac-controller.internal:8642/v1",
+        "path": "/chat/completions",
+        "api_key_env": "MAC_HERMES_BACKEND_KEY",
+        "timeout_seconds": 120,
+        "model_rewrite": "hermes-agent"
       },
       "allowed_callers": ["pi_research_1"],
       "required_capability": "notify_audited_result",

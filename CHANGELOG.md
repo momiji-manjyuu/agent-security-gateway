@@ -11,6 +11,8 @@
 - Enforced route input policy fields including `max_messages`, `require_message_type`, `require_structured_task`, `allow_raw_external_content`, `disallow_external_urls`, and `max_batch_size`.
 - Added `/readyz` and canonical backend HMAC signing over method, path, body hash, ASG identity headers, and timestamp.
 - Added `/v1/results` audit receipt forwarding for Mac/controller notification routes so worker reports can trigger follow-up checks without forwarding raw report content.
+- Added OpenAI chat backend support for result audit receipt forwarding so Mac Hermes can receive audited worker completion notifications on port `8642`.
+- Added route-local trusted control policy for known internal ASG instruction URLs and defensive secret-handling text without weakening default scanner/action/output guards.
 - Added `scripts/openai_asg_shim.py` so workers with plain OpenAI-compatible clients can forward through ASG with fixed route, capability, and taint metadata, including `/v1/results` mode for report-only Mac/controller contact.
 - Added `scripts/result_receipt_collector.py` as a minimal authenticated Mac/controller backend for storing ASG result audit receipts.
 - Preserved deterministic scanner, Unicode normalization, output guard, LLM inspector hook, kill switch, rate limit, and hash-chained JSONL audit logs from the proxy codebase.

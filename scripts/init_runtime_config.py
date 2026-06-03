@@ -132,9 +132,12 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
                 "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
             },
             "mac.result_receipt.notify": {
-                "kind": "http_json",
-                "description": "Notify the Mac controller with an audited result receipt, not the raw worker report.",
-                "backend": dry_run_backend(args.enable_forward, args.mac_receipt_backend_url, "/asg/result-receipts", "MAC_RESULT_RECEIPT_BACKEND_KEY", 30),
+                "kind": "openai_chat_completions",
+                "description": "Notify the Mac Hermes API with an audited result receipt, not the raw worker report.",
+                "backend": {
+                    **dry_run_backend(args.enable_forward, args.mac_hermes_backend_url, "/chat/completions", "MAC_HERMES_BACKEND_KEY", 120),
+                    "model_rewrite": args.mac_hermes_model,
+                },
                 "allowed_callers": ["pi_research_1"],
                 "required_capability": "notify_audited_result",
                 "input_policy": {
@@ -189,7 +192,8 @@ def main() -> int:
     parser.add_argument("--pi-backend-url", default="http://pi1-agent.internal:8000/v1")
     parser.add_argument("--knowledge-backend-url", default="http://ubuntu1-knowledge.internal:8801")
     parser.add_argument("--image-backend-url", default="http://windows-image.internal:8188")
-    parser.add_argument("--mac-receipt-backend-url", default="http://mac-controller.internal:8789")
+    parser.add_argument("--mac-hermes-backend-url", default="http://mac-controller.internal:8642/v1")
+    parser.add_argument("--mac-hermes-model", default="hermes-agent")
     args = parser.parse_args()
 
     args.runtime_dir.mkdir(parents=True, exist_ok=True)

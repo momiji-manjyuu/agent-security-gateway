@@ -108,6 +108,10 @@ SHELL_LIKE_PATTERN = re.compile(
     r"\b(?:curl|wget|bash|zsh|sh|sudo|rm\s+-rf|python\s+-c|pip\s+install|npm\s+install|apt(?:-get)?\s+install|brew\s+install)\b",
     re.IGNORECASE,
 )
+DEFENSIVE_SECRET_INSTRUCTION_PATTERN = re.compile(
+    r"\b(?:do not|don't|never|must not|without)\b.{0,100}\b(?:show|print|dump|send|upload|reveal|disclose|share|include)\b.{0,100}\b(?:\.env|auth\.json|credentials?|secrets?|private key|api[_ -]?key|token|password)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 DANGEROUS_ACTION_PATTERNS: list[tuple[str, str, int, str]] = [
     ("secret_exfiltration", r"\b(read|open|cat|show|print|dump|send|upload)\b.{0,100}(\.env|id_rsa|credentials?|auth\.json|private key|api[_ -]?key|token)", 10, "secret exfiltration request"),
     ("curl_pipe_shell", r"\bcurl\b[^\n|]{0,200}\|\s*(sh|bash|zsh)\b", 10, "curl piped into a shell"),
@@ -361,8 +365,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
             for field in REPORT_POLICY_BOOL_FIELDS:
                 if field in report_policy and not isinstance(report_policy.get(field), bool):
                     errors.append(f"routes.{route_id}.report_policy.{field} must be a boolean")
-            if report_policy.get("forward_audit_receipt") and kind != "http_json":
-                errors.append(f"routes.{route_id}.report_policy.forward_audit_receipt requires kind 'http_json'")
+            if report_policy.get("forward_audit_receipt") and kind not in {"http_json", "openai_chat_completions"}:
+                errors.append(f"routes.{route_id}.report_policy.forward_audit_receipt requires kind 'http_json' or 'openai_chat_completions'")
         backend = route.get("backend", {})
         if kind != "inspect_only":
             if not isinstance(backend, dict):
@@ -765,6 +769,79 @@ def scan_inbound(payload: dict[str, Any], cfg: dict[str, Any]) -> security.Inbou
     return security.scan_inbound_payload(payload, cfg)
 
 
+def route_input_policy(decision: RouteDecision) -> dict[str, Any]:
+    policy = decision.route.get("input_policy", {})
+    return policy if isinstance(policy, dict) else {}
+
+
+def normalized_allowed_private_instruction_hosts(decision: RouteDecision) -> set[str]:
+    hosts = route_input_policy(decision).get("allowed_private_instruction_hosts") or []
+    if not isinstance(hosts, list):
+        return set()
+    return {str(host).lower().strip().strip("[]") for host in hosts if str(host).strip()}
+
+
+def private_url_hosts(text: str) -> set[str]:
+    hosts: set[str] = set()
+    for match in security.URL_PATTERN.finditer(text):
+        parsed = urllib.parse.urlsplit(match.group(0))
+        host = (parsed.hostname or "").lower().strip("[]")
+        if host and is_private_host(host):
+            hosts.add(host)
+    return hosts
+
+
+def route_allows_private_instruction_hosts(decision: RouteDecision, text: str) -> bool:
+    allowed = normalized_allowed_private_instruction_hosts(decision)
+    if not allowed:
+        return False
+    private_hosts = private_url_hosts(text)
+    return bool(private_hosts) and private_hosts.issubset(allowed)
+
+
+def route_allows_defensive_secret_instruction(decision: RouteDecision, text: str) -> bool:
+    return bool(route_input_policy(decision).get("allow_defensive_secret_instructions")) and bool(DEFENSIVE_SECRET_INSTRUCTION_PATTERN.search(text))
+
+
+def route_allows_input_finding(decision: RouteDecision, finding: security.Finding, text: str) -> bool:
+    policy = route_input_policy(decision)
+    allowed = policy.get("allow_scanner_findings") or []
+    if isinstance(allowed, list) and finding.category in {str(item) for item in allowed}:
+        return True
+    if finding.category == "input_dlp:private_host":
+        return route_allows_private_instruction_hosts(decision, text)
+    if finding.category in {
+        "prompt_injection:secret_exfiltration",
+        "prompt_injection:local_secret_file_request",
+        "prompt_injection:ja_secret_exfiltration",
+    }:
+        return route_allows_defensive_secret_instruction(decision, text)
+    return False
+
+
+def apply_route_inbound_scan_policy(inbound: security.InboundScan, decision: RouteDecision, cfg: dict[str, Any]) -> security.InboundScan:
+    kept: list[security.Finding] = []
+    ignored_categories: list[str] = []
+    for finding in inbound.scan.findings:
+        if route_allows_input_finding(decision, finding, inbound.extracted_text):
+            ignored_categories.append(finding.category)
+            continue
+        kept.append(finding)
+    if len(kept) == len(inbound.scan.findings):
+        return inbound
+    inbound.scan.findings = kept
+    inbound.scan.risk_score = sum(finding.severity for finding in kept)
+    inbound.scan.blocked = inbound.scan.risk_score >= int(cfg.get("block_risk_score", 8))
+    inbound.scan.requires_review = inbound.scan.risk_score >= int(cfg.get("review_risk_score", 4))
+    for category in sorted(set(ignored_categories)):
+        decision.warnings.append("route_ignored_input_finding:" + category)
+    return inbound
+
+
+def scan_inbound_for_route(payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> security.InboundScan:
+    return apply_route_inbound_scan_policy(scan_inbound(payload, cfg), decision, cfg)
+
+
 def recursive_items(value: Any, path: str = "$") -> list[tuple[str, Any]]:
     items: list[tuple[str, Any]] = []
     if isinstance(value, dict):
@@ -832,6 +909,34 @@ def action_guard(headers: Any, payload: dict[str, Any]) -> ActionGuardResult:
         seen.add(key)
         deduped.append(finding)
     return ActionGuardResult("sha256:" + sha256_text(normalized), deduped)
+
+
+def route_allows_action_finding(decision: RouteDecision, finding: security.Finding, text: str) -> bool:
+    policy = route_input_policy(decision)
+    allowed = policy.get("allow_action_guard_findings") or []
+    if isinstance(allowed, list) and finding.category in {str(item) for item in allowed}:
+        return True
+    if finding.category == "action_guard:private_network_target":
+        return route_allows_private_instruction_hosts(decision, text)
+    if finding.category == "action_guard:secret_exfiltration":
+        return route_allows_defensive_secret_instruction(decision, text)
+    return False
+
+
+def apply_route_action_guard_policy(result: ActionGuardResult, decision: RouteDecision, payload: dict[str, Any]) -> ActionGuardResult:
+    text = security.extract_content(payload) + "\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    kept: list[security.Finding] = []
+    ignored_categories: list[str] = []
+    for finding in result.findings:
+        if route_allows_action_finding(decision, finding, text):
+            ignored_categories.append(finding.category)
+            continue
+        kept.append(finding)
+    if len(kept) == len(result.findings):
+        return result
+    for category in sorted(set(ignored_categories)):
+        decision.warnings.append("route_ignored_action_finding:" + category)
+    return ActionGuardResult(result.normalized_action_hash, kept)
 
 
 def approval_store_path(cfg: dict[str, Any]) -> Path:
@@ -971,9 +1076,41 @@ def backend_url(backend: dict[str, Any], default_path: str) -> str:
     return base_url + path
 
 
+def audit_receipt_chat_messages(receipt: dict[str, Any]) -> list[dict[str, str]]:
+    allowed_fields = (
+        "receipt_type",
+        "ok",
+        "decision",
+        "reason",
+        "request_id",
+        "agent_id",
+        "route_id",
+        "route_kind",
+        "capability",
+        "run_id",
+        "task_id",
+        "taint",
+        "warnings",
+        "content_sha256",
+        "content_length",
+        "scan",
+        "action_guard",
+        "delivery",
+    )
+    summary = {field: receipt.get(field) for field in allowed_fields if field in receipt}
+    content = (
+        "Agent Security Gateway received a worker completion report. "
+        "Raw worker report content was not forwarded. Treat this as audit metadata only.\n"
+        + json.dumps(summary, ensure_ascii=False, sort_keys=True)
+    )
+    return [{"role": "user", "content": content}]
+
+
 def build_openai_backend_payload(payload: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
     backend = decision.route.get("backend", {})
     messages = payload.get("messages")
+    if payload.get("receipt_type") == "asg_result_audit":
+        messages = audit_receipt_chat_messages(payload)
     if not isinstance(messages, list):
         messages = [{"role": "user", "content": security.content_to_text(payload.get("input", payload))}]
     model = backend.get("model_rewrite") or backend.get("model") or decision.route_id
@@ -1134,7 +1271,12 @@ def enforce_output_guard(payload: dict[str, Any], cfg: dict[str, Any], decision:
     return scan
 
 
-def output_guard_blocks(scan: security.ScanResult, cfg: dict[str, Any]) -> bool:
+def output_guard_blocks(scan: security.ScanResult, cfg: dict[str, Any], decision: RouteDecision) -> bool:
+    if scan.blocked:
+        return True
+    output_policy = decision.route.get("output_policy", {})
+    if isinstance(output_policy, dict) and output_policy.get("block_on_review") is False:
+        return False
     return security.output_guard_blocks(scan, cfg)
 
 
@@ -1381,8 +1523,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(payload, decision)
-            inbound = scan_inbound(payload, cfg)
-            action = action_guard(self.headers, payload)
+            inbound = scan_inbound_for_route(payload, cfg, decision)
+            action = apply_route_action_guard_policy(action_guard(self.headers, payload), decision, payload)
             event = {
                 **audit_base(request_id, verified, client_ip, decision),
                 "content_sha256": inbound.scan.normalized_sha256,
@@ -1481,7 +1623,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             forward_payload = receipt if forward_receipt else payload
             upstream_status, upstream = self.forward(forward_payload, cfg, decision, verified)
             output_scan = enforce_output_guard(upstream, cfg, decision)
-            if output_guard_blocks(output_scan, cfg):
+            if output_guard_blocks(output_scan, cfg, decision):
                 write_audit(
                     cfg,
                     {
@@ -1645,7 +1787,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             "backend_status": upstream_status,
             "output_scan": security.public_scan_for_audit(output_scan, cfg),
         }
-        if output_guard_blocks(output_scan, cfg):
+        if output_guard_blocks(output_scan, cfg, decision):
             raise GatewayError(403, "blocked_by_output_guard", "result audit receipt backend output was blocked by output guard")
         return delivery
 
