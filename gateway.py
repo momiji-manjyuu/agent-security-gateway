@@ -1082,8 +1082,120 @@ def backend_url(backend: dict[str, Any], default_path: str) -> str:
     return base_url + path
 
 
+def safe_summary_token(value: Any, *, max_chars: int = 64) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable())
+    if len(cleaned) > max_chars:
+        return cleaned[: max_chars - 3].rstrip() + "..."
+    return cleaned
+
+
+def receipt_report_kind_ja(receipt: dict[str, Any]) -> str:
+    message_type = safe_summary_token(receipt.get("message_type"), max_chars=48)
+    message_type_labels = {
+        "source_card": "ソースカード報告",
+        "worker_report": "ワーカー完了報告",
+        "verification_result": "検証結果報告",
+        "sandbox_result": "サンドボックス検証報告",
+        "model_report": "モデル出力報告",
+    }
+    if message_type in message_type_labels:
+        return message_type_labels[message_type]
+
+    capability = safe_summary_token(receipt.get("capability"), max_chars=64)
+    capability_labels = {
+        "submit_source_card": "ソースカード報告",
+        "submit_verification_result": "検証結果報告",
+        "notify_audited_result": "ワーカー完了報告",
+    }
+    if capability in capability_labels:
+        return capability_labels[capability]
+
+    taint = receipt.get("taint")
+    taints = taint if isinstance(taint, list) else []
+    taint_labels = {
+        "untrusted_web": "Web調査報告",
+        "sandbox_output": "サンドボックス検証報告",
+        "model_output": "モデル出力報告",
+    }
+    for item in taints:
+        if item in taint_labels:
+            return taint_labels[item]
+
+    route_id = safe_summary_token(receipt.get("route_id"), max_chars=96)
+    if "source_card" in route_id:
+        return "ソースカード報告"
+    if "verify" in route_id or "verification" in route_id:
+        return "検証結果報告"
+    return "ワーカー報告"
+
+
+def receipt_decision_label_ja(receipt: dict[str, Any]) -> str:
+    decision = safe_summary_token(receipt.get("decision"), max_chars=32)
+    reason = safe_summary_token(receipt.get("reason"), max_chars=64)
+    if decision == "allow":
+        return "許可"
+    if decision == "review_required":
+        return "要確認"
+    if decision == "deny":
+        reason_labels = {
+            "blocked_by_input_guard": "入力ガードで破棄",
+            "blocked_by_action_guard": "アクションガードで破棄",
+            "approval_required": "承認待ちで停止",
+            "manual_review_required": "手動確認待ち",
+        }
+        return reason_labels.get(reason, "破棄")
+    return decision or "処理"
+
+
+def receipt_finding_count(receipt: dict[str, Any]) -> int:
+    total = 0
+    scan = receipt.get("scan")
+    if isinstance(scan, dict):
+        finding_counts = scan.get("finding_counts")
+        if isinstance(finding_counts, dict):
+            for value in finding_counts.values():
+                if isinstance(value, int):
+                    total += value
+        elif isinstance(scan.get("finding_count"), int):
+            total += int(scan["finding_count"])
+        elif isinstance(scan.get("findings"), list):
+            total += len(scan["findings"])
+
+    action_guard = receipt.get("action_guard")
+    if isinstance(action_guard, dict) and isinstance(action_guard.get("findings"), list):
+        total += len(action_guard["findings"])
+    return total
+
+
+def receipt_summary_ja(receipt: dict[str, Any]) -> str:
+    kind = receipt_report_kind_ja(receipt)
+    decision = receipt_decision_label_ja(receipt)
+    agent_id = safe_summary_token(receipt.get("agent_id"), max_chars=48) or "unknown-agent"
+    task_id = safe_summary_token(receipt.get("task_id"), max_chars=64)
+    run_id = safe_summary_token(receipt.get("run_id"), max_chars=64)
+    content_sha = safe_summary_token(receipt.get("content_sha256"), max_chars=80)
+    if task_id and run_id:
+        subject = f"task {task_id} / run {run_id}"
+    elif task_id:
+        subject = f"task {task_id}"
+    elif run_id:
+        subject = f"run {run_id}"
+    elif content_sha:
+        subject = f"hash {content_sha[:12]}"
+    else:
+        subject = "ID未指定の報告"
+
+    finding_count = receipt_finding_count(receipt)
+    finding_text = "検出なし" if finding_count == 0 else f"検出{finding_count}件"
+    return f"{kind}: {agent_id} からの {subject} を{decision}（{finding_text}、生レポート未転送）"
+
+
 def audit_receipt_chat_messages(receipt: dict[str, Any]) -> list[dict[str, str]]:
     allowed_fields = (
+        "summary_ja",
         "receipt_type",
         "ok",
         "decision",
@@ -1095,6 +1207,7 @@ def audit_receipt_chat_messages(receipt: dict[str, Any]) -> list[dict[str, str]]
         "capability",
         "run_id",
         "task_id",
+        "message_type",
         "taint",
         "warnings",
         "content_sha256",
@@ -1104,9 +1217,11 @@ def audit_receipt_chat_messages(receipt: dict[str, Any]) -> list[dict[str, str]]
         "delivery",
     )
     summary = {field: receipt.get(field) for field in allowed_fields if field in receipt}
+    summary_line = receipt_summary_ja(receipt)
+    summary["summary_ja"] = summary_line
     content = (
-        "Agent Security Gateway received a worker completion report. "
-        "Raw worker report content was not forwarded. Treat this as audit metadata only.\n"
+        summary_line
+        + "\nASG監査メタデータのみを通知しています。生のワーカー報告本文は転送していません。\n"
         + json.dumps(summary, ensure_ascii=False, sort_keys=True)
     )
     return [{"role": "user", "content": content}]
@@ -1349,6 +1464,7 @@ def result_audit_receipt(
     forward_payload_mode: str = "raw",
     backend_status: int | None = None,
     include_structured_extract: bool = False,
+    message_type: str | None = None,
 ) -> dict[str, Any]:
     receipt: dict[str, Any] = {
         "ok": receipt_decision == "allow",
@@ -1374,12 +1490,16 @@ def result_audit_receipt(
             "raw_report_forwarded": forward_payload_mode == "raw",
         },
     }
+    safe_message_type = safe_summary_token(message_type, max_chars=64)
+    if safe_message_type:
+        receipt["message_type"] = safe_message_type
     if reason:
         receipt["reason"] = reason
     if backend_status is not None:
         receipt["delivery"]["backend_status"] = backend_status
     if include_structured_extract:
         receipt["structured_extract"] = inbound.structured_extract
+    receipt["summary_ja"] = receipt_summary_ja(receipt)
     return receipt
 
 
@@ -1529,6 +1649,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(payload, decision)
+            message_type = payload_message_type(payload)
             inbound = scan_inbound_for_route(payload, cfg, decision)
             action = apply_route_action_guard_policy(action_guard(self.headers, payload), decision, payload)
             event = {
@@ -1555,6 +1676,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "blocked_by_input_guard",
                     notify_on_block,
                     include_receipt_structured,
+                    message_type,
                 )
                 audit_event = {"event": "deny", "reason": "blocked_by_input_guard", **event}
                 if delivery is not None:
@@ -1578,6 +1700,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "manual_review_required",
                     notify_on_block,
                     include_receipt_structured,
+                    message_type,
                 )
                 audit_event = {"event": "review_required", "reason": "manual_review_required", **event}
                 if delivery is not None:
@@ -1603,6 +1726,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     exc.code,
                     notify_on_block,
                     include_receipt_structured,
+                    message_type,
                 )
                 audit_event = {"event": "deny", "reason": exc.code, **event}
                 if delivery is not None:
@@ -1625,6 +1749,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 receipt_decision="allow",
                 forward_payload_mode=forward_payload_mode,
                 include_structured_extract=include_receipt_structured,
+                message_type=message_type,
             )
             forward_payload = receipt if forward_receipt else payload
             upstream_status, upstream = self.forward(forward_payload, cfg, decision, verified)
@@ -1810,6 +1935,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         reason: str,
         notify_on_block: bool,
         include_structured_extract: bool,
+        message_type: str | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         receipt = result_audit_receipt(
             request_id=request_id,
@@ -1823,6 +1949,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             reason=reason,
             forward_payload_mode="audit_receipt" if notify_on_block else "none",
             include_structured_extract=include_structured_extract,
+            message_type=message_type,
         )
         if not notify_on_block:
             return receipt, None

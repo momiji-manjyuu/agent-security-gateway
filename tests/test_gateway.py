@@ -751,10 +751,15 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(body["decision"], "allow")
             self.assertEqual(body["agent_id"], "pi_research_1")
             self.assertEqual(body["task_id"], "task-report")
+            self.assertEqual(body["message_type"], "source_card")
+            self.assertIn("ソースカード報告", body["summary_ja"])
+            self.assertIn("task task-report / run run-report", body["summary_ja"])
+            self.assertIn("許可", body["summary_ja"])
             self.assertFalse(body["delivery"]["raw_report_forwarded"])
             self.assertEqual(body["delivery"]["backend_status"], 200)
             forwarded = json.dumps(backend.last_body, ensure_ascii=False)  # type: ignore[attr-defined]
             self.assertIn("asg_result_audit", forwarded)
+            self.assertIn("ソースカード報告", forwarded)
             self.assertNotIn("Artifact is ready", forwarded)
             self.assertNotIn("src-1", forwarded)
             self.assertEqual(backend.last_body["scan"]["finding_counts"], {})  # type: ignore[attr-defined]
@@ -808,8 +813,13 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(body["delivery"]["backend_status"], 200)
             self.assertEqual(backend.last_body["model"], "mac-hermes-agent")  # type: ignore[attr-defined]
             forwarded = json.dumps(backend.last_body, ensure_ascii=False)  # type: ignore[attr-defined]
+            message_content = backend.last_body["messages"][0]["content"]  # type: ignore[index]
+            first_line = message_content.splitlines()[0]
+            self.assertTrue(first_line.startswith("ソースカード報告: pi_research_1 からの task task-report / run run-report を許可"))
+            self.assertIn("生のワーカー報告本文は転送していません", message_content)
             self.assertIn("asg_result_audit", forwarded)
-            self.assertIn("Raw worker report content was not forwarded", forwarded)
+            self.assertNotIn("Agent Security Gateway received a worker completion report", forwarded)
+            self.assertNotIn("Raw worker report content was not forwarded", forwarded)
             self.assertNotIn("Artifact is ready", forwarded)
             self.assertNotIn("src-1", forwarded)
             event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
@@ -850,9 +860,12 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(body["receipt_type"], "asg_result_audit")
             self.assertEqual(body["decision"], "deny")
             self.assertEqual(body["reason"], "blocked_by_input_guard")
+            self.assertEqual(body["message_type"], "source_card")
+            self.assertIn("入力ガードで破棄", body["summary_ja"])
             self.assertFalse(body["delivery"]["raw_report_forwarded"])
             forwarded = json.dumps(backend.last_body, ensure_ascii=False)  # type: ignore[attr-defined]
             self.assertIn("asg_result_audit", forwarded)
+            self.assertIn("入力ガードで破棄", forwarded)
             self.assertNotIn("Ignore previous instructions", forwarded)
             self.assertNotIn("src-1", forwarded)
             event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])

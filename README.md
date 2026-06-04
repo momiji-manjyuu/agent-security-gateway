@@ -191,7 +191,9 @@ For Mac/controller notifications, configure a result route with
 worker payload and forwards only an `asg_result_audit` receipt to the backend,
 not the raw worker report. The receipt includes route/run/task metadata,
 content hash, scan summary, action-guard summary, and optional structured
-extract. If `notify_on_block` is not set, it defaults to true when
+extract. The receipt also includes a short Japanese `summary_ja` generated from
+audit metadata so Mac/controller sessions can use a distinct human-readable
+title without receiving raw worker report text. If `notify_on_block` is not set, it defaults to true when
 `forward_audit_receipt` is true, so blocked/review-stopped reports can still
 notify the Mac with a safe discard receipt.
 
@@ -281,7 +283,8 @@ Route kinds:
 For `/v1/results` routes with `report_policy.forward_audit_receipt: true`,
 `http_json` sends the generated audit receipt as the backend body. For
 `openai_chat_completions`, the gateway converts the generated receipt into a
-short OpenAI-compatible chat message before forwarding. Both modes keep raw
+short OpenAI-compatible chat message before forwarding. The first line is the
+Japanese `summary_ja`, followed by audit metadata JSON. Both modes keep raw
 worker report text out of Mac/controller notification routes.
 
 Trusted controller routes that need to instruct a worker to call known internal
@@ -481,7 +484,8 @@ python3 scripts/openai_asg_shim.py serve
 In `/v1/results` mode, the shim accepts OpenAI-compatible
 `/v1/chat/completions` requests locally, converts the stripped chat messages
 into an ASG result packet, and returns a normal OpenAI chat completion whose
-message content is the ASG audit receipt JSON.
+message content is the ASG audit receipt JSON, including `summary_ja` when the
+gateway returned one.
 
 Run a minimal Mac/controller receipt backend only when you want receipt JSONL
 storage instead of Hermes notification:
