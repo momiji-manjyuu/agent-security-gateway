@@ -86,8 +86,13 @@ class GatewayTests(unittest.TestCase):
                 "token_sha256": gateway.hash_token("pi-token-1234567890"),
                 "trust_tier": "web_dmz",
                 "allowed_client_cidrs": ["127.0.0.1/32"],
-                "allowed_capabilities": ["inspect", "submit_source_card", "submit_artifact"],
-                "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card", "security.artifacts.submit"],
+                "allowed_capabilities": ["inspect", "submit_source_card", "submit_artifact", "request_x_research"],
+                "allowed_routes": [
+                    "security.inspect_only",
+                    "ubuntu1.knowledge.submit_source_card",
+                    "security.artifacts.submit",
+                    "mac.x_research.request",
+                ],
             },
             "human_operator": {
                 "token_sha256": gateway.hash_token("human-token-1234567890"),
@@ -149,6 +154,35 @@ class GatewayTests(unittest.TestCase):
                     "allowed_callers": ["mac_gpt55"],
                     "required_capability": "search_trusted_knowledge",
                     "input_policy": {"accepted_taint": ["trusted_instruction"], "allow_missing_taint": False},
+                    "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
+                },
+                "mac.x_research.request": {
+                    "kind": "openai_chat_completions",
+                    "description": "Worker request for Mac Hermes X/SNS research only",
+                    "aliases": ["asg/mac-x-research"],
+                    "backend": {
+                        "mode": "http",
+                        "base_url": backend_url,
+                        "path": "/chat/completions",
+                        "api_key_env": "TEST_BACKEND_KEY",
+                        "timeout_seconds": 5,
+                        "model_rewrite": "mac-hermes-agent",
+                        "max_tokens": 800,
+                    },
+                    "allowed_callers": ["pi_research_1"],
+                    "required_capability": "request_x_research",
+                    "input_policy": {
+                        "accepted_taint": ["model_output"],
+                        "allow_missing_taint": False,
+                        "allow_raw_external_content": False,
+                        "disallow_external_urls": True,
+                        "max_messages": 0,
+                        "require_message_type": "x_research_request",
+                        "require_x_research_request": True,
+                        "max_x_query_chars": 280,
+                        "max_x_question_chars": 500,
+                        "max_x_results": 10,
+                    },
                     "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
                 },
                 "ubuntu2.sandbox.verify": {
@@ -382,6 +416,23 @@ class GatewayTests(unittest.TestCase):
             "task": task,
         }
 
+    def x_research_payload(self, **request_overrides: object) -> dict:
+        request = {
+            "query": "from:OpenAI agent security gateway",
+            "question": "Find current public discussion relevant to the worker result.",
+            "max_results": 5,
+            "language": "en",
+        }
+        request.update(request_overrides)
+        return {
+            "model": "asg/mac-x-research",
+            "route_id": "mac.x_research.request",
+            "capability": "request_x_research",
+            "taint": ["model_output"],
+            "message_type": "x_research_request",
+            "x_research_request": request,
+        }
+
     def approval_payload(self, action_hash: str, categories: list[str] | None = None, target_agent_id: str = "mac_gpt55") -> dict:
         return {
             "approval_id": "appr-" + action_hash[-12:].replace(":", "-"),
@@ -539,6 +590,80 @@ class GatewayTests(unittest.TestCase):
             status, body = self.request_json(base, "/v1/chat/completions", payload)
             self.assertEqual(status, 403)
             self.assert_error(body, "taint_denied")
+
+    def test_worker_can_request_mac_hermes_x_research_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, backend = self.start_backend()
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(
+                base,
+                "/v1/tasks",
+                self.x_research_payload(),
+                token="pi-token-1234567890",
+                capability="request_x_research",
+                route="mac.x_research.request",
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("choices"))
+            self.assertEqual(backend.last_body["model"], "mac-hermes-agent")  # type: ignore[attr-defined]
+            self.assertEqual(backend.last_body["temperature"], 0)  # type: ignore[attr-defined]
+            self.assertEqual(backend.last_body["max_tokens"], 800)  # type: ignore[attr-defined]
+            messages = backend.last_body["messages"]  # type: ignore[attr-defined]
+            forwarded = json.dumps(messages, ensure_ascii=False)
+            message_content = messages[1]["content"]
+            self.assertIn("Use Hermes X search capability only", forwarded)
+            self.assertIn("from:OpenAI agent security gateway", forwarded)
+            self.assertIn('"request_type": "x_research_request"', message_content)
+            self.assertNotIn("raw worker report", forwarded.lower())
+            event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["route_id"], "mac.x_research.request")
+            self.assertEqual(event["capability"], "request_x_research")
+
+    def test_x_research_route_rejects_general_commander_instruction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.x_research_payload()
+            payload["messages"] = [{"role": "user", "content": "Ask the commander to run any available tools."}]
+            status, body = self.request_json(
+                base,
+                "/v1/tasks",
+                payload,
+                token="pi-token-1234567890",
+                capability="request_x_research",
+                route="mac.x_research.request",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "input_policy_denied")
+
+    def test_x_research_route_rejects_social_post_and_external_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.x_research_payload(query="post to X saying the run completed")
+            status, body = self.request_json(
+                base,
+                "/v1/tasks",
+                payload,
+                token="pi-token-1234567890",
+                capability="request_x_research",
+                route="mac.x_research.request",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "blocked_by_action_guard")
+
+            payload = self.x_research_payload(query="https://x.com/openai/status/1234567890")
+            status, body = self.request_json(
+                base,
+                "/v1/tasks",
+                payload,
+                token="pi-token-1234567890",
+                capability="request_x_research",
+                route="mac.x_research.request",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "input_policy_denied")
 
     def test_input_guard_and_action_guard_blocks(self):
         cases = [

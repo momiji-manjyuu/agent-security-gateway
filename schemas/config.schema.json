@@ -144,7 +144,55 @@
           "type": "object"
         },
         "input_policy": {
-          "type": "object"
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "accepted_taint": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "allow_missing_taint": {
+              "type": "boolean"
+            },
+            "require_message_type": {
+              "type": "string"
+            },
+            "require_structured_task": {
+              "type": "boolean"
+            },
+            "require_x_research_request": {
+              "type": "boolean"
+            },
+            "max_x_query_chars": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_x_question_chars": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_x_results": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            },
+            "allow_raw_external_content": {
+              "type": "boolean"
+            },
+            "disallow_external_urls": {
+              "type": "boolean"
+            },
+            "max_messages": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_batch_size": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
         },
         "action_policy": {
           "type": "object"

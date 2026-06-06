@@ -20,8 +20,14 @@
       "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "trust_tier": "web_dmz",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.30.11/32"],
-      "allowed_capabilities": ["inspect", "submit_source_card", "submit_artifact", "notify_audited_result"],
-      "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card", "security.artifacts.submit", "mac.result_receipt.notify"]
+      "allowed_capabilities": ["inspect", "submit_source_card", "submit_artifact", "notify_audited_result", "request_x_research"],
+      "allowed_routes": [
+        "security.inspect_only",
+        "ubuntu1.knowledge.submit_source_card",
+        "security.artifacts.submit",
+        "mac.result_receipt.notify",
+        "mac.x_research.request"
+      ]
     },
     "human_operator": {
       "token_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
@@ -168,6 +174,33 @@
         "return_audit_receipt": true,
         "include_structured_extract": false,
         "notify_on_block": true
+      }
+    },
+    "mac.x_research.request": {
+      "kind": "openai_chat_completions",
+      "aliases": ["asg/mac-x-research"],
+      "backend": {
+        "mode": "http",
+        "base_url": "http://mac-controller.internal:8642/v1",
+        "path": "/chat/completions",
+        "api_key_env": "MAC_HERMES_BACKEND_KEY",
+        "timeout_seconds": 120,
+        "model_rewrite": "hermes-agent",
+        "max_tokens": 800
+      },
+      "allowed_callers": ["pi_research_1"],
+      "required_capability": "request_x_research",
+      "input_policy": {
+        "accepted_taint": ["model_output"],
+        "allow_missing_taint": false,
+        "allow_raw_external_content": false,
+        "disallow_external_urls": true,
+        "max_messages": 0,
+        "require_message_type": "x_research_request",
+        "require_x_research_request": true,
+        "max_x_query_chars": 280,
+        "max_x_question_chars": 500,
+        "max_x_results": 10
       }
     }
   }

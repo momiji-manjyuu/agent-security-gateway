@@ -248,6 +248,66 @@ Example Mac notification route:
 }
 ```
 
+Worker-to-controller instructions should stay blocked by default. If a worker
+needs the Mac Hermes controller's X/SNS search capability, use a separate
+`mac.x_research.request` route and grant only the `request_x_research`
+capability. The route accepts only a structured `x_research_request`; it does
+not forward worker chat messages, raw reports, caller-selected tools, social
+posting requests, external URLs, or raw external content. ASG converts the
+validated fields into a short Hermes prompt that says to use X search only.
+
+```json
+"mac.x_research.request": {
+  "kind": "openai_chat_completions",
+  "aliases": ["asg/mac-x-research"],
+  "backend": {
+    "mode": "http",
+    "base_url": "http://mac-controller.internal:8642/v1",
+    "path": "/chat/completions",
+    "api_key_env": "MAC_HERMES_BACKEND_KEY",
+    "timeout_seconds": 120,
+    "model_rewrite": "hermes-agent",
+    "max_tokens": 800
+  },
+  "allowed_callers": ["pi_research_1", "ubuntu_verify_2"],
+  "required_capability": "request_x_research",
+  "input_policy": {
+    "accepted_taint": ["model_output"],
+    "allow_missing_taint": false,
+    "allow_raw_external_content": false,
+    "disallow_external_urls": true,
+    "max_messages": 0,
+    "require_message_type": "x_research_request",
+    "require_x_research_request": true,
+    "max_x_query_chars": 280,
+    "max_x_question_chars": 500,
+    "max_x_results": 10
+  }
+}
+```
+
+```bash
+curl -s http://127.0.0.1:8788/v1/tasks \
+  -H "Authorization: Bearer $PI_AGENT_TOKEN" \
+  -H "X-Agent-Capability: request_x_research" \
+  -H "X-ASG-Route: mac.x_research.request" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "route_id": "mac.x_research.request",
+    "capability": "request_x_research",
+    "run_id": "example-run",
+    "task_id": "task-x-001",
+    "taint": ["model_output"],
+    "message_type": "x_research_request",
+    "x_research_request": {
+      "query": "from:OpenAI agent security",
+      "question": "Find recent public X discussion relevant to this worker result.",
+      "max_results": 5,
+      "language": "en"
+    }
+  }'
+```
+
 ### `POST /v1/artifacts`
 
 Stores an artifact in the ASG quarantine store and returns an `artifact_ref`.
@@ -447,6 +507,7 @@ Routes accept only taints listed in `route.input_policy.accepted_taint`, unless 
 - `max_messages`: rejects `messages` arrays above the configured length.
 - `require_message_type`: requires top-level `message_type` or `metadata.message_type` to match.
 - `require_structured_task`: requires a top-level `task` object with non-empty `task.objective`; `task.constraints` and `task.output_contract` must be objects when present. `metadata.message_type == "task_instruction"` with `messages` is allowed only for compatibility. Strict deployments should use task packets.
+- `require_x_research_request`: requires `message_type: "x_research_request"` and a top-level `x_research_request` object containing only `query`, optional `question`, optional `max_results`, optional `since`/`until` dates, and optional `language`. Use with `max_messages: 0`, `allow_raw_external_content: false`, and `disallow_external_urls: true` for worker-to-Hermes X search requests.
 - `allow_raw_external_content: false`: rejects raw external body keys such as `raw_content`, `raw_html`, `html`, `full_text`, `page_text`, `document_text`, `source_text`, `raw_document`, `raw_page`, `raw_markdown`, and `transcript_raw`.
 - `disallow_external_urls: true`: rejects any `http://` or `https://` URL in the payload.
 - `max_batch_size`: rejects oversized numeric batch fields (`batch_size`, `n`, `count`, `num_images`, `num_prompts`, `samples`) and oversized list fields (`prompts`, `prompt_matrix`, `items`, `jobs`, `requests`).
