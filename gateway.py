@@ -110,6 +110,7 @@ BATCH_LIST_KEYS = {
 ARTIFACT_STATUSES = {"unchecked", "verified", "needs_review", "blocked"}
 ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-f0-9]{32}$")
 ARTIFACT_SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+ARTIFACT_PARTITION_PATTERN = re.compile(r"^\d{4}/\d{2}/\d{2}$")
 ARTIFACT_TEXT_MEDIA_TYPES = {
     "application/json",
     "application/ld+json",
@@ -1696,6 +1697,7 @@ def artifact_allowed_statuses(decision: RouteDecision) -> set[str]:
 def ensure_artifact_store(root: Path) -> None:
     for relative in (
         "blobs/sha256",
+        "index/artifacts",
         "manifests",
         "quarantine/unchecked",
         "quarantine/verified",
@@ -1705,24 +1707,96 @@ def ensure_artifact_store(root: Path) -> None:
         (root / relative).mkdir(parents=True, exist_ok=True)
 
 
-def artifact_manifest_path(root: Path, artifact_id: str) -> Path:
+def validate_artifact_id(artifact_id: str) -> None:
     if not ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
         raise GatewayError(404, "unknown_artifact", "unknown artifact")
+
+
+def validate_artifact_partition(partition: str) -> None:
+    if not ARTIFACT_PARTITION_PATTERN.fullmatch(partition):
+        raise GatewayError(500, "artifact_store_error", "invalid artifact partition")
+
+
+def artifact_partition_from_timestamp(timestamp: Any) -> str:
+    text = str(timestamp or "")
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = dt.datetime.now(dt.timezone.utc)
+    return f"{parsed.year:04d}/{parsed.month:02d}/{parsed.day:02d}"
+
+
+def artifact_storage_partition(manifest: dict[str, Any]) -> str:
+    partition = str(manifest.get("storage_partition") or "")
+    if partition:
+        validate_artifact_partition(partition)
+        return partition
+    partition = artifact_partition_from_timestamp(manifest.get("created_at"))
+    manifest["storage_partition"] = partition
+    return partition
+
+
+def artifact_lookup_path(root: Path, artifact_id: str) -> Path:
+    validate_artifact_id(artifact_id)
+    return root / "index" / "artifacts" / f"{artifact_id}.json"
+
+
+def artifact_flat_manifest_path(root: Path, artifact_id: str) -> Path:
+    validate_artifact_id(artifact_id)
     return root / "manifests" / f"{artifact_id}.json"
 
 
-def artifact_index_path(root: Path, status: str, artifact_id: str) -> Path:
+def artifact_manifest_path(root: Path, artifact_id: str, partition: str | None = None) -> Path:
+    validate_artifact_id(artifact_id)
+    if partition is None:
+        return artifact_flat_manifest_path(root, artifact_id)
+    validate_artifact_partition(partition)
+    return root / "manifests" / partition / f"{artifact_id}.json"
+
+
+def artifact_manifest_write_path(root: Path, manifest: dict[str, Any]) -> Path:
+    return artifact_manifest_path(root, str(manifest["artifact_id"]), artifact_storage_partition(manifest))
+
+
+def safe_relative_artifact_path(root: Path, relative_path: Any) -> Path | None:
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    return root / candidate
+
+
+def artifact_index_path(root: Path, status: str, artifact_id: str, partition: str | None = None) -> Path:
     if status not in ARTIFACT_STATUSES:
         raise GatewayError(500, "artifact_store_error", "invalid artifact status")
-    if not ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
-        raise GatewayError(404, "unknown_artifact", "unknown artifact")
-    return root / "quarantine" / status / f"{artifact_id}.json"
+    validate_artifact_id(artifact_id)
+    if partition is None:
+        return root / "quarantine" / status / f"{artifact_id}.json"
+    validate_artifact_partition(partition)
+    return root / "quarantine" / status / partition / f"{artifact_id}.json"
 
 
 def artifact_blob_path(root: Path, content_sha256: str) -> Path:
     if not ARTIFACT_SHA256_PATTERN.fullmatch(content_sha256):
         raise GatewayError(500, "artifact_store_error", "invalid artifact content hash")
+    return root / "blobs" / "sha256" / content_sha256[:2] / content_sha256
+
+
+def artifact_legacy_blob_path(root: Path, content_sha256: str) -> Path:
+    if not ARTIFACT_SHA256_PATTERN.fullmatch(content_sha256):
+        raise GatewayError(500, "artifact_store_error", "invalid artifact content hash")
     return root / "blobs" / "sha256" / content_sha256
+
+
+def artifact_blob_read_path(root: Path, content_sha256: str) -> Path:
+    path = artifact_blob_path(root, content_sha256)
+    if path.exists():
+        return path
+    legacy = artifact_legacy_blob_path(root, content_sha256)
+    if legacy.exists():
+        return legacy
+    return path
 
 
 def write_json_atomic(path: Path, body: dict[str, Any]) -> None:
@@ -1757,16 +1831,43 @@ def write_blob_once(path: Path, content: bytes) -> None:
 
 
 def write_artifact_manifest(root: Path, manifest: dict[str, Any]) -> None:
-    write_json_atomic(artifact_manifest_path(root, str(manifest["artifact_id"])), manifest)
+    path = artifact_manifest_write_path(root, manifest)
+    write_json_atomic(path, manifest)
+    write_artifact_lookup(root, manifest, path)
+
+
+def write_artifact_lookup(root: Path, manifest: dict[str, Any], manifest_path: Path) -> None:
+    artifact_id = str(manifest["artifact_id"])
+    partition = artifact_storage_partition(manifest)
+    lookup = {
+        "artifact_id": artifact_id,
+        "storage_partition": partition,
+        "manifest_path": str(manifest_path.relative_to(root)),
+        "status": manifest["status"],
+        "content_sha256": manifest["content_sha256"],
+        "size_bytes": manifest["size_bytes"],
+        "updated_at": manifest["updated_at"],
+        "producer_agent_id": manifest["producer_agent_id"],
+        "route_id": manifest["route_id"],
+        "run_id": manifest.get("run_id"),
+        "task_id": manifest.get("task_id"),
+        "taint": manifest.get("taint", []),
+    }
+    write_json_atomic(artifact_lookup_path(root, artifact_id), lookup)
 
 
 def write_artifact_index(root: Path, manifest: dict[str, Any]) -> None:
     artifact_id = str(manifest["artifact_id"])
+    partition = artifact_storage_partition(manifest)
     for status in ARTIFACT_STATUSES:
-        try:
-            artifact_index_path(root, status, artifact_id).unlink()
-        except FileNotFoundError:
-            pass
+        for path in (
+            artifact_index_path(root, status, artifact_id),
+            artifact_index_path(root, status, artifact_id, partition),
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
     index = {
         "artifact_id": artifact_id,
         "status": manifest["status"],
@@ -1779,18 +1880,43 @@ def write_artifact_index(root: Path, manifest: dict[str, Any]) -> None:
         "run_id": manifest.get("run_id"),
         "task_id": manifest.get("task_id"),
         "taint": manifest.get("taint", []),
+        "storage_partition": partition,
     }
-    write_json_atomic(artifact_index_path(root, str(manifest["status"]), artifact_id), index)
+    write_json_atomic(artifact_index_path(root, str(manifest["status"]), artifact_id, partition), index)
 
 
 def load_artifact_manifest(root: Path, artifact_id: str) -> dict[str, Any]:
-    path = artifact_manifest_path(root, artifact_id)
-    if not path.exists():
+    validate_artifact_id(artifact_id)
+    path: Path | None = None
+    lookup = artifact_lookup_path(root, artifact_id)
+    if lookup.exists():
+        with lookup.open("r", encoding="utf-8") as fh:
+            lookup_body = json.load(fh)
+        if isinstance(lookup_body, dict):
+            path = safe_relative_artifact_path(root, lookup_body.get("manifest_path"))
+            if path is not None and not path.exists():
+                path = None
+    if path is None:
+        flat = artifact_flat_manifest_path(root, artifact_id)
+        if flat.exists():
+            path = flat
+    if path is None:
+        matches = sorted((root / "manifests").glob(f"*/*/*/{artifact_id}.json"))
+        path = matches[0] if matches else None
+    if path is None or not path.exists():
         raise GatewayError(404, "unknown_artifact", "unknown artifact")
     with path.open("r", encoding="utf-8") as fh:
         manifest = json.load(fh)
     if not isinstance(manifest, dict):
         raise GatewayError(500, "artifact_store_error", "artifact manifest is invalid")
+    if "storage_partition" not in manifest and path.parent != (root / "manifests"):
+        try:
+            relative = path.relative_to(root / "manifests").parent
+            partition = str(relative)
+            validate_artifact_partition(partition)
+            manifest["storage_partition"] = partition
+        except (ValueError, GatewayError):
+            pass
     return manifest
 
 
@@ -1829,6 +1955,7 @@ def public_artifact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "run_id",
         "size_bytes",
         "status",
+        "storage_partition",
         "taint",
         "task_id",
     )
@@ -2282,7 +2409,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(access_payload, decision)
             enforce_artifact_access_policy(manifest, decision)
-            blob = artifact_blob_path(root, str(manifest.get("content_sha256", "")))
+            blob = artifact_blob_read_path(root, str(manifest.get("content_sha256", "")))
             if not blob.exists():
                 raise GatewayError(500, "artifact_store_error", "artifact blob is missing")
             content = blob.read_bytes()

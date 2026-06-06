@@ -931,7 +931,12 @@ class GatewayTests(unittest.TestCase):
             self.assertNotIn(str(Path(tmp)), json.dumps(body))
             artifact_id = artifact_ref["artifact_id"]
             root = Path(cfg["artifact_store"]["path"])
-            self.assertTrue((root / "quarantine" / "verified" / f"{artifact_id}.json").exists())
+            partition = body["manifest"]["storage_partition"]
+            self.assertRegex(partition, r"^\d{4}/\d{2}/\d{2}$")
+            self.assertTrue((root / "manifests" / partition / f"{artifact_id}.json").exists())
+            self.assertTrue((root / "index" / "artifacts" / f"{artifact_id}.json").exists())
+            self.assertTrue((root / "quarantine" / "verified" / partition / f"{artifact_id}.json").exists())
+            self.assertFalse((root / "quarantine" / "verified" / f"{artifact_id}.json").exists())
             self.assertFalse((root / "quarantine" / "unchecked" / f"{artifact_id}.json").exists())
 
             status, content, headers = self.request_raw(base, artifact_ref["content_path"])
@@ -974,7 +979,9 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(artifact_ref["status"], "needs_review")
             artifact_id = artifact_ref["artifact_id"]
             root = Path(cfg["artifact_store"]["path"])
-            self.assertTrue((root / "quarantine" / "needs_review" / f"{artifact_id}.json").exists())
+            partition = body["manifest"]["storage_partition"]
+            self.assertTrue((root / "quarantine" / "needs_review" / partition / f"{artifact_id}.json").exists())
+            self.assertFalse((root / "quarantine" / "needs_review" / f"{artifact_id}.json").exists())
 
             status, raw_body, _ = self.request_raw(base, artifact_ref["content_path"])
             self.assertEqual(status, 403)
@@ -1055,6 +1062,57 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(status, 403)
             denied = json.loads(raw_body.decode("utf-8"))
             self.assertEqual(denied["error"]["code"], "artifact_status_denied")
+
+    def test_artifact_legacy_flat_manifest_and_blob_are_still_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            root = Path(cfg["artifact_store"]["path"])
+            content = b"Legacy flat artifact content."
+            content_sha = gateway.hashlib.sha256(content).hexdigest()
+            artifact_id = "art_" + "a" * 32
+            manifest = {
+                "artifact_id": artifact_id,
+                "artifact_type": "report",
+                "content_sha256": content_sha,
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:00+00:00",
+                "detected_media_type": "text/plain",
+                "filename": "legacy.txt",
+                "inspection": {"text_scanned": True, "magic": "text", "scan": {}},
+                "media_type": "text/plain",
+                "policy_scope": {
+                    "route_id": "security.artifacts.submit",
+                    "capability": "submit_artifact",
+                    "taint": ["untrusted_web"],
+                    "run_id": "legacy-run",
+                    "task_id": "legacy-task",
+                },
+                "producer_agent_id": "pi_research_1",
+                "producer_trust_tier": "web_dmz",
+                "reason": "artifact_scan_passed",
+                "route_id": "security.artifacts.submit",
+                "run_id": "legacy-run",
+                "size_bytes": len(content),
+                "status": "verified",
+                "taint": ["untrusted_web"],
+                "task_id": "legacy-task",
+            }
+            (root / "manifests").mkdir(parents=True)
+            (root / "blobs" / "sha256").mkdir(parents=True)
+            (root / "manifests" / f"{artifact_id}.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (root / "blobs" / "sha256" / content_sha).write_bytes(content)
+
+            status, body, _ = self.request_raw(base, f"/v1/artifacts/{artifact_id}/metadata")
+            self.assertEqual(status, 200)
+            metadata = json.loads(body.decode("utf-8"))
+            self.assertEqual(metadata["manifest"]["status"], "verified")
+            self.assertNotIn("storage_partition", metadata["manifest"])
+
+            status, downloaded, headers = self.request_raw(base, f"/v1/artifacts/{artifact_id}/content")
+            self.assertEqual(status, 200)
+            self.assertEqual(downloaded, content)
+            self.assertEqual(headers["X-ASG-Artifact-Status"], "verified")
 
     def test_require_structured_task_enforced(self):
         with tempfile.TemporaryDirectory() as tmp:

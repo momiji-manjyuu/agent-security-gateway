@@ -261,6 +261,25 @@ content-addressed bytes, writes a manifest, and moves the artifact index from
 
 The response never includes the local store path.
 
+New artifact manifests and status indexes are partitioned by UTC date so large
+stores do not place every record in one directory:
+
+```text
+artifacts/
+  blobs/sha256/ab/<content_sha256>
+  index/artifacts/<artifact_id>.json
+  manifests/YYYY/MM/DD/<artifact_id>.json
+  quarantine/<status>/YYYY/MM/DD/<artifact_id>.json
+```
+
+The submitted `filename` is metadata only. It is sanitized and used for the
+download `Content-Disposition` header, but never as the storage path, so same
+name uploads do not overwrite each other. Identical bytes share one SHA-256
+blob; each upload still gets a separate manifest and `artifact_id`. The gateway
+continues to read the earlier flat `manifests/<artifact_id>.json` and
+`blobs/sha256/<content_sha256>` layout as a migration fallback, but new writes
+use the date-partitioned layout.
+
 ```bash
 curl -s http://127.0.0.1:8788/v1/artifacts \
   -H "Authorization: Bearer $PI_AGENT_TOKEN" \
