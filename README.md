@@ -126,7 +126,7 @@ Returns app name, version, and route count.
 
 ### `GET /readyz`
 
-Readiness check. It verifies config is loaded, at least one route exists, audit and approval parent directories are writable, and the kill switch is inactive. It returns `503` when the gateway should not receive traffic.
+Readiness check. It verifies config is loaded, at least one route exists, audit, approval, and artifact store parent directories are writable, and the kill switch is inactive. It returns `503` when the gateway should not receive traffic.
 
 ### `POST /inspect`
 
@@ -246,6 +246,65 @@ Example Mac notification route:
     "notify_on_block": true
   }
 }
+```
+
+### `POST /v1/artifacts`
+
+Stores an artifact in the ASG quarantine store and returns an `artifact_ref`.
+Agents submit `content_text` or `content_base64`; the gateway stores immutable
+content-addressed bytes, writes a manifest, and moves the artifact index from
+`unchecked` to one of:
+
+- `verified`: ASG scanned the text payload and found no blocking or review findings.
+- `needs_review`: ASG could not inspect the content enough, such as images, PDFs, archives, or undecodable text.
+- `blocked`: ASG found a scanner-blocking artifact payload.
+
+The response never includes the local store path.
+
+```bash
+curl -s http://127.0.0.1:8788/v1/artifacts \
+  -H "Authorization: Bearer $PI_AGENT_TOKEN" \
+  -H "X-Agent-Capability: submit_artifact" \
+  -H "X-ASG-Route: security.artifacts.submit" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "route_id": "security.artifacts.submit",
+    "capability": "submit_artifact",
+    "run_id": "example-run",
+    "task_id": "task-001",
+    "taint": ["untrusted_web"],
+    "message_type": "artifact",
+    "artifact_type": "report",
+    "filename": "source-summary.txt",
+    "media_type": "text/plain",
+    "content_text": "Reviewed public-source summary."
+  }'
+```
+
+### `GET /v1/artifacts/{artifact_id}/metadata`
+
+Returns the public manifest for an artifact after the caller passes the route,
+capability, run-scope, taint, and artifact-status policy checks.
+
+```bash
+curl -s http://127.0.0.1:8788/v1/artifacts/art_00000000000000000000000000000000/metadata \
+  -H "Authorization: Bearer $ASG_AGENT_TOKEN" \
+  -H "X-Agent-Capability: download_artifact" \
+  -H "X-ASG-Route: security.artifacts.download"
+```
+
+### `GET /v1/artifacts/{artifact_id}/content`
+
+Streams the artifact bytes from ASG after the same policy checks. Agents should
+pass `artifact_ref.content_path`, not a filesystem path or storage URL. A normal
+download route should allow only `verified`; a human/operator review route can
+allow `needs_review`.
+
+```bash
+curl -s -o source-summary.txt http://127.0.0.1:8788/v1/artifacts/art_00000000000000000000000000000000/content \
+  -H "Authorization: Bearer $ASG_AGENT_TOKEN" \
+  -H "X-Agent-Capability: download_artifact" \
+  -H "X-ASG-Route: security.artifacts.download"
 ```
 
 ### `POST /v1/approvals`
@@ -408,7 +467,7 @@ Backend responses are scanned before the caller receives them. Secret-like mater
 
 ## Audit Log
 
-Audit logs are append-only JSONL with a hash chain. Events record request ID, agent ID, route ID, capability, run ID, task ID, taint, scan summary, action guard summary, output guard summary, and backend status. Raw request/response content and raw tokens are not logged by default.
+Audit logs are append-only JSONL with a hash chain. Events record request ID, agent ID, route ID, capability, run ID, task ID, taint, scan summary, action guard summary, output guard summary, backend status, artifact ID, artifact status, and content hash when applicable. Raw request/response content, artifact bytes, local store paths, and raw tokens are not logged by default.
 
 Verify an audit log:
 

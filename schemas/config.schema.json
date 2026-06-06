@@ -34,6 +34,19 @@
     "require_known_run_id": {
       "type": "boolean"
     },
+    "artifact_store": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "max_artifact_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
     "agents": {
       "type": "object",
       "additionalProperties": {
@@ -130,6 +143,27 @@
         },
         "action_policy": {
           "type": "object"
+        },
+        "artifact_policy": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "allowed_statuses": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "unchecked",
+                  "verified",
+                  "needs_review",
+                  "blocked"
+                ]
+              }
+            },
+            "max_artifact_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
         },
         "report_policy": {
           "type": "object",

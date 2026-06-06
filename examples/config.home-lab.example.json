@@ -2,28 +2,32 @@
   "bind": "127.0.0.1",
   "port": 8788,
   "audit_log": "~/.agent-security-gateway/audit.jsonl",
+  "artifact_store": {
+    "path": "~/.agent-security-gateway/artifacts",
+    "max_artifact_bytes": 10485760
+  },
   "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
   "agents": {
     "mac_gpt55": {
       "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "trust_tier": "privileged_core",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.10.10/32"],
-      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge"],
-      "allowed_routes": ["security.inspect_only", "pi.web_research.chat", "ubuntu1.knowledge.search_trusted"]
+      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "download_artifact"],
+      "allowed_routes": ["security.inspect_only", "pi.web_research.chat", "ubuntu1.knowledge.search_trusted", "security.artifacts.download"]
     },
     "pi_research_1": {
       "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "trust_tier": "web_dmz",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.30.11/32"],
-      "allowed_capabilities": ["inspect", "submit_source_card", "notify_audited_result"],
-      "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card", "mac.result_receipt.notify"]
+      "allowed_capabilities": ["inspect", "submit_source_card", "submit_artifact", "notify_audited_result"],
+      "allowed_routes": ["security.inspect_only", "ubuntu1.knowledge.submit_source_card", "security.artifacts.submit", "mac.result_receipt.notify"]
     },
     "human_operator": {
       "token_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "trust_tier": "human_control",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.10.10/32"],
-      "allowed_capabilities": ["inspect", "approve_action"],
-      "allowed_routes": ["security.inspect_only", "security.approvals.create"]
+      "allowed_capabilities": ["inspect", "approve_action", "review_quarantined_artifact"],
+      "allowed_routes": ["security.inspect_only", "security.approvals.create", "security.artifacts.review"]
     }
   },
   "routes": {
@@ -45,6 +49,46 @@
       "input_policy": {
         "accepted_taint": ["human_approved"],
         "allow_missing_taint": true
+      }
+    },
+    "security.artifacts.submit": {
+      "kind": "inspect_only",
+      "aliases": ["asg/artifacts-submit"],
+      "allowed_callers": ["pi_research_1"],
+      "required_capability": "submit_artifact",
+      "input_policy": {
+        "accepted_taint": ["untrusted_web", "untrusted_pdf", "untrusted_github", "sandbox_output", "model_output"],
+        "allow_missing_taint": false,
+        "require_message_type": "artifact"
+      },
+      "artifact_policy": {
+        "max_artifact_bytes": 10485760
+      }
+    },
+    "security.artifacts.download": {
+      "kind": "inspect_only",
+      "aliases": ["asg/artifacts-download"],
+      "allowed_callers": ["mac_gpt55"],
+      "required_capability": "download_artifact",
+      "input_policy": {
+        "accepted_taint": ["untrusted_web", "untrusted_pdf", "untrusted_github", "sandbox_output", "model_output", "promoted_knowledge"],
+        "allow_missing_taint": false
+      },
+      "artifact_policy": {
+        "allowed_statuses": ["verified"]
+      }
+    },
+    "security.artifacts.review": {
+      "kind": "inspect_only",
+      "aliases": ["asg/artifacts-review"],
+      "allowed_callers": ["human_operator"],
+      "required_capability": "review_quarantined_artifact",
+      "input_policy": {
+        "accepted_taint": ["untrusted_web", "untrusted_pdf", "untrusted_github", "sandbox_output", "model_output"],
+        "allow_missing_taint": false
+      },
+      "artifact_policy": {
+        "allowed_statuses": ["needs_review"]
       }
     },
     "pi.web_research.chat": {

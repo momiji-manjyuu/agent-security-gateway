@@ -11,6 +11,7 @@
 - Enforced route input policy fields including `max_messages`, `require_message_type`, `require_structured_task`, `allow_raw_external_content`, `disallow_external_urls`, and `max_batch_size`.
 - Added `/readyz` and canonical backend HMAC signing over method, path, body hash, ASG identity headers, and timestamp.
 - Added `/v1/results` audit receipt forwarding for Mac/controller notification routes so worker reports can trigger follow-up checks without forwarding raw report content.
+- Added ASG-managed artifact quarantine storage with `/v1/artifacts`, `/v1/artifacts/{id}/metadata`, and `/v1/artifacts/{id}/content`; artifacts move from `unchecked` to `verified`, `needs_review`, or `blocked`, and content retrieval is forced through route/capability/taint policy.
 - Added OpenAI chat backend support for result audit receipt forwarding so Mac Hermes can receive audited worker completion notifications on port `8642`.
 - Added route-local trusted control policy for known internal ASG instruction URLs and defensive secret-handling text without weakening default scanner/action/output guards.
 - Documented and tested route-local trusted control exceptions for destructive worker maintenance instructions while keeping caller-controlled backend selection blocked.
