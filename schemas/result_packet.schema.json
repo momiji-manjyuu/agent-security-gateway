@@ -11,6 +11,10 @@
     "task_id": {"type": "string"},
     "taint": {"type": "array", "items": {"type": "string"}},
     "message_type": {"type": "string"},
-    "result": {"type": "object"}
+    "result": {"type": "object"},
+    "artifact_refs": {
+      "type": "array",
+      "items": {"$ref": "artifact_manifest.schema.json#/$defs/artifact_ref"}
+    }
   }
 }

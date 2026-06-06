@@ -9,6 +9,8 @@ policy, scans input and output, and records append-only hash-chained audit logs.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 import dataclasses
 import datetime as dt
@@ -43,6 +45,7 @@ DEFAULT_CONFIG_PATH = RUNTIME_DIR / "config.json"
 DEFAULT_AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
 DEFAULT_KILL_SWITCH = RUNTIME_DIR / "KILL_SWITCH"
 DEFAULT_APPROVAL_STORE = RUNTIME_DIR / "approvals.jsonl"
+DEFAULT_ARTIFACT_STORE = RUNTIME_DIR / "artifacts"
 MAX_TIMEOUT_SECONDS = 600
 ROUTE_KINDS = {"inspect_only", "openai_chat_completions", "http_json", "command"}
 PUBLIC_ROUTE_FIELDS = ("description", "kind", "required_capability", "allowed_capabilities", "aliases")
@@ -104,6 +107,37 @@ BATCH_LIST_KEYS = {
     "jobs",
     "requests",
 }
+ARTIFACT_STATUSES = {"unchecked", "verified", "needs_review", "blocked"}
+ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-f0-9]{32}$")
+ARTIFACT_SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+ARTIFACT_TEXT_MEDIA_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/x-ndjson",
+    "application/xml",
+    "application/yaml",
+    "application/x-yaml",
+    "text/csv",
+    "text/html",
+    "text/markdown",
+    "text/plain",
+    "text/xml",
+}
+ARTIFACT_BINARY_MAGIC: list[tuple[bytes, str, str]] = [
+    (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (b"\xff\xd8\xff", "image/jpeg", "jpeg"),
+    (b"GIF87a", "image/gif", "gif"),
+    (b"GIF89a", "image/gif", "gif"),
+    (b"%PDF-", "application/pdf", "pdf"),
+    (b"PK\x03\x04", "application/zip", "zip"),
+    (b"\x1f\x8b", "application/gzip", "gzip"),
+    (b"\x7fELF", "application/x-elf", "elf"),
+    (b"MZ", "application/x-msdownload", "pe"),
+    (b"\xfe\xed\xfa\xce", "application/x-mach-binary", "mach-o"),
+    (b"\xfe\xed\xfa\xcf", "application/x-mach-binary", "mach-o"),
+    (b"\xcf\xfa\xed\xfe", "application/x-mach-binary", "mach-o"),
+    (b"\xca\xfe\xba\xbe", "application/x-mach-binary", "mach-o"),
+]
 SHELL_LIKE_PATTERN = re.compile(
     r"\b(?:curl|wget|bash|zsh|sh|sudo|rm\s+-rf|python\s+-c|pip\s+install|npm\s+install|apt(?:-get)?\s+install|brew\s+install)\b",
     re.IGNORECASE,
@@ -149,6 +183,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "kill_switch_file": str(DEFAULT_KILL_SWITCH),
     "audit_log": str(DEFAULT_AUDIT_PATH),
     "approval_store": str(DEFAULT_APPROVAL_STORE),
+    "artifact_store": {
+        "path": str(DEFAULT_ARTIFACT_STORE),
+        "max_artifact_bytes": 10_485_760,
+    },
     "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
     "require_known_run_id": False,
     "agents": {},
@@ -173,6 +211,93 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "promoted_knowledge",
                 ],
                 "allow_missing_taint": True,
+            },
+            "output_policy": {
+                "block_secrets": True,
+                "block_private_urls": True,
+                "block_internal_paths": True,
+            },
+        },
+        "security.artifacts.submit": {
+            "kind": "inspect_only",
+            "description": "Store an artifact in ASG quarantine and return an artifact reference.",
+            "aliases": ["asg/artifacts-submit"],
+            "allowed_callers": ["*"],
+            "required_capability": "submit_artifact",
+            "input_policy": {
+                "accepted_taint": [
+                    "trusted_instruction",
+                    "untrusted_web",
+                    "untrusted_pdf",
+                    "untrusted_github",
+                    "sandbox_output",
+                    "model_output",
+                    "human_approved",
+                    "reviewed_untrusted_summary",
+                    "reviewed_prompt_matrix",
+                    "promoted_knowledge",
+                ],
+                "allow_missing_taint": False,
+                "require_message_type": "artifact",
+            },
+            "artifact_policy": {
+                "max_artifact_bytes": 10_485_760,
+            },
+            "output_policy": {
+                "block_secrets": True,
+                "block_private_urls": True,
+                "block_internal_paths": True,
+            },
+        },
+        "security.artifacts.download": {
+            "kind": "inspect_only",
+            "description": "Download verified artifact content through ASG policy checks.",
+            "aliases": ["asg/artifacts-download"],
+            "allowed_callers": ["*"],
+            "required_capability": "download_artifact",
+            "input_policy": {
+                "accepted_taint": [
+                    "trusted_instruction",
+                    "untrusted_web",
+                    "untrusted_pdf",
+                    "untrusted_github",
+                    "sandbox_output",
+                    "model_output",
+                    "human_approved",
+                    "reviewed_untrusted_summary",
+                    "reviewed_prompt_matrix",
+                    "promoted_knowledge",
+                ],
+                "allow_missing_taint": False,
+            },
+            "artifact_policy": {
+                "allowed_statuses": ["verified"],
+            },
+            "output_policy": {
+                "block_secrets": True,
+                "block_private_urls": True,
+                "block_internal_paths": True,
+            },
+        },
+        "security.artifacts.review": {
+            "kind": "inspect_only",
+            "description": "Allow human/operator review download of artifacts that require manual review.",
+            "aliases": ["asg/artifacts-review"],
+            "allowed_callers": ["human_operator"],
+            "required_capability": "review_quarantined_artifact",
+            "input_policy": {
+                "accepted_taint": [
+                    "untrusted_web",
+                    "untrusted_pdf",
+                    "untrusted_github",
+                    "sandbox_output",
+                    "model_output",
+                    "reviewed_untrusted_summary",
+                ],
+                "allow_missing_taint": False,
+            },
+            "artifact_policy": {
+                "allowed_statuses": ["needs_review"],
             },
             "output_policy": {
                 "block_secrets": True,
@@ -299,6 +424,17 @@ def validate_config(cfg: dict[str, Any]) -> None:
     max_body, max_body_ok = parse_int(cfg.get("max_body_bytes"), default=524_288)
     if not max_body_ok or max_body <= 0:
         errors.append("max_body_bytes must be a positive integer")
+    artifact_store = cfg.get("artifact_store", {})
+    if artifact_store is not None and not isinstance(artifact_store, dict):
+        errors.append("artifact_store must be an object")
+        artifact_store = {}
+    if isinstance(artifact_store, dict):
+        store_path = artifact_store.get("path", str(DEFAULT_ARTIFACT_STORE))
+        if not isinstance(store_path, str) or not store_path.strip():
+            errors.append("artifact_store.path must be a non-empty string")
+        max_artifact, max_artifact_ok = parse_int(artifact_store.get("max_artifact_bytes", 10_485_760), default=10_485_760)
+        if not max_artifact_ok or max_artifact <= 0:
+            errors.append("artifact_store.max_artifact_bytes must be a positive integer")
 
     agents = cfg.get("agents")
     routes = cfg.get("routes")
@@ -367,6 +503,23 @@ def validate_config(cfg: dict[str, Any]) -> None:
                     errors.append(f"routes.{route_id}.report_policy.{field} must be a boolean")
             if report_policy.get("forward_audit_receipt") and kind not in {"http_json", "openai_chat_completions"}:
                 errors.append(f"routes.{route_id}.report_policy.forward_audit_receipt requires kind 'http_json' or 'openai_chat_completions'")
+        artifact_policy = route.get("artifact_policy", {})
+        if artifact_policy is not None and not isinstance(artifact_policy, dict):
+            errors.append(f"routes.{route_id}.artifact_policy must be an object")
+            artifact_policy = {}
+        if isinstance(artifact_policy, dict):
+            if "allowed_statuses" in artifact_policy:
+                statuses = artifact_policy.get("allowed_statuses")
+                if not isinstance(statuses, list) or not statuses:
+                    errors.append(f"routes.{route_id}.artifact_policy.allowed_statuses must be a non-empty array")
+                else:
+                    for status in statuses:
+                        if status not in ARTIFACT_STATUSES:
+                            errors.append(f"routes.{route_id}.artifact_policy.allowed_statuses contains invalid status: {status}")
+            if "max_artifact_bytes" in artifact_policy:
+                route_max, route_max_ok = parse_int(artifact_policy.get("max_artifact_bytes"), default=0)
+                if not route_max_ok or route_max <= 0:
+                    errors.append(f"routes.{route_id}.artifact_policy.max_artifact_bytes must be a positive integer")
         backend = route.get("backend", {})
         if kind != "inspect_only":
             if not isinstance(backend, dict):
@@ -1503,6 +1656,406 @@ def result_audit_receipt(
     return receipt
 
 
+def artifact_store_options(cfg: dict[str, Any]) -> dict[str, Any]:
+    options = cfg.get("artifact_store", {})
+    if not isinstance(options, dict):
+        options = {}
+    return options
+
+
+def artifact_store_root(cfg: dict[str, Any]) -> Path:
+    return expand_path(str(artifact_store_options(cfg).get("path", DEFAULT_ARTIFACT_STORE)))
+
+
+def artifact_max_bytes(cfg: dict[str, Any], decision: RouteDecision | None = None) -> int:
+    configured = artifact_store_options(cfg).get("max_artifact_bytes", 10_485_760)
+    limit, ok = parse_int(configured, default=10_485_760)
+    if not ok or limit <= 0:
+        limit = 10_485_760
+    if decision is not None:
+        policy = route_artifact_policy(decision)
+        if "max_artifact_bytes" in policy:
+            route_limit, route_ok = parse_int(policy.get("max_artifact_bytes"), default=limit)
+            if route_ok and route_limit > 0:
+                limit = min(limit, route_limit)
+    return limit
+
+
+def route_artifact_policy(decision: RouteDecision) -> dict[str, Any]:
+    policy = decision.route.get("artifact_policy", {})
+    return policy if isinstance(policy, dict) else {}
+
+
+def artifact_allowed_statuses(decision: RouteDecision) -> set[str]:
+    configured = route_artifact_policy(decision).get("allowed_statuses")
+    if isinstance(configured, list) and configured:
+        return {str(status) for status in configured if str(status) in ARTIFACT_STATUSES}
+    return {"verified"}
+
+
+def ensure_artifact_store(root: Path) -> None:
+    for relative in (
+        "blobs/sha256",
+        "manifests",
+        "quarantine/unchecked",
+        "quarantine/verified",
+        "quarantine/needs_review",
+        "quarantine/blocked",
+    ):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def artifact_manifest_path(root: Path, artifact_id: str) -> Path:
+    if not ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
+        raise GatewayError(404, "unknown_artifact", "unknown artifact")
+    return root / "manifests" / f"{artifact_id}.json"
+
+
+def artifact_index_path(root: Path, status: str, artifact_id: str) -> Path:
+    if status not in ARTIFACT_STATUSES:
+        raise GatewayError(500, "artifact_store_error", "invalid artifact status")
+    if not ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
+        raise GatewayError(404, "unknown_artifact", "unknown artifact")
+    return root / "quarantine" / status / f"{artifact_id}.json"
+
+
+def artifact_blob_path(root: Path, content_sha256: str) -> Path:
+    if not ARTIFACT_SHA256_PATTERN.fullmatch(content_sha256):
+        raise GatewayError(500, "artifact_store_error", "invalid artifact content hash")
+    return root / "blobs" / "sha256" / content_sha256
+
+
+def write_json_atomic(path: Path, body: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+    with tmp.open("wb") as fh:
+        fh.write(encoded)
+        fh.write(b"\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except FileNotFoundError:
+        pass
+
+
+def write_blob_once(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("xb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except FileExistsError:
+        return
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except FileNotFoundError:
+        pass
+
+
+def write_artifact_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    write_json_atomic(artifact_manifest_path(root, str(manifest["artifact_id"])), manifest)
+
+
+def write_artifact_index(root: Path, manifest: dict[str, Any]) -> None:
+    artifact_id = str(manifest["artifact_id"])
+    for status in ARTIFACT_STATUSES:
+        try:
+            artifact_index_path(root, status, artifact_id).unlink()
+        except FileNotFoundError:
+            pass
+    index = {
+        "artifact_id": artifact_id,
+        "status": manifest["status"],
+        "content_sha256": manifest["content_sha256"],
+        "size_bytes": manifest["size_bytes"],
+        "media_type": manifest["media_type"],
+        "updated_at": manifest["updated_at"],
+        "producer_agent_id": manifest["producer_agent_id"],
+        "route_id": manifest["route_id"],
+        "run_id": manifest.get("run_id"),
+        "task_id": manifest.get("task_id"),
+        "taint": manifest.get("taint", []),
+    }
+    write_json_atomic(artifact_index_path(root, str(manifest["status"]), artifact_id), index)
+
+
+def load_artifact_manifest(root: Path, artifact_id: str) -> dict[str, Any]:
+    path = artifact_manifest_path(root, artifact_id)
+    if not path.exists():
+        raise GatewayError(404, "unknown_artifact", "unknown artifact")
+    with path.open("r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if not isinstance(manifest, dict):
+        raise GatewayError(500, "artifact_store_error", "artifact manifest is invalid")
+    return manifest
+
+
+def public_artifact_ref(manifest: dict[str, Any]) -> dict[str, Any]:
+    artifact_id = str(manifest.get("artifact_id", ""))
+    return {
+        "artifact_id": artifact_id,
+        "content_sha256": manifest.get("content_sha256"),
+        "status": manifest.get("status"),
+        "media_type": manifest.get("media_type"),
+        "size_bytes": manifest.get("size_bytes"),
+        "taint": manifest.get("taint", []),
+        "run_id": manifest.get("run_id"),
+        "task_id": manifest.get("task_id"),
+        "metadata_path": f"/v1/artifacts/{artifact_id}/metadata",
+        "content_path": f"/v1/artifacts/{artifact_id}/content",
+    }
+
+
+def public_artifact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    public_fields = (
+        "artifact_id",
+        "artifact_type",
+        "content_sha256",
+        "created_at",
+        "updated_at",
+        "detected_media_type",
+        "filename",
+        "inspection",
+        "media_type",
+        "policy_scope",
+        "producer_agent_id",
+        "producer_trust_tier",
+        "reason",
+        "route_id",
+        "run_id",
+        "size_bytes",
+        "status",
+        "taint",
+        "task_id",
+    )
+    body = {field: manifest.get(field) for field in public_fields if field in manifest}
+    body["artifact_ref"] = public_artifact_ref(manifest)
+    return body
+
+
+def safe_artifact_filename(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    name = value.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    name = "".join(ch if ch.isalnum() or ch in {".", "-", "_"} else "_" for ch in name)
+    name = name.strip("._")
+    return name[:120]
+
+
+def normalize_media_type(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "application/octet-stream"
+    return value.split(";", 1)[0].strip().lower() or "application/octet-stream"
+
+
+def detect_artifact_media_type(content: bytes) -> tuple[str, str]:
+    for prefix, media_type, magic_name in ARTIFACT_BINARY_MAGIC:
+        if content.startswith(prefix):
+            return media_type, magic_name
+    if looks_like_text(content):
+        return "text/plain", "text"
+    return "application/octet-stream", "unknown"
+
+
+def looks_like_text(content: bytes) -> bool:
+    if b"\x00" in content:
+        return False
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not text:
+        return True
+    controls = sum(1 for ch in text if ord(ch) < 32 and ch not in "\n\r\t")
+    return controls / max(len(text), 1) < 0.02
+
+
+def media_type_is_text(media_type: str) -> bool:
+    return media_type.startswith("text/") or media_type in ARTIFACT_TEXT_MEDIA_TYPES
+
+
+def artifact_media_type_matches(declared: str, detected: str) -> bool:
+    if declared == "application/octet-stream" or declared == detected:
+        return True
+    if media_type_is_text(declared) and detected == "text/plain":
+        return True
+    return False
+
+
+def add_scan_finding(scan: security.ScanResult, finding: security.Finding, cfg: dict[str, Any]) -> None:
+    scan.findings.append(finding)
+    scan.risk_score = sum(item.severity for item in scan.findings)
+    scan.blocked = scan.risk_score >= int(cfg.get("block_risk_score", 8))
+    scan.requires_review = scan.risk_score >= int(cfg.get("review_risk_score", 4))
+
+
+def decode_artifact_content(payload: dict[str, Any]) -> bytes:
+    has_text = isinstance(payload.get("content_text"), str)
+    has_base64 = isinstance(payload.get("content_base64"), str)
+    if has_text == has_base64:
+        raise GatewayError(400, "invalid_artifact", "provide exactly one of content_text or content_base64")
+    if has_text:
+        return str(payload["content_text"]).encode("utf-8")
+    try:
+        return base64.b64decode(str(payload["content_base64"]), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise GatewayError(400, "invalid_artifact", "content_base64 is invalid") from exc
+
+
+def artifact_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    clean: dict[str, Any] = {}
+    omitted = {"content_text", "content_base64"}
+    for key, value in payload.items():
+        if key in omitted:
+            continue
+        clean[key] = value
+    clean["content_omitted"] = True
+    return clean
+
+
+def inspect_artifact_content(content: bytes, media_type: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    detected_media_type, magic = detect_artifact_media_type(content)
+    scan = security.scan_text("", cfg)
+    text_scanned = False
+    reason = "binary_requires_review"
+    status = "needs_review"
+
+    if not content:
+        add_scan_finding(scan, security.Finding("artifact:empty", 4, "empty artifact requires review"), cfg)
+        reason = "empty_artifact"
+    elif media_type_is_text(media_type) or media_type_is_text(detected_media_type):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            add_scan_finding(scan, security.Finding("artifact:text_decode_failed", 4, "declared text artifact is not valid UTF-8"), cfg)
+            reason = "text_decode_failed"
+        else:
+            text_scanned = True
+            scan = security.scan_text(text, cfg)
+            if scan.blocked:
+                status = "blocked"
+                reason = "blocked_by_artifact_scan"
+            elif scan.requires_review:
+                status = "needs_review"
+                reason = "artifact_scan_requires_review"
+            else:
+                status = "verified"
+                reason = "artifact_scan_passed"
+    else:
+        add_scan_finding(scan, security.Finding("artifact:binary_requires_review", 4, "binary artifact requires manual review"), cfg)
+
+    if not artifact_media_type_matches(media_type, detected_media_type) and detected_media_type != "application/octet-stream":
+        add_scan_finding(scan, security.Finding("artifact:media_type_mismatch", 3, "declared media type does not match detected content"), cfg)
+        if status == "verified":
+            status = "needs_review"
+            reason = "media_type_mismatch"
+
+    if scan.blocked:
+        status = "blocked"
+        if reason == "artifact_scan_passed":
+            reason = "blocked_by_artifact_scan"
+    elif status == "verified" and scan.requires_review:
+        status = "needs_review"
+        reason = "artifact_scan_requires_review"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "detected_media_type": detected_media_type,
+        "magic": magic,
+        "text_scanned": text_scanned,
+        "scan": scan,
+    }
+
+
+def build_artifact_manifest(
+    *,
+    request_id: str,
+    verified: VerifiedAgent,
+    decision: RouteDecision,
+    payload: dict[str, Any],
+    content: bytes,
+    inspection: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    now = utc_now()
+    media_type = normalize_media_type(payload.get("media_type"))
+    scan = inspection["scan"]
+    artifact_id = "art_" + secrets.token_hex(16)
+    manifest = {
+        "artifact_id": artifact_id,
+        "artifact_type": safe_summary_token(payload.get("artifact_type"), max_chars=64) or "generic",
+        "request_id": request_id,
+        "route_id": decision.route_id,
+        "capability": decision.capability,
+        "run_id": decision.run_id,
+        "task_id": decision.task_id,
+        "taint": decision.taint,
+        "producer_agent_id": verified.agent_id,
+        "producer_trust_tier": verified.agent.get("trust_tier"),
+        "filename": safe_artifact_filename(payload.get("filename")),
+        "media_type": media_type,
+        "detected_media_type": inspection["detected_media_type"],
+        "size_bytes": len(content),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "status": "unchecked",
+        "reason": "stored_pending_scan",
+        "created_at": now,
+        "updated_at": now,
+        "policy_scope": {
+            "route_id": decision.route_id,
+            "capability": decision.capability,
+            "taint": decision.taint,
+            "run_id": decision.run_id,
+            "task_id": decision.task_id,
+        },
+        "inspection": {
+            "text_scanned": bool(inspection["text_scanned"]),
+            "magic": inspection["magic"],
+            "scan": security.public_scan_for_audit(scan, cfg),
+        },
+    }
+    return manifest
+
+
+def finalize_artifact_manifest(manifest: dict[str, Any], inspection: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    scan = inspection["scan"]
+    manifest["status"] = inspection["status"]
+    manifest["reason"] = inspection["reason"]
+    manifest["updated_at"] = utc_now()
+    manifest["inspection"] = {
+        "text_scanned": bool(inspection["text_scanned"]),
+        "magic": inspection["magic"],
+        "scan": security.public_scan_for_audit(scan, cfg),
+    }
+    return manifest
+
+
+def artifact_access_payload(headers: Any, manifest: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "route_id": header_value(headers, "X-ASG-Route"),
+        "capability": header_value(headers, "X-Agent-Capability"),
+        "run_id": header_value(headers, "X-ASG-Run-Id") or manifest.get("run_id"),
+        "task_id": header_value(headers, "X-ASG-Task-Id") or manifest.get("task_id"),
+        "taint": manifest.get("taint", []),
+    }
+    return payload
+
+
+def enforce_artifact_access_policy(manifest: dict[str, Any], decision: RouteDecision) -> None:
+    status = str(manifest.get("status", ""))
+    if status not in artifact_allowed_statuses(decision):
+        raise GatewayError(403, "artifact_status_denied", f"route '{decision.route_id}' cannot access artifact status '{status}'")
+    if decision.run_id and manifest.get("run_id") and decision.run_id != manifest.get("run_id"):
+        raise GatewayError(403, "artifact_scope_denied", "artifact run_id does not match request scope")
+    if decision.task_id and manifest.get("task_id") and decision.task_id != manifest.get("task_id"):
+        raise GatewayError(403, "artifact_scope_denied", "artifact task_id does not match request scope")
+
+
 def write_audit(cfg: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     return security.AuditLogger(expand_path(str(cfg["audit_log"]))).write(event)
 
@@ -1521,12 +2074,15 @@ def readiness_status(cfg: dict[str, Any]) -> dict[str, Any]:
         "routes_present": bool(cfg.get("routes")),
         "audit_parent_writable": False,
         "approval_parent_writable": False,
+        "artifact_store_parent_writable": False,
         "kill_switch_inactive": not expand_path(str(cfg.get("kill_switch_file", DEFAULT_KILL_SWITCH))).exists(),
     }
     audit_parent = expand_path(str(cfg.get("audit_log", DEFAULT_AUDIT_PATH))).parent
     approval_parent = approval_store_path(cfg).parent
+    artifact_parent = artifact_store_root(cfg).parent
     checks["audit_parent_writable"] = audit_parent.exists() and os.access(audit_parent, os.W_OK)
     checks["approval_parent_writable"] = approval_parent.exists() and os.access(approval_parent, os.W_OK)
+    checks["artifact_store_parent_writable"] = artifact_parent.exists() and os.access(artifact_parent, os.W_OK)
     return {
         "ok": all(bool(value) for value in checks.values()),
         "app": APP_NAME,
@@ -1539,7 +2095,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     server_version = "AgentSecurityGateway/" + VERSION
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/healthz":
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/healthz":
             cfg = self.server.config  # type: ignore[attr-defined]
             self.write_json(
                 200,
@@ -1551,27 +2108,215 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
             return
-        if self.path == "/readyz":
+        if parsed.path == "/readyz":
             cfg = self.server.config  # type: ignore[attr-defined]
             ready = readiness_status(cfg)
             self.write_json(200 if ready["ok"] else 503, ready)
             return
-        if self.path == "/routes":
+        if parsed.path == "/routes":
             self.handle_routes()
+            return
+        artifact_id, artifact_action = self.parse_artifact_get_path(parsed.path)
+        if artifact_id and artifact_action == "metadata":
+            self.handle_artifact_metadata(artifact_id)
+            return
+        if artifact_id and artifact_action == "content":
+            self.handle_artifact_content(artifact_id)
             return
         self.write_json(404, json_error("not_found", "not found", "req_" + uuid.uuid4().hex))
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/inspect":
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/inspect":
             self.handle_inspect()
             return
-        if self.path in {"/v1/chat/completions", "/v1/tasks", "/v1/results"}:
+        if parsed.path in {"/v1/chat/completions", "/v1/tasks", "/v1/results"}:
             self.handle_routed_request()
             return
-        if self.path == "/v1/approvals":
+        if parsed.path == "/v1/artifacts":
+            self.handle_artifact_submit()
+            return
+        if parsed.path == "/v1/approvals":
             self.handle_approval()
             return
         self.write_json(404, json_error("not_found", "not found", "req_" + uuid.uuid4().hex))
+
+    def parse_artifact_get_path(self, path: str) -> tuple[str, str]:
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "v1" and parts[1] == "artifacts" and parts[3] in {"metadata", "content"}:
+            artifact_id = parts[2]
+            if ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
+                return artifact_id, parts[3]
+            return "", ""
+        return "", ""
+
+    def handle_artifact_submit(self) -> None:
+        cfg = self.server.config  # type: ignore[attr-defined]
+        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        client_ip = self.client_address[0]
+        verified: VerifiedAgent | None = None
+        decision: RouteDecision | None = None
+        try:
+            self.check_kill_switch(cfg, request_id, client_ip)
+            payload = self.read_json_body(cfg)
+            verified = verify_agent(self.headers, cfg, client_ip)
+            decision = resolve_route_decision(self.headers, payload, cfg)
+            self.check_rate_limit(cfg, verified, decision, client_ip)
+            enforce_route_policy(verified, decision, cfg)
+            enforce_input_policy(payload, decision)
+
+            metadata_payload = artifact_policy_payload(payload)
+            metadata_inbound = scan_inbound_for_route(metadata_payload, cfg, decision)
+            metadata_action = apply_route_action_guard_policy(action_guard(self.headers, metadata_payload), decision, metadata_payload)
+            if metadata_inbound.scan.blocked:
+                raise GatewayError(403, "blocked_by_input_guard", "artifact metadata was blocked by input guard")
+            if metadata_inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get("block_on_review", cfg.get("review_policy", {}).get("block_forward", False))):
+                raise GatewayError(403, "manual_review_required", "artifact metadata requires manual review")
+            enforce_action_guard(cfg, decision, verified, metadata_action)
+
+            content = decode_artifact_content(payload)
+            limit = artifact_max_bytes(cfg, decision)
+            if len(content) > limit:
+                raise GatewayError(413, "request_too_large", "artifact content is too large")
+            media_type = normalize_media_type(payload.get("media_type"))
+            inspection = inspect_artifact_content(content, media_type, cfg)
+
+            root = artifact_store_root(cfg)
+            ensure_artifact_store(root)
+            manifest = build_artifact_manifest(
+                request_id=request_id,
+                verified=verified,
+                decision=decision,
+                payload=payload,
+                content=content,
+                inspection=inspection,
+                cfg=cfg,
+            )
+            blob = artifact_blob_path(root, str(manifest["content_sha256"]))
+            write_blob_once(blob, content)
+            write_artifact_manifest(root, manifest)
+            write_artifact_index(root, manifest)
+            manifest = finalize_artifact_manifest(manifest, inspection, cfg)
+            write_artifact_manifest(root, manifest)
+            write_artifact_index(root, manifest)
+
+            write_audit(
+                cfg,
+                {
+                    "event": "artifact",
+                    "decision": "stored",
+                    **audit_base(request_id, verified, client_ip, decision),
+                    "artifact_id": manifest["artifact_id"],
+                    "artifact_status": manifest["status"],
+                    "artifact_reason": manifest["reason"],
+                    "content_sha256": manifest["content_sha256"],
+                    "size_bytes": manifest["size_bytes"],
+                    "media_type": manifest["media_type"],
+                    "detected_media_type": manifest["detected_media_type"],
+                    "metadata_scan": security.public_scan_for_audit(metadata_inbound.scan, cfg),
+                    "artifact_scan": manifest["inspection"]["scan"],
+                    "action_guard": metadata_action.public_dict(),
+                },
+            )
+            self.write_json(
+                200,
+                {
+                    "ok": manifest["status"] in {"verified", "needs_review"},
+                    "request_id": request_id,
+                    "artifact_ref": public_artifact_ref(manifest),
+                    "manifest": public_artifact_manifest(manifest),
+                },
+            )
+        except GatewayError as exc:
+            self.deny(cfg, exc, request_id, client_ip, verified, decision)
+        except Exception as exc:  # noqa: BLE001
+            self.internal_error(cfg, exc, request_id, client_ip)
+
+    def handle_artifact_metadata(self, artifact_id: str) -> None:
+        cfg = self.server.config  # type: ignore[attr-defined]
+        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        client_ip = self.client_address[0]
+        verified: VerifiedAgent | None = None
+        decision: RouteDecision | None = None
+        try:
+            self.check_kill_switch(cfg, request_id, client_ip)
+            root = artifact_store_root(cfg)
+            manifest = load_artifact_manifest(root, artifact_id)
+            verified = verify_agent(self.headers, cfg, client_ip)
+            decision = resolve_route_decision(self.headers, artifact_access_payload(self.headers, manifest), cfg)
+            self.check_rate_limit(cfg, verified, decision, client_ip)
+            enforce_route_policy(verified, decision, cfg)
+            enforce_input_policy(artifact_access_payload(self.headers, manifest), decision)
+            enforce_artifact_access_policy(manifest, decision)
+            write_audit(
+                cfg,
+                {
+                    "event": "artifact",
+                    "decision": "metadata",
+                    **audit_base(request_id, verified, client_ip, decision),
+                    "artifact_id": artifact_id,
+                    "artifact_status": manifest.get("status"),
+                    "content_sha256": manifest.get("content_sha256"),
+                },
+            )
+            self.write_json(200, {"ok": True, "request_id": request_id, "manifest": public_artifact_manifest(manifest)})
+        except GatewayError as exc:
+            self.deny(cfg, exc, request_id, client_ip, verified, decision, {"artifact_id": artifact_id})
+        except Exception as exc:  # noqa: BLE001
+            self.internal_error(cfg, exc, request_id, client_ip)
+
+    def handle_artifact_content(self, artifact_id: str) -> None:
+        cfg = self.server.config  # type: ignore[attr-defined]
+        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        client_ip = self.client_address[0]
+        verified: VerifiedAgent | None = None
+        decision: RouteDecision | None = None
+        try:
+            self.check_kill_switch(cfg, request_id, client_ip)
+            root = artifact_store_root(cfg)
+            manifest = load_artifact_manifest(root, artifact_id)
+            verified = verify_agent(self.headers, cfg, client_ip)
+            access_payload = artifact_access_payload(self.headers, manifest)
+            decision = resolve_route_decision(self.headers, access_payload, cfg)
+            self.check_rate_limit(cfg, verified, decision, client_ip)
+            enforce_route_policy(verified, decision, cfg)
+            enforce_input_policy(access_payload, decision)
+            enforce_artifact_access_policy(manifest, decision)
+            blob = artifact_blob_path(root, str(manifest.get("content_sha256", "")))
+            if not blob.exists():
+                raise GatewayError(500, "artifact_store_error", "artifact blob is missing")
+            content = blob.read_bytes()
+            if hashlib.sha256(content).hexdigest() != manifest.get("content_sha256"):
+                raise GatewayError(500, "artifact_integrity_error", "artifact content hash does not match manifest")
+            write_audit(
+                cfg,
+                {
+                    "event": "artifact",
+                    "decision": "download",
+                    **audit_base(request_id, verified, client_ip, decision),
+                    "artifact_id": artifact_id,
+                    "artifact_status": manifest.get("status"),
+                    "content_sha256": manifest.get("content_sha256"),
+                    "size_bytes": manifest.get("size_bytes"),
+                    "media_type": manifest.get("media_type"),
+                },
+            )
+            filename = safe_artifact_filename(manifest.get("filename")) or artifact_id
+            self.write_bytes(
+                200,
+                content,
+                str(manifest.get("media_type") or "application/octet-stream"),
+                {
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-ASG-Artifact-Id": artifact_id,
+                    "X-ASG-Artifact-SHA256": str(manifest.get("content_sha256")),
+                    "X-ASG-Artifact-Status": str(manifest.get("status")),
+                },
+            )
+        except GatewayError as exc:
+            self.deny(cfg, exc, request_id, client_ip, verified, decision, {"artifact_id": artifact_id})
+        except Exception as exc:  # noqa: BLE001
+            self.internal_error(cfg, exc, request_id, client_ip)
 
     def handle_routes(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
@@ -2041,6 +2786,17 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(encoded)
+
+    def write_bytes(self, status: int, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (utc_now(), fmt % args))

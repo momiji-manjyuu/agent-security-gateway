@@ -1,5 +1,9 @@
 {
   "audit_log": "~/.agent-security-gateway/audit.jsonl",
+  "artifact_store": {
+    "path": "~/.agent-security-gateway/artifacts",
+    "max_artifact_bytes": 10485760
+  },
   "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
   "bind": "127.0.0.1",
   "block_risk_score": 8,
@@ -21,6 +25,7 @@
         "request_sandbox_verification",
         "search_trusted_knowledge",
         "submit_task",
+        "download_artifact",
         "generate_image",
         "request_gpu_benchmark",
         "inspect"
@@ -30,6 +35,7 @@
         "pi.web_research.chat",
         "ubuntu2.sandbox.verify",
         "ubuntu1.knowledge.search_trusted",
+        "security.artifacts.download",
         "windows_image.comfyui.generate",
         "rtx3090.local_llm.benchmark"
       ]
@@ -43,11 +49,13 @@
       ],
       "allowed_capabilities": [
         "submit_source_card",
+        "submit_artifact",
         "notify_audited_result",
         "inspect"
       ],
       "allowed_routes": [
         "security.inspect_only",
+        "security.artifacts.submit",
         "ubuntu1.knowledge.submit_source_card",
         "mac.result_receipt.notify"
       ]
@@ -62,11 +70,13 @@
       "allowed_capabilities": [
         "submit_verification_result",
         "submit_benchmark_result",
+        "submit_artifact",
         "notify_audited_result",
         "inspect"
       ],
       "allowed_routes": [
         "security.inspect_only",
+        "security.artifacts.submit",
         "ubuntu1.knowledge.submit_verification_result",
         "mac.result_receipt.notify"
       ]
@@ -80,11 +90,13 @@
       ],
       "allowed_capabilities": [
         "inspect",
-        "approve_action"
+        "approve_action",
+        "review_quarantined_artifact"
       ],
       "allowed_routes": [
         "security.inspect_only",
-        "security.approvals.create"
+        "security.approvals.create",
+        "security.artifacts.review"
       ]
     }
   },
@@ -130,6 +142,101 @@
           "human_approved"
         ],
         "allow_missing_taint": true
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "security.artifacts.submit": {
+      "kind": "inspect_only",
+      "description": "Store an artifact in ASG quarantine and return an artifact reference.",
+      "aliases": [
+        "asg/artifacts-submit"
+      ],
+      "allowed_callers": [
+        "pi_research_1",
+        "ubuntu_verify_2"
+      ],
+      "required_capability": "submit_artifact",
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "untrusted_pdf",
+          "untrusted_github",
+          "sandbox_output",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "require_message_type": "artifact"
+      },
+      "artifact_policy": {
+        "max_artifact_bytes": 10485760
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "security.artifacts.download": {
+      "kind": "inspect_only",
+      "description": "Download verified artifact content through ASG policy checks.",
+      "aliases": [
+        "asg/artifacts-download"
+      ],
+      "allowed_callers": [
+        "mac_gpt55"
+      ],
+      "required_capability": "download_artifact",
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "untrusted_pdf",
+          "untrusted_github",
+          "sandbox_output",
+          "model_output",
+          "reviewed_untrusted_summary",
+          "promoted_knowledge"
+        ],
+        "allow_missing_taint": false
+      },
+      "artifact_policy": {
+        "allowed_statuses": [
+          "verified"
+        ]
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "security.artifacts.review": {
+      "kind": "inspect_only",
+      "description": "Allow human/operator review download of artifacts that require manual review.",
+      "aliases": [
+        "asg/artifacts-review"
+      ],
+      "allowed_callers": [
+        "human_operator"
+      ],
+      "required_capability": "review_quarantined_artifact",
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "untrusted_pdf",
+          "untrusted_github",
+          "sandbox_output",
+          "model_output"
+        ],
+        "allow_missing_taint": false
+      },
+      "artifact_policy": {
+        "allowed_statuses": [
+          "needs_review"
+        ]
       },
       "output_policy": {
         "block_secrets": true,

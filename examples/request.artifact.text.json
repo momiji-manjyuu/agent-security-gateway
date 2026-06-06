@@ -1,0 +1,12 @@
+{
+  "route_id": "security.artifacts.submit",
+  "capability": "submit_artifact",
+  "run_id": "example-run",
+  "task_id": "task-001",
+  "taint": ["untrusted_web"],
+  "message_type": "artifact",
+  "artifact_type": "report",
+  "filename": "source-summary.txt",
+  "media_type": "text/plain",
+  "content_text": "Reviewed public-source summary."
+}

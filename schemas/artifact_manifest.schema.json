@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/agent-security-gateway/artifact_manifest.schema.json",
+  "title": "Agent Security Gateway artifact manifest",
+  "type": "object",
+  "required": [
+    "artifact_id",
+    "content_sha256",
+    "status",
+    "media_type",
+    "size_bytes",
+    "taint"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "artifact_id": {"type": "string", "pattern": "^art_[a-f0-9]{32}$"},
+    "artifact_type": {"type": "string"},
+    "content_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "status": {"enum": ["unchecked", "verified", "needs_review", "blocked"]},
+    "reason": {"type": "string"},
+    "media_type": {"type": "string"},
+    "detected_media_type": {"type": "string"},
+    "filename": {"type": "string"},
+    "size_bytes": {"type": "integer", "minimum": 0},
+    "producer_agent_id": {"type": "string"},
+    "route_id": {"type": "string"},
+    "capability": {"type": "string"},
+    "run_id": {"type": ["string", "null"]},
+    "task_id": {"type": ["string", "null"]},
+    "taint": {"type": "array", "items": {"type": "string"}},
+    "policy_scope": {"type": "object"},
+    "inspection": {"type": "object"},
+    "artifact_ref": {"$ref": "#/$defs/artifact_ref"}
+  },
+  "$defs": {
+    "artifact_ref": {
+      "type": "object",
+      "required": ["artifact_id", "content_sha256", "status", "media_type", "size_bytes"],
+      "additionalProperties": true,
+      "properties": {
+        "artifact_id": {"type": "string", "pattern": "^art_[a-f0-9]{32}$"},
+        "content_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "status": {"enum": ["unchecked", "verified", "needs_review", "blocked"]},
+        "media_type": {"type": "string"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "taint": {"type": "array", "items": {"type": "string"}},
+        "run_id": {"type": ["string", "null"]},
+        "task_id": {"type": ["string", "null"]},
+        "metadata_path": {"type": "string"},
+        "content_path": {"type": "string"}
+      }
+    }
+  }
+}
