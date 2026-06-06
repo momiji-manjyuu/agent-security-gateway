@@ -4,7 +4,8 @@
   "audit_log": "~/.agent-security-gateway/audit.jsonl",
   "artifact_store": {
     "path": "~/.agent-security-gateway/artifacts",
-    "max_artifact_bytes": 10485760
+    "max_artifact_bytes": 10485760,
+    "retention_days": 90
   },
   "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
   "agents": {

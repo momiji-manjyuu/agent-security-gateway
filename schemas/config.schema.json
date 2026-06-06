@@ -44,6 +44,11 @@
         "max_artifact_bytes": {
           "type": "integer",
           "minimum": 1
+        },
+        "retention_days": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 90
         }
       }
     },
