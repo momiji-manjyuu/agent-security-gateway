@@ -280,6 +280,12 @@ continues to read the earlier flat `manifests/<artifact_id>.json` and
 `blobs/sha256/<content_sha256>` layout as a migration fallback, but new writes
 use the date-partitioned layout.
 
+Artifacts are retained for at most `artifact_store.retention_days`, defaulting
+to 90 days. Metadata and content access fail closed after that retention window,
+even before garbage collection has run. Run `gc-artifacts` to remove expired
+manifests, lookup records, and quarantine indexes. Content blobs are deleted
+only when no remaining manifest references the same SHA-256 bytes.
+
 ```bash
 curl -s http://127.0.0.1:8788/v1/artifacts \
   -H "Authorization: Bearer $PI_AGENT_TOKEN" \
@@ -519,6 +525,13 @@ Validate config:
 
 ```bash
 python3 gateway.py --config ~/.agent-security-gateway/config.json validate-config
+```
+
+Check and remove expired artifacts:
+
+```bash
+python3 gateway.py --config ~/.agent-security-gateway/config.json gc-artifacts --dry-run
+python3 gateway.py --config ~/.agent-security-gateway/config.json gc-artifacts
 ```
 
 Run a worker-side OpenAI-compatible shim when a worker runtime cannot attach ASG

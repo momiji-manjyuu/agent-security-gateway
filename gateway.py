@@ -46,6 +46,7 @@ DEFAULT_AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
 DEFAULT_KILL_SWITCH = RUNTIME_DIR / "KILL_SWITCH"
 DEFAULT_APPROVAL_STORE = RUNTIME_DIR / "approvals.jsonl"
 DEFAULT_ARTIFACT_STORE = RUNTIME_DIR / "artifacts"
+DEFAULT_ARTIFACT_RETENTION_DAYS = 90
 MAX_TIMEOUT_SECONDS = 600
 ROUTE_KINDS = {"inspect_only", "openai_chat_completions", "http_json", "command"}
 PUBLIC_ROUTE_FIELDS = ("description", "kind", "required_capability", "allowed_capabilities", "aliases")
@@ -187,6 +188,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "artifact_store": {
         "path": str(DEFAULT_ARTIFACT_STORE),
         "max_artifact_bytes": 10_485_760,
+        "retention_days": DEFAULT_ARTIFACT_RETENTION_DAYS,
     },
     "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
     "require_known_run_id": False,
@@ -436,6 +438,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
         max_artifact, max_artifact_ok = parse_int(artifact_store.get("max_artifact_bytes", 10_485_760), default=10_485_760)
         if not max_artifact_ok or max_artifact <= 0:
             errors.append("artifact_store.max_artifact_bytes must be a positive integer")
+        retention_days, retention_days_ok = parse_int(
+            artifact_store.get("retention_days", DEFAULT_ARTIFACT_RETENTION_DAYS),
+            default=DEFAULT_ARTIFACT_RETENTION_DAYS,
+        )
+        if not retention_days_ok or retention_days <= 0:
+            errors.append("artifact_store.retention_days must be a positive integer")
 
     agents = cfg.get("agents")
     routes = cfg.get("routes")
@@ -1682,6 +1690,14 @@ def artifact_max_bytes(cfg: dict[str, Any], decision: RouteDecision | None = Non
     return limit
 
 
+def artifact_retention_days(cfg: dict[str, Any]) -> int:
+    configured = artifact_store_options(cfg).get("retention_days", DEFAULT_ARTIFACT_RETENTION_DAYS)
+    days, ok = parse_int(configured, default=DEFAULT_ARTIFACT_RETENTION_DAYS)
+    if not ok or days <= 0:
+        return DEFAULT_ARTIFACT_RETENTION_DAYS
+    return days
+
+
 def route_artifact_policy(decision: RouteDecision) -> dict[str, Any]:
     policy = decision.route.get("artifact_policy", {})
     return policy if isinstance(policy, dict) else {}
@@ -1918,6 +1934,203 @@ def load_artifact_manifest(root: Path, artifact_id: str) -> dict[str, Any]:
         except (ValueError, GatewayError):
             pass
     return manifest
+
+
+def parse_artifact_datetime(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def artifact_retention_timestamp(manifest: dict[str, Any]) -> dt.datetime | None:
+    return parse_artifact_datetime(manifest.get("created_at")) or parse_artifact_datetime(manifest.get("updated_at"))
+
+
+def normalize_artifact_now(now: dt.datetime | None = None) -> dt.datetime:
+    if now is None:
+        return dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=dt.timezone.utc)
+    return now.astimezone(dt.timezone.utc)
+
+
+def artifact_retention_cutoff(cfg: dict[str, Any], now: dt.datetime | None = None) -> dt.datetime:
+    return normalize_artifact_now(now) - dt.timedelta(days=artifact_retention_days(cfg))
+
+
+def enforce_artifact_retention(manifest: dict[str, Any], cfg: dict[str, Any], now: dt.datetime | None = None) -> None:
+    created_at = artifact_retention_timestamp(manifest)
+    if created_at is None:
+        raise GatewayError(410, "artifact_expired", "artifact retention timestamp is missing")
+    if created_at < artifact_retention_cutoff(cfg, now):
+        raise GatewayError(410, "artifact_expired", "artifact retention period has expired")
+
+
+def iter_artifact_manifest_paths(root: Path) -> list[Path]:
+    manifest_root = root / "manifests"
+    if not manifest_root.exists():
+        return []
+    paths: list[Path] = []
+    for path in manifest_root.rglob("*.json"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        paths.append(path)
+    return sorted(paths)
+
+
+def read_artifact_manifest_file(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            body = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def artifact_partition_from_manifest_path(root: Path, manifest_path: Path) -> str | None:
+    try:
+        relative = manifest_path.relative_to(root / "manifests")
+    except ValueError:
+        return None
+    if len(relative.parts) != 4:
+        return None
+    partition = "/".join(relative.parts[:3])
+    try:
+        validate_artifact_partition(partition)
+    except GatewayError:
+        return None
+    return partition
+
+
+def artifact_gc_index_paths(root: Path, artifact_id: str, manifest: dict[str, Any], manifest_path: Path) -> list[Path]:
+    partitions: set[str] = set()
+    configured_partition = str(manifest.get("storage_partition") or "")
+    if configured_partition:
+        try:
+            validate_artifact_partition(configured_partition)
+            partitions.add(configured_partition)
+        except GatewayError:
+            pass
+    path_partition = artifact_partition_from_manifest_path(root, manifest_path)
+    if path_partition:
+        partitions.add(path_partition)
+
+    paths: set[Path] = {artifact_lookup_path(root, artifact_id)}
+    for status in ARTIFACT_STATUSES:
+        paths.add(artifact_index_path(root, status, artifact_id))
+        for partition in partitions:
+            paths.add(artifact_index_path(root, status, artifact_id, partition))
+        status_root = root / "quarantine" / status
+        if status_root.exists():
+            paths.update(path for path in status_root.glob(f"*/*/*/{artifact_id}.json") if path.is_file() and not path.is_symlink())
+    return sorted(paths)
+
+
+def artifact_blob_paths_for_delete(root: Path, content_sha256: str) -> list[Path]:
+    if not ARTIFACT_SHA256_PATTERN.fullmatch(content_sha256):
+        return []
+    paths = [artifact_blob_path(root, content_sha256), artifact_legacy_blob_path(root, content_sha256)]
+    return [path for path in paths if path.exists()]
+
+
+def unlink_if_present(path: Path) -> bool:
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def gc_artifacts(cfg: dict[str, Any], *, dry_run: bool = False, now: dt.datetime | None = None) -> dict[str, Any]:
+    root = artifact_store_root(cfg)
+    retention_days = artifact_retention_days(cfg)
+    now = normalize_artifact_now(now)
+    cutoff = now - dt.timedelta(days=retention_days)
+
+    manifest_paths = iter_artifact_manifest_paths(root)
+    sha_references: dict[str, set[Path]] = {}
+    candidates: list[dict[str, Any]] = []
+    skipped = 0
+    for manifest_path in manifest_paths:
+        manifest = read_artifact_manifest_file(manifest_path)
+        if manifest is None:
+            skipped += 1
+            continue
+        content_sha256 = str(manifest.get("content_sha256") or "")
+        if ARTIFACT_SHA256_PATTERN.fullmatch(content_sha256):
+            sha_references.setdefault(content_sha256, set()).add(manifest_path)
+        artifact_id = str(manifest.get("artifact_id") or "")
+        try:
+            validate_artifact_id(artifact_id)
+        except GatewayError:
+            skipped += 1
+            continue
+        created_at = artifact_retention_timestamp(manifest)
+        if created_at is None:
+            skipped += 1
+            continue
+        if created_at < cutoff:
+            candidates.append(
+                {
+                    "artifact_id": artifact_id,
+                    "content_sha256": content_sha256,
+                    "created_at": created_at,
+                    "manifest": manifest,
+                    "manifest_path": manifest_path,
+                }
+            )
+
+    expired_paths = {candidate["manifest_path"] for candidate in candidates}
+    deleted_manifests = 0
+    deleted_indexes = 0
+    deleted_blobs = 0
+    if not dry_run:
+        deleted_blob_hashes: set[str] = set()
+        for candidate in candidates:
+            manifest_path = candidate["manifest_path"]
+            if unlink_if_present(manifest_path):
+                deleted_manifests += 1
+            for index_path in artifact_gc_index_paths(root, candidate["artifact_id"], candidate["manifest"], manifest_path):
+                if unlink_if_present(index_path):
+                    deleted_indexes += 1
+            content_sha256 = candidate["content_sha256"]
+            if content_sha256 in deleted_blob_hashes:
+                continue
+            references = sha_references.get(content_sha256, set())
+            if references and references.issubset(expired_paths):
+                blob_deleted = False
+                for blob_path in artifact_blob_paths_for_delete(root, content_sha256):
+                    blob_deleted = unlink_if_present(blob_path) or blob_deleted
+                if blob_deleted:
+                    deleted_blob_hashes.add(content_sha256)
+                    deleted_blobs += 1
+
+    summary = {
+        "ok": True,
+        "dry_run": dry_run,
+        "store": str(root),
+        "now": now.isoformat(),
+        "retention_days": retention_days,
+        "cutoff": cutoff.isoformat(),
+        "scanned_manifests": len(manifest_paths),
+        "expired_manifests": len(candidates),
+        "deleted_manifests": deleted_manifests,
+        "deleted_indexes": deleted_indexes,
+        "deleted_blobs": deleted_blobs,
+        "skipped_manifests": skipped,
+    }
+    if not dry_run:
+        audit_event = {key: value for key, value in summary.items() if key != "store"}
+        audit_event["event"] = "artifact_gc"
+        audit_event["decision"] = "completed"
+        write_audit(cfg, audit_event)
+    return summary
 
 
 def public_artifact_ref(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -2173,7 +2386,8 @@ def artifact_access_payload(headers: Any, manifest: dict[str, Any]) -> dict[str,
     return payload
 
 
-def enforce_artifact_access_policy(manifest: dict[str, Any], decision: RouteDecision) -> None:
+def enforce_artifact_access_policy(manifest: dict[str, Any], decision: RouteDecision, cfg: dict[str, Any]) -> None:
+    enforce_artifact_retention(manifest, cfg)
     status = str(manifest.get("status", ""))
     if status not in artifact_allowed_statuses(decision):
         raise GatewayError(403, "artifact_status_denied", f"route '{decision.route_id}' cannot access artifact status '{status}'")
@@ -2374,7 +2588,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(artifact_access_payload(self.headers, manifest), decision)
-            enforce_artifact_access_policy(manifest, decision)
+            enforce_artifact_access_policy(manifest, decision, cfg)
             write_audit(
                 cfg,
                 {
@@ -2408,7 +2622,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(access_payload, decision)
-            enforce_artifact_access_policy(manifest, decision)
+            enforce_artifact_access_policy(manifest, decision, cfg)
             blob = artifact_blob_read_path(root, str(manifest.get("content_sha256", "")))
             if not blob.exists():
                 raise GatewayError(500, "artifact_store_error", "artifact blob is missing")
@@ -2987,6 +3201,15 @@ def verify_audit_cli(path: Path) -> None:
         raise SystemExit(1)
 
 
+def gc_artifacts_cli(config_path: Path, *, dry_run: bool, now_text: str | None = None) -> None:
+    cfg = load_config(config_path)
+    now = parse_artifact_datetime(now_text) if now_text else None
+    if now_text and now is None:
+        raise SystemExit("--now must be an ISO-8601 timestamp")
+    summary = gc_artifacts(cfg, dry_run=dry_run, now=now)
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Agent Security Gateway")
     parser.add_argument("--config", type=Path, default=Path(os.environ.get("ASG_CONFIG", DEFAULT_CONFIG_PATH)))
@@ -3003,6 +3226,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("validate-config")
     p_verify = sub.add_parser("verify-audit")
     p_verify.add_argument("--path", type=Path)
+    p_gc = sub.add_parser("gc-artifacts")
+    p_gc.add_argument("--dry-run", action="store_true")
+    p_gc.add_argument("--now", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -3022,6 +3248,8 @@ def main(argv: list[str] | None = None) -> int:
         validate_config_cli(args.config)
     elif args.command == "verify-audit":
         verify_audit_cli(args.path or expand_path(str(load_config(args.config)["audit_log"])))
+    elif args.command == "gc-artifacts":
+        gc_artifacts_cli(args.config, dry_run=args.dry_run, now_text=args.now)
     return 0
 
 

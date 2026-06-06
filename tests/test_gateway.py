@@ -222,6 +222,49 @@ class GatewayTests(unittest.TestCase):
         gateway.validate_config(cfg)
         return cfg
 
+    def write_artifact_fixture(
+        self,
+        root: Path,
+        *,
+        artifact_id: str,
+        content: bytes,
+        created_at: str,
+        status: str = "verified",
+    ) -> dict:
+        gateway.ensure_artifact_store(root)
+        content_sha256 = gateway.hashlib.sha256(content).hexdigest()
+        manifest = {
+            "artifact_id": artifact_id,
+            "artifact_type": "report",
+            "content_sha256": content_sha256,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "detected_media_type": "text/plain",
+            "filename": f"{artifact_id}.txt",
+            "inspection": {"text_scanned": True, "magic": "text", "scan": {}},
+            "media_type": "text/plain",
+            "policy_scope": {
+                "route_id": "security.artifacts.submit",
+                "capability": "submit_artifact",
+                "taint": ["untrusted_web"],
+                "run_id": "gc-run",
+                "task_id": artifact_id,
+            },
+            "producer_agent_id": "pi_research_1",
+            "producer_trust_tier": "web_dmz",
+            "reason": "artifact_scan_passed",
+            "route_id": "security.artifacts.submit",
+            "run_id": "gc-run",
+            "size_bytes": len(content),
+            "status": status,
+            "taint": ["untrusted_web"],
+            "task_id": artifact_id,
+        }
+        gateway.write_blob_once(gateway.artifact_blob_path(root, content_sha256), content)
+        gateway.write_artifact_manifest(root, manifest)
+        gateway.write_artifact_index(root, manifest)
+        return manifest
+
     def start_gateway(self, cfg: dict) -> str:
         security.RATE_LIMITER.reset()
         server = gateway.ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
@@ -1075,8 +1118,8 @@ class GatewayTests(unittest.TestCase):
                 "artifact_id": artifact_id,
                 "artifact_type": "report",
                 "content_sha256": content_sha,
-                "created_at": "2026-06-01T00:00:00+00:00",
-                "updated_at": "2026-06-01T00:00:00+00:00",
+                "created_at": "2099-06-01T00:00:00+00:00",
+                "updated_at": "2099-06-01T00:00:00+00:00",
                 "detected_media_type": "text/plain",
                 "filename": "legacy.txt",
                 "inspection": {"text_scanned": True, "magic": "text", "scan": {}},
@@ -1113,6 +1156,117 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(downloaded, content)
             self.assertEqual(headers["X-ASG-Artifact-Status"], "verified")
+
+    def test_artifact_gc_dry_run_reports_expired_without_deleting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            root = Path(cfg["artifact_store"]["path"])
+            manifest = self.write_artifact_fixture(
+                root,
+                artifact_id="art_" + "b" * 32,
+                content=b"expired dry-run artifact",
+                created_at="2026-02-01T00:00:00+00:00",
+            )
+            manifest_path = gateway.artifact_manifest_write_path(root, manifest)
+            index_path = gateway.artifact_index_path(root, "verified", manifest["artifact_id"], manifest["storage_partition"])
+            blob_path = gateway.artifact_blob_path(root, manifest["content_sha256"])
+            now = gateway.dt.datetime(2026, 6, 6, tzinfo=gateway.dt.timezone.utc)
+
+            summary = gateway.gc_artifacts(cfg, dry_run=True, now=now)
+
+            self.assertEqual(summary["expired_manifests"], 1)
+            self.assertEqual(summary["deleted_manifests"], 0)
+            self.assertTrue(manifest_path.exists())
+            self.assertTrue(index_path.exists())
+            self.assertTrue(blob_path.exists())
+            self.assertFalse(Path(cfg["audit_log"]).exists())
+
+    def test_artifact_gc_deletes_expired_manifest_indexes_and_unreferenced_blob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            root = Path(cfg["artifact_store"]["path"])
+            manifest = self.write_artifact_fixture(
+                root,
+                artifact_id="art_" + "c" * 32,
+                content=b"expired artifact",
+                created_at="2026-02-01T00:00:00+00:00",
+            )
+            artifact_id = manifest["artifact_id"]
+            manifest_path = gateway.artifact_manifest_write_path(root, manifest)
+            lookup_path = gateway.artifact_lookup_path(root, artifact_id)
+            index_path = gateway.artifact_index_path(root, "verified", artifact_id, manifest["storage_partition"])
+            blob_path = gateway.artifact_blob_path(root, manifest["content_sha256"])
+            now = gateway.dt.datetime(2026, 6, 6, tzinfo=gateway.dt.timezone.utc)
+
+            summary = gateway.gc_artifacts(cfg, now=now)
+
+            self.assertEqual(summary["deleted_manifests"], 1)
+            self.assertEqual(summary["deleted_indexes"], 2)
+            self.assertEqual(summary["deleted_blobs"], 1)
+            self.assertFalse(manifest_path.exists())
+            self.assertFalse(lookup_path.exists())
+            self.assertFalse(index_path.exists())
+            self.assertFalse(blob_path.exists())
+            audit_event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(audit_event["event"], "artifact_gc")
+            self.assertEqual(audit_event["retention_days"], 90)
+            self.assertEqual(audit_event["deleted_manifests"], 1)
+
+    def test_artifact_gc_keeps_blob_referenced_by_recent_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            root = Path(cfg["artifact_store"]["path"])
+            content = b"shared artifact bytes"
+            expired = self.write_artifact_fixture(
+                root,
+                artifact_id="art_" + "d" * 32,
+                content=content,
+                created_at="2026-02-01T00:00:00+00:00",
+            )
+            recent = self.write_artifact_fixture(
+                root,
+                artifact_id="art_" + "e" * 32,
+                content=content,
+                created_at="2026-06-01T00:00:00+00:00",
+            )
+            expired_manifest_path = gateway.artifact_manifest_write_path(root, expired)
+            recent_manifest_path = gateway.artifact_manifest_write_path(root, recent)
+            blob_path = gateway.artifact_blob_path(root, expired["content_sha256"])
+            now = gateway.dt.datetime(2026, 6, 6, tzinfo=gateway.dt.timezone.utc)
+
+            summary = gateway.gc_artifacts(cfg, now=now)
+
+            self.assertEqual(summary["deleted_manifests"], 1)
+            self.assertEqual(summary["deleted_blobs"], 0)
+            self.assertFalse(expired_manifest_path.exists())
+            self.assertTrue(recent_manifest_path.exists())
+            self.assertTrue(blob_path.exists())
+
+    def test_artifact_store_retention_days_must_be_positive_integer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["artifact_store"]["retention_days"] = 0
+            with self.assertRaises(ValueError) as raised:
+                gateway.validate_config(cfg)
+            self.assertIn("artifact_store.retention_days", str(raised.exception))
+
+    def test_artifact_retention_blocks_expired_access_before_gc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            root = Path(cfg["artifact_store"]["path"])
+            manifest = self.write_artifact_fixture(
+                root,
+                artifact_id="art_" + "f" * 32,
+                content=b"expired but not yet garbage collected",
+                created_at="2026-02-01T00:00:00+00:00",
+            )
+            now = gateway.dt.datetime(2026, 6, 6, tzinfo=gateway.dt.timezone.utc)
+
+            with self.assertRaises(gateway.GatewayError) as raised:
+                gateway.enforce_artifact_retention(manifest, cfg, now=now)
+
+            self.assertEqual(raised.exception.code, "artifact_expired")
+            self.assertTrue(gateway.artifact_manifest_write_path(root, manifest).exists())
 
     def test_require_structured_task_enforced(self):
         with tempfile.TemporaryDirectory() as tmp:
