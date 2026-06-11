@@ -259,6 +259,8 @@ capability. The route accepts only a structured `x_research_request`; it does
 not forward worker chat messages, raw reports, caller-selected tools, social
 posting requests, external URLs, or raw external content. ASG converts the
 validated fields into a short Hermes prompt that says to use X search only.
+`query` and `question` must not contain control characters, newlines,
+zero-width characters, or Unicode bidirectional format controls.
 
 ```json
 "mac.x_research.request": {
