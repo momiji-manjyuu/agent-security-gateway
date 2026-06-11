@@ -141,7 +141,14 @@
           "type": "string"
         },
         "backend": {
-          "type": "object"
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "require_signature": {
+              "type": "boolean",
+              "default": false
+            }
+          }
         },
         "input_policy": {
           "type": "object",

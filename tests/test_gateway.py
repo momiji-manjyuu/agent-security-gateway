@@ -962,6 +962,70 @@ class GatewayTests(unittest.TestCase):
             event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(event["forward_payload_mode"], "audit_receipt")
 
+    def test_backend_require_signature_requires_hmac_key_during_config_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["backend_hmac_key_env"] = "TEST_REQUIRED_BACKEND_HMAC_KEY"
+            cfg["routes"]["pi.web_research.chat"]["backend"]["require_signature"] = True
+            old_value = os.environ.pop("TEST_REQUIRED_BACKEND_HMAC_KEY", None)
+            try:
+                with self.assertRaisesRegex(ValueError, "require_signature requires environment variable TEST_REQUIRED_BACKEND_HMAC_KEY"):
+                    gateway.validate_config(cfg)
+            finally:
+                if old_value is not None:
+                    os.environ["TEST_REQUIRED_BACKEND_HMAC_KEY"] = old_value
+
+    def test_backend_require_signature_fails_closed_at_request_time_without_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, _ = self.start_backend()
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            cfg["backend_hmac_key_env"] = "TEST_REQUIRED_BACKEND_HMAC_KEY"
+            cfg["routes"]["pi.web_research.chat"]["backend"]["require_signature"] = True
+            old_value = os.environ.pop("TEST_REQUIRED_BACKEND_HMAC_KEY", None)
+            try:
+                base = self.start_gateway(cfg)
+                status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload())
+                self.assertEqual(status, 500)
+                self.assert_error(body, "backend_signature_required")
+            finally:
+                if old_value is not None:
+                    os.environ["TEST_REQUIRED_BACKEND_HMAC_KEY"] = old_value
+
+    def test_backend_require_signature_sends_canonical_hmac(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, backend = self.start_backend()
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            cfg["backend_hmac_key_env"] = "TEST_REQUIRED_BACKEND_HMAC_KEY"
+            cfg["routes"]["pi.web_research.chat"]["backend"]["require_signature"] = True
+            old_value = os.environ.get("TEST_REQUIRED_BACKEND_HMAC_KEY")
+            os.environ["TEST_REQUIRED_BACKEND_HMAC_KEY"] = "test-hmac-key"
+            try:
+                gateway.validate_config(cfg)
+                base = self.start_gateway(cfg)
+                payload = self.chat_payload(run_id="run-allowed", task_id="task-hmac")
+                status, _ = self.request_json(base, "/v1/chat/completions", payload)
+                self.assertEqual(status, 200)
+                headers = backend.last_headers  # type: ignore[attr-defined]
+                body_sha256 = gateway.hashlib.sha256(backend.last_raw_body).hexdigest()  # type: ignore[attr-defined]
+                canonical = gateway.backend_signature_canonical(
+                    "POST",
+                    "/chat/completions",
+                    body_sha256,
+                    "mac_gpt55",
+                    "pi.web_research.chat",
+                    "run-allowed",
+                    "task-hmac",
+                    headers["X-Asg-Timestamp"],
+                )
+                expected = "sha256=" + gateway.hmac.new(b"test-hmac-key", canonical.encode("utf-8"), gateway.hashlib.sha256).hexdigest()
+                self.assertEqual(headers["X-Asg-Request-Sha256"], body_sha256)
+                self.assertEqual(headers["X-Asg-Signature"], expected)
+            finally:
+                if old_value is None:
+                    os.environ.pop("TEST_REQUIRED_BACKEND_HMAC_KEY", None)
+                else:
+                    os.environ["TEST_REQUIRED_BACKEND_HMAC_KEY"] = old_value
+
     def test_results_report_policy_can_forward_audit_receipt_to_openai_chat(self):
         with tempfile.TemporaryDirectory() as tmp:
             backend_url, backend = self.start_backend()

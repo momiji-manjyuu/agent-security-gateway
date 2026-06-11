@@ -1,4 +1,7 @@
 import importlib.util
+import datetime as dt
+import hashlib
+import hmac
 import json
 import sys
 import tempfile
@@ -30,7 +33,14 @@ class ResultReceiptCollectorTests(unittest.TestCase):
         host, port = server.server_address
         return f"http://{host}:{port}"
 
-    def request_json(self, base_url: str, path: str, payload: dict, token: str = "collector-token") -> tuple[int, dict]:
+    def request_json(
+        self,
+        base_url: str,
+        path: str,
+        payload: dict,
+        token: str = "collector-token",
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict]:
         headers = {
             "Content-Type": "application/json",
             "X-Request-ID": "req-test",
@@ -39,6 +49,8 @@ class ResultReceiptCollectorTests(unittest.TestCase):
         }
         if token:
             headers["Authorization"] = "Bearer " + token
+        if extra_headers:
+            headers.update(extra_headers)
         request = urllib.request.Request(
             base_url + path,
             data=json.dumps(payload).encode("utf-8"),
@@ -61,6 +73,8 @@ class ResultReceiptCollectorTests(unittest.TestCase):
             store_path=store_path,
             token="collector-token",
             max_body_bytes=8192,
+            hmac_key="",
+            signature_max_age_seconds=300,
         )
 
     def receipt(self) -> dict:
@@ -98,6 +112,78 @@ class ResultReceiptCollectorTests(unittest.TestCase):
             status, body = self.request_json(base, "/asg/result-receipts", {"ok": True})
             self.assertEqual(status, 400)
             self.assertEqual(body["error"]["code"], "invalid_receipt")
+
+    def signed_headers(
+        self,
+        payload: dict,
+        *,
+        hmac_key: str = "collector-hmac-key",
+        timestamp: str | None = None,
+        route_id: str = "mac.result_receipt.notify",
+    ) -> dict[str, str]:
+        raw = json.dumps(payload).encode("utf-8")
+        body_sha256 = hashlib.sha256(raw).hexdigest()
+        timestamp = timestamp or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        canonical = collector.backend_signature_canonical(
+            "POST",
+            "/asg/result-receipts",
+            body_sha256,
+            "nuc7cjyh",
+            route_id,
+            "",
+            "",
+            timestamp,
+        )
+        return {
+            "X-ASG-Request-SHA256": body_sha256,
+            "X-ASG-Timestamp": timestamp,
+            "X-ASG-Signature": "sha256=" + hmac.new(hmac_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest(),
+        }
+
+    def test_accepts_valid_asg_signature_when_hmac_key_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "receipts.jsonl"
+            config = self.make_config(store_path)
+            config = collector.dataclasses.replace(config, hmac_key="collector-hmac-key")
+            base = self.start_collector(config)
+            payload = self.receipt()
+            status, body = self.request_json(base, "/asg/result-receipts", payload, extra_headers=self.signed_headers(payload))
+            self.assertEqual(status, 200)
+            self.assertTrue(body["stored"])
+
+    def test_rejects_missing_asg_signature_when_hmac_key_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp) / "receipts.jsonl")
+            config = collector.dataclasses.replace(config, hmac_key="collector-hmac-key")
+            base = self.start_collector(config)
+            status, body = self.request_json(base, "/asg/result-receipts", self.receipt())
+            self.assertEqual(status, 401)
+            self.assertEqual(body["error"]["code"], "signature_required")
+
+    def test_rejects_tampered_asg_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp) / "receipts.jsonl")
+            config = collector.dataclasses.replace(config, hmac_key="collector-hmac-key")
+            base = self.start_collector(config)
+            payload = self.receipt()
+            headers = self.signed_headers(payload)
+            replacement = "1" if headers["X-ASG-Signature"].endswith("0") else "0"
+            headers["X-ASG-Signature"] = headers["X-ASG-Signature"][:-1] + replacement
+            status, body = self.request_json(base, "/asg/result-receipts", payload, extra_headers=headers)
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"]["code"], "signature_invalid")
+
+    def test_rejects_expired_asg_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp) / "receipts.jsonl")
+            config = collector.dataclasses.replace(config, hmac_key="collector-hmac-key", signature_max_age_seconds=300)
+            base = self.start_collector(config)
+            payload = self.receipt()
+            old_timestamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3600)).isoformat(timespec="seconds")
+            headers = self.signed_headers(payload, timestamp=old_timestamp)
+            status, body = self.request_json(base, "/asg/result-receipts", payload, extra_headers=headers)
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"]["code"], "signature_stale")
 
 
 if __name__ == "__main__":
