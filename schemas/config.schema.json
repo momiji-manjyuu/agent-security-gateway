@@ -239,6 +239,10 @@
             },
             "notify_on_block": {
               "type": "boolean"
+            },
+            "max_receipts_per_minute": {
+              "type": "integer",
+              "minimum": 1
             }
           }
         },

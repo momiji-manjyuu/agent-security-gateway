@@ -22,6 +22,7 @@ import scripts.init_runtime_config as init_runtime_config  # noqa: E402
 
 class FakeBackendHandler(gateway.http.server.BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
+        self.server.request_count = getattr(self.server, "request_count", 0) + 1  # type: ignore[attr-defined]
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         self.server.last_headers = dict(self.headers)  # type: ignore[attr-defined]
@@ -1171,6 +1172,66 @@ class GatewayTests(unittest.TestCase):
             event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(event["reason"], "blocked_by_input_guard")
             self.assertTrue(event["receipt_delivery"]["ok"])
+
+    def test_results_report_policy_rate_limits_receipts_per_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, backend = self.start_backend(response_body={"ok": True, "accepted": True})
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            cfg["routes"]["ubuntu1.knowledge.submit_source_card"]["report_policy"] = {
+                "forward_audit_receipt": True,
+                "return_audit_receipt": True,
+                "max_receipts_per_minute": 1,
+            }
+            gateway.validate_config(cfg)
+            base = self.start_gateway(cfg)
+            payload = {
+                "route_id": "ubuntu1.knowledge.submit_source_card",
+                "capability": "submit_source_card",
+                "run_id": "run-report",
+                "task_id": "task-report",
+                "taint": ["untrusted_web"],
+                "message_type": "source_card",
+                "source_card": {
+                    "source_id": "src-1",
+                    "title": "Example",
+                    "claims": ["Artifact is ready. Verification completed normally."],
+                },
+            }
+            status, _ = self.request_json(
+                base,
+                "/v1/results",
+                payload,
+                token="pi-token-1234567890",
+                capability="submit_source_card",
+                route="ubuntu1.knowledge.submit_source_card",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(backend.request_count, 1)  # type: ignore[attr-defined]
+
+            payload["task_id"] = "task-report-2"
+            status, body = self.request_json(
+                base,
+                "/v1/results",
+                payload,
+                token="pi-token-1234567890",
+                capability="submit_source_card",
+                route="ubuntu1.knowledge.submit_source_card",
+            )
+            self.assertEqual(status, 429)
+            self.assert_error(body, "rate_limited")
+            self.assertEqual(backend.request_count, 1)  # type: ignore[attr-defined]
+            event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["reason"], "rate_limited")
+
+    def test_report_policy_rejects_invalid_receipt_rate_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["routes"]["ubuntu1.knowledge.submit_source_card"]["report_policy"] = {
+                "forward_audit_receipt": True,
+                "max_receipts_per_minute": 0,
+            }
+            with self.assertRaisesRegex(ValueError, "max_receipts_per_minute must be a positive integer"):
+                gateway.validate_config(cfg)
 
     def test_artifact_submit_verifies_text_and_downloads_through_asg(self):
         with tempfile.TemporaryDirectory() as tmp:
