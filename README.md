@@ -398,6 +398,72 @@ curl -s -o source-summary.txt http://127.0.0.1:8788/v1/artifacts/art_00000000000
   -H "X-ASG-Route: security.artifacts.download"
 ```
 
+### Quarantined artifact review route
+
+Use route kind `artifact_review` when a privileged controller needs a summary
+of a verified untrusted artifact without reading the artifact's raw text. The
+caller sends only `artifact_ref.artifact_id`; top-level raw content, chat
+messages, or a full artifact download reference are rejected with
+`input_policy_denied`. ASG loads the verified text artifact from its store,
+sends it to the configured isolated review backend with a fixed system prompt
+and no tools, then accepts only a JSON object matching
+`schemas/reviewed_summary.schema.json`.
+
+The backend's free-form text is never forwarded. If the backend response is not
+valid JSON or does not match the reviewed-summary structure, ASG returns
+`review_status: "needs_review"` and no claims. Valid summaries are stored as a
+new derived artifact with taint `reviewed_untrusted_summary`, `derived_from` set
+to the source artifact ID, and an `artifact_review` audit edge.
+
+Example route:
+
+```json
+"security.artifacts.review_summary": {
+  "kind": "artifact_review",
+  "aliases": ["asg/artifacts-review-summary"],
+  "backend": {
+    "mode": "http",
+    "base_url": "http://mac-controller.internal:8642/v1",
+    "path": "/chat/completions",
+    "api_key_env": "MAC_ARTIFACT_REVIEW_BACKEND_KEY",
+    "timeout_seconds": 120,
+    "model_rewrite": "local-artifact-reviewer",
+    "max_tokens": 800,
+    "max_review_chars": 40000
+  },
+  "allowed_callers": ["mac_gpt55"],
+  "required_capability": "review_artifact",
+  "input_policy": {
+    "accepted_taint": ["untrusted_web", "untrusted_pdf", "untrusted_github", "sandbox_output", "model_output"],
+    "allow_missing_taint": false
+  },
+  "artifact_policy": {
+    "allowed_statuses": ["verified"]
+  }
+}
+```
+
+Example request:
+
+```bash
+curl -s http://127.0.0.1:8788/v1/tasks \
+  -H "Authorization: Bearer $ASG_AGENT_TOKEN" \
+  -H "X-Agent-Capability: review_artifact" \
+  -H "X-ASG-Route: security.artifacts.review_summary" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "route_id": "security.artifacts.review_summary",
+    "capability": "review_artifact",
+    "run_id": "example-run",
+    "task_id": "task-001",
+    "taint": ["untrusted_web"],
+    "message_type": "artifact_review_request",
+    "artifact_ref": {
+      "artifact_id": "art_00000000000000000000000000000000"
+    }
+  }'
+```
+
 ### `POST /v1/approvals`
 
 Stores a file-backed human/operator approval artifact. This endpoint requires a separate caller token with `approve_action` capability and route `security.approvals.create`; target agents cannot approve their own actions.
@@ -429,6 +495,7 @@ Route kinds:
 - `openai_chat_completions`: POSTs JSON to `route.backend.base_url + route.backend.path`; rewrites model with `model_rewrite` when configured.
 - `http_json`: POSTs JSON to configured backend path.
 - `command`: supported but disabled unless a command route explicitly sets `enabled: true`.
+- `artifact_review`: loads a verified artifact by `artifact_ref.artifact_id`, sends raw text only to the route-configured isolated review backend, validates the backend JSON summary, stores a derived `reviewed_untrusted_summary` artifact, and returns only schema-approved fields.
 
 For `/v1/results` routes with `report_policy.forward_audit_receipt: true`,
 `http_json` sends the generated audit receipt as the backend body. For
@@ -527,6 +594,7 @@ Routes accept only taints listed in `route.input_policy.accepted_taint`, unless 
 - `require_message_type`: requires top-level `message_type` or `metadata.message_type` to match.
 - `require_structured_task`: requires a top-level `task` object with non-empty `task.objective`; `task.constraints` and `task.output_contract` must be objects when present. `metadata.message_type == "task_instruction"` with `messages` is allowed only for compatibility. Strict deployments should use task packets.
 - `require_x_research_request`: requires `message_type: "x_research_request"` and a top-level `x_research_request` object containing only `query`, optional `question`, optional `max_results`, optional `since`/`until` dates, and optional `language`. Use with `max_messages: 0`, `allow_raw_external_content: false`, and `disallow_external_urls: true` for worker-to-Hermes X search requests.
+- `artifact_review` routes always require `message_type: "artifact_review_request"` and a top-level `artifact_ref` containing only `artifact_id`; unsupported top-level fields and raw artifact text are rejected before scanning.
 - `allow_raw_external_content: false`: rejects raw external body keys such as `raw_content`, `raw_html`, `html`, `full_text`, `page_text`, `document_text`, `source_text`, `raw_document`, `raw_page`, `raw_markdown`, and `transcript_raw`.
 - `disallow_external_urls: true`: rejects any `http://` or `https://` URL in the payload.
 - `max_batch_size`: rejects oversized numeric batch fields (`batch_size`, `n`, `count`, `num_images`, `num_prompts`, `samples`) and oversized list fields (`prompts`, `prompt_matrix`, `items`, `jobs`, `requests`).

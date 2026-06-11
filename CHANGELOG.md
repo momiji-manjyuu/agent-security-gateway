@@ -16,6 +16,7 @@
 - Hardened `x_research_request` so `query` and `question` reject control, zero-width, and bidirectional format characters.
 - Added audit anchor export, collector storage for off-host anchors, and `verify-audit --expect-anchor` tail-hash verification.
 - Expanded the red-team corpus and added CI thresholds for minimum attack detection and maximum benign false positives.
+- Added `artifact_review` routes that load verified artifacts by ID, isolate raw text to a route-configured review backend, validate reviewed-summary JSON, return only schema-approved fields, and record derived artifact/audit lineage with `reviewed_untrusted_summary` taint.
 - Added `/v1/results` audit receipt forwarding for Mac/controller notification routes so worker reports can trigger follow-up checks without forwarding raw report content.
 - Added ASG-managed artifact quarantine storage with `/v1/artifacts`, `/v1/artifacts/{id}/metadata`, and `/v1/artifacts/{id}/content`; artifacts move from `unchecked` to `verified`, `needs_review`, or `blocked`, and content retrieval is forced through route/capability/taint policy.
 - Changed new artifact manifests and quarantine indexes to UTC date-partitioned storage while keeping read fallback for the earlier flat artifact layout.
