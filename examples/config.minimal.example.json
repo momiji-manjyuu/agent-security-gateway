@@ -3,6 +3,7 @@
   "port": 8788,
   "audit_log": "~/.agent-security-gateway/audit.jsonl",
   "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
+  "require_known_run_id": true,
   "agents": {
     "mac_gpt55": {
       "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
