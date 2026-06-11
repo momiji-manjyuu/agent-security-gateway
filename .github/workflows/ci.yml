@@ -31,7 +31,7 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests
       - name: Red-team corpus
-        run: python scripts/eval_redteam.py
+        run: python scripts/eval_redteam.py --min-detection 1.0 --max-false-positive 0.0
       - name: Validate example config
         run: python gateway.py --config config.example.json validate-config
       - name: Validate JSON files

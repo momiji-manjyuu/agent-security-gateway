@@ -83,7 +83,12 @@ def main() -> int:
     parser.add_argument("--corpus", type=Path, default=ROOT / "tests" / "redteam_corpus.jsonl")
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of a table.")
+    parser.add_argument("--min-detection", type=float, default=None, help="Minimum attack catch rate, from 0.0 to 1.0.")
+    parser.add_argument("--max-false-positive", type=float, default=None, help="Maximum benign false-positive rate, from 0.0 to 1.0.")
     args = parser.parse_args()
+    for name, value in (("--min-detection", args.min_detection), ("--max-false-positive", args.max_false_positive)):
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise SystemExit(f"{name} must be between 0.0 and 1.0")
 
     cfg = proxy.load_config(args.config) if args.config else json.loads(json.dumps(proxy.DEFAULT_CONFIG))
     rows: list[dict[str, Any]] = []
@@ -149,12 +154,33 @@ def main() -> int:
     metrics = {
         "attack_catch_rate": (counts["attack_caught"] / counts["attack_total"]) if counts["attack_total"] else None,
         "benign_allow_rate": (counts["benign_allowed"] / counts["benign_total"]) if counts["benign_total"] else None,
+        "false_positive_rate": (
+            (counts["benign_total"] - counts["benign_allowed"]) / counts["benign_total"] if counts["benign_total"] else None
+        ),
         **counts,
     }
+    threshold_failures: list[str] = []
+    if args.min_detection is not None:
+        rate = metrics["attack_catch_rate"]
+        if rate is None or rate < args.min_detection:
+            actual = "n/a" if rate is None else f"{rate:.4f}"
+            threshold_failures.append(f"attack detection {actual} is below minimum {args.min_detection:.4f}")
+    if args.max_false_positive is not None:
+        rate = metrics["false_positive_rate"]
+        if rate is None or rate > args.max_false_positive:
+            actual = "n/a" if rate is None else f"{rate:.4f}"
+            threshold_failures.append(f"false-positive rate {actual} is above maximum {args.max_false_positive:.4f}")
     if args.json:
         print(
             json.dumps(
-                {"passed": passed, "failed": failed, "metrics": metrics, "tag_metrics": tag_metrics, "cases": rows},
+                {
+                    "passed": passed,
+                    "failed": failed,
+                    "threshold_failures": threshold_failures,
+                    "metrics": metrics,
+                    "tag_metrics": tag_metrics,
+                    "cases": rows,
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -165,6 +191,12 @@ def main() -> int:
             print(f"attack catch rate: {metrics['attack_caught']}/{metrics['attack_total']} = {metrics['attack_catch_rate']:.2%}")
         if metrics["benign_allow_rate"] is not None:
             print(f"benign allow rate: {metrics['benign_allowed']}/{metrics['benign_total']} = {metrics['benign_allow_rate']:.2%}")
+            print(
+                "false-positive rate: "
+                f"{metrics['benign_total'] - metrics['benign_allowed']}/{metrics['benign_total']} = {metrics['false_positive_rate']:.2%}"
+            )
+        for failure in threshold_failures:
+            print(f"FAIL threshold: {failure}")
         if tag_metrics:
             print("tag coverage:")
             for tag, tag_row in sorted(tag_metrics.items()):
@@ -178,7 +210,7 @@ def main() -> int:
                 f"capability={row['capability']:22} expect={row['expect']:15} "
                 f"decision={row['decision']:6} score={row['risk_score']:3} tags={tags} findings={findings}"
             )
-    return 0 if failed == 0 else 1
+    return 0 if failed == 0 and not threshold_failures else 1
 
 
 if __name__ == "__main__":
