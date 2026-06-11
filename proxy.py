@@ -1123,7 +1123,7 @@ def verify_audit_log(path: Path) -> dict[str, Any]:
     previous_hash = "0" * 64
     events = 0
     if not path.exists():
-        return {"ok": True, "events": 0, "errors": []}
+        return {"ok": True, "events": 0, "latest_hash": previous_hash, "errors": []}
 
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line_number, line in enumerate(fh, start=1):
@@ -1162,7 +1162,7 @@ def verify_audit_log(path: Path) -> dict[str, Any]:
                     }
                 )
             previous_hash = event_hash or expected_hash
-    return {"ok": not errors, "events": events, "errors": errors}
+    return {"ok": not errors, "events": events, "latest_hash": previous_hash, "errors": errors}
 
 
 class LLMInspector:

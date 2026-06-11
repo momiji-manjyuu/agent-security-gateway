@@ -1766,6 +1766,23 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(event["capability"], "delegate_web_research")
             self.assertEqual(event["run_id"], "run-allowed")
             self.assertEqual(event["task_id"], "task-1")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                gateway.export_audit_anchor_cli(audit_path)
+            anchor = json.loads(stdout.getvalue())
+            self.assertEqual(anchor["anchor_type"], "asg_audit_anchor")
+            self.assertEqual(anchor["latest_hash"], event["event_hash"])
+            self.assertEqual(anchor["line_count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                gateway.verify_audit_cli(audit_path, expect_anchor=anchor["latest_hash"])
+            verified = json.loads(stdout.getvalue())
+            self.assertTrue(verified["ok"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit):
+                gateway.verify_audit_cli(audit_path, expect_anchor="0" * 64)
 
     def test_kill_switch(self):
         with tempfile.TemporaryDirectory() as tmp:

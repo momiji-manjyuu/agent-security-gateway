@@ -3450,11 +3450,38 @@ def validate_config_cli(config_path: Path) -> None:
     )
 
 
-def verify_audit_cli(path: Path) -> None:
+def verify_audit_cli(path: Path, *, expect_anchor: str | None = None) -> None:
     result = security.verify_audit_log(path)
+    if expect_anchor is not None:
+        expected = expect_anchor.strip().lower()
+        actual = str(result.get("latest_hash", "")).lower()
+        if expected != actual:
+            result["ok"] = False
+            result.setdefault("errors", []).append(
+                {
+                    "error": "anchor_mismatch",
+                    "expected": expected,
+                    "actual": actual,
+                }
+            )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     if not result["ok"]:
         raise SystemExit(1)
+
+
+def export_audit_anchor_cli(path: Path) -> None:
+    result = security.verify_audit_log(path)
+    if not result["ok"]:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+    anchor = {
+        "anchor_type": "asg_audit_anchor",
+        "audit_path": str(path),
+        "latest_hash": result.get("latest_hash", "0" * 64),
+        "line_count": result.get("events", 0),
+        "timestamp": utc_now(),
+    }
+    print(json.dumps(anchor, ensure_ascii=False, sort_keys=True))
 
 
 def gc_artifacts_cli(config_path: Path, *, dry_run: bool, now_text: str | None = None) -> None:
@@ -3482,6 +3509,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("validate-config")
     p_verify = sub.add_parser("verify-audit")
     p_verify.add_argument("--path", type=Path)
+    p_verify.add_argument("--expect-anchor")
+    p_export_anchor = sub.add_parser("export-audit-anchor")
+    p_export_anchor.add_argument("--path", type=Path)
     p_gc = sub.add_parser("gc-artifacts")
     p_gc.add_argument("--dry-run", action="store_true")
     p_gc.add_argument("--now", help=argparse.SUPPRESS)
@@ -3503,7 +3533,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "validate-config":
         validate_config_cli(args.config)
     elif args.command == "verify-audit":
-        verify_audit_cli(args.path or expand_path(str(load_config(args.config)["audit_log"])))
+        verify_audit_cli(args.path or expand_path(str(load_config(args.config)["audit_log"])), expect_anchor=args.expect_anchor)
+    elif args.command == "export-audit-anchor":
+        export_audit_anchor_cli(args.path or expand_path(str(load_config(args.config)["audit_log"])))
     elif args.command == "gc-artifacts":
         gc_artifacts_cli(args.config, dry_run=args.dry_run, now_text=args.now)
     return 0
