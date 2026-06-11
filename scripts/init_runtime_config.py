@@ -151,6 +151,7 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
                     "return_audit_receipt": True,
                     "include_structured_extract": False,
                     "notify_on_block": True,
+                    "max_receipts_per_minute": 20,
                 },
                 "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
             },

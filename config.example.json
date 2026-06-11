@@ -364,7 +364,8 @@
         "forward_audit_receipt": true,
         "return_audit_receipt": true,
         "include_structured_extract": false,
-        "notify_on_block": true
+        "notify_on_block": true,
+        "max_receipts_per_minute": 20
       },
       "output_policy": {
         "block_secrets": true,

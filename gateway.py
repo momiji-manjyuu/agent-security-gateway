@@ -547,6 +547,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
                     errors.append(f"routes.{route_id}.report_policy.{field} must be a boolean")
             if report_policy.get("forward_audit_receipt") and kind not in {"http_json", "openai_chat_completions"}:
                 errors.append(f"routes.{route_id}.report_policy.forward_audit_receipt requires kind 'http_json' or 'openai_chat_completions'")
+            if "max_receipts_per_minute" in report_policy:
+                max_receipts, max_receipts_ok = parse_int(report_policy.get("max_receipts_per_minute"), default=0)
+                if not max_receipts_ok or max_receipts <= 0:
+                    errors.append(f"routes.{route_id}.report_policy.max_receipts_per_minute must be a positive integer")
         artifact_policy = route.get("artifact_policy", {})
         if artifact_policy is not None and not isinstance(artifact_policy, dict):
             errors.append(f"routes.{route_id}.artifact_policy must be an object")
@@ -1812,6 +1816,26 @@ def report_policy_notify_on_block(path: str, decision: RouteDecision) -> bool:
     return bool(policy.get("forward_audit_receipt", False))
 
 
+def check_report_receipt_rate_limit(path: str, verified: VerifiedAgent, decision: RouteDecision) -> None:
+    if path != "/v1/results":
+        return
+    policy = route_report_policy(decision.route)
+    if not policy.get("forward_audit_receipt"):
+        return
+    if "max_receipts_per_minute" not in policy:
+        return
+    max_receipts, ok = parse_int(policy.get("max_receipts_per_minute"), default=0)
+    if not ok or max_receipts <= 0:
+        raise GatewayError(403, "input_policy_denied", "route max_receipts_per_minute policy is invalid")
+    allowed, retry_after = security.RATE_LIMITER.check(
+        f"receipt:{decision.route_id}:{verified.agent_id}",
+        {"rate_limit": {"enabled": True}},
+        {"enabled": True, "window_seconds": 60, "max_requests": max_receipts},
+    )
+    if not allowed:
+        raise GatewayError(429, "rate_limited", f"rate limited; retry after {retry_after} seconds")
+
+
 def result_audit_receipt(
     *,
     request_id: str,
@@ -2949,6 +2973,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             forward_receipt = report_policy_enabled(self.path, decision, "forward_audit_receipt")
             return_receipt = report_policy_enabled(self.path, decision, "return_audit_receipt")
             notify_on_block = report_policy_notify_on_block(self.path, decision)
+            check_report_receipt_rate_limit(self.path, verified, decision)
             if inbound.scan.blocked:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,

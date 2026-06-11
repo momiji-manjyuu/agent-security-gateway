@@ -195,7 +195,10 @@ extract. The receipt also includes a short Japanese `summary_ja` generated from
 audit metadata so Mac/controller sessions can use a distinct human-readable
 title without receiving raw worker report text. If `notify_on_block` is not set, it defaults to true when
 `forward_audit_receipt` is true, so blocked/review-stopped reports can still
-notify the Mac with a safe discard receipt.
+notify the Mac with a safe discard receipt. Set
+`report_policy.max_receipts_per_minute` to rate-limit forwarded receipts per
+calling agent on that route; when omitted, receipt forwarding remains unlimited
+for compatibility.
 
 ```bash
 curl -s http://127.0.0.1:8788/v1/results \
@@ -243,7 +246,8 @@ Example Mac notification route:
     "forward_audit_receipt": true,
     "return_audit_receipt": true,
     "include_structured_extract": false,
-    "notify_on_block": true
+    "notify_on_block": true,
+    "max_receipts_per_minute": 20
   }
 }
 ```
