@@ -159,6 +159,7 @@
         "base_url": "http://mac-controller.internal:8642/v1",
         "path": "/chat/completions",
         "api_key_env": "MAC_HERMES_BACKEND_KEY",
+        "require_signature": false,
         "timeout_seconds": 120,
         "model_rewrite": "hermes-agent"
       },

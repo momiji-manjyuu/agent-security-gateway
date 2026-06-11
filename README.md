@@ -471,11 +471,24 @@ Backend requests include:
 - `X-ASG-Task-Id`
 - `X-ASG-Request-SHA256`
 - `X-ASG-Timestamp`
-- optional `X-ASG-Signature` when `ASG_BACKEND_HMAC_KEY` is set
+- `X-ASG-Signature` when `ASG_BACKEND_HMAC_KEY` is set, or when the route backend sets `require_signature: true`
 
 The gateway strips caller `Authorization` and uses only the backend key from `route.backend.api_key_env`.
 
-When HMAC signing is enabled, the signature covers a canonical string containing method, backend path, body SHA-256, agent ID, route ID, run ID, task ID, and timestamp. Backends should verify timestamp freshness, body hash, route ID, agent ID, and HMAC before trusting ASG headers.
+When HMAC signing is enabled, the signature is `sha256=<hex>` over this exact canonical string:
+
+```text
+POST
+<backend path>
+<body sha256 hex>
+<X-ASG-Agent-Id>
+<X-ASG-Route-Id>
+<X-ASG-Run-Id or empty>
+<X-ASG-Task-Id or empty>
+<X-ASG-Timestamp>
+```
+
+Set `backend.require_signature: true` on a route to fail closed if the configured `backend_hmac_key_env` value is missing. `validate-config` also fails when such a route is enabled and the HMAC key environment variable is unset. Backends should verify timestamp freshness, body hash, route ID, agent ID, and HMAC before trusting ASG headers.
 
 ## Run Scope
 
@@ -647,6 +660,8 @@ export ASG_RECEIPT_COLLECTOR_BIND="192.168.1.10"
 export ASG_RECEIPT_COLLECTOR_PORT="8789"
 export ASG_RECEIPT_COLLECTOR_STORE="$HOME/.agent-security-gateway/result-receipts.jsonl"
 export ASG_RECEIPT_COLLECTOR_TOKEN_FILE="$HOME/.agent-security-gateway/receipt-collector.token"
+export ASG_RECEIPT_COLLECTOR_HMAC_KEY="replace-with-the-shared-ASG-backend-HMAC-key"
+export ASG_RECEIPT_COLLECTOR_SIGNATURE_MAX_AGE_SECONDS="300"
 python3 scripts/result_receipt_collector.py serve
 ```
 
@@ -654,7 +669,10 @@ For the Hermes notification route, set the ASG route backend `api_key_env` to an
 environment variable containing the Mac Hermes API key. For the optional JSONL
 collector route, set it to the collector token instead. The collector accepts
 only `POST /asg/result-receipts` payloads whose `receipt_type` is
-`asg_result_audit`.
+`asg_result_audit`. If `ASG_RECEIPT_COLLECTOR_HMAC_KEY` is set, the collector
+requires `X-ASG-Signature`, `X-ASG-Timestamp`, and `X-ASG-Request-SHA256`,
+rejects stale signatures, and verifies the same canonical string ASG uses for
+backend HMAC signing.
 
 Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 

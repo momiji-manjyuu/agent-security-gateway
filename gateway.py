@@ -567,6 +567,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
             if not isinstance(backend, dict):
                 errors.append(f"routes.{route_id}.backend must be an object")
             else:
+                if "require_signature" in backend and not isinstance(backend.get("require_signature"), bool):
+                    errors.append(f"routes.{route_id}.backend.require_signature must be a boolean")
+                if backend.get("require_signature"):
+                    hmac_env = str(cfg.get("backend_hmac_key_env", "") or "")
+                    if not hmac_env:
+                        errors.append(f"routes.{route_id}.backend.require_signature requires backend_hmac_key_env")
+                    elif not os.environ.get(hmac_env, ""):
+                        errors.append(f"routes.{route_id}.backend.require_signature requires environment variable {hmac_env}")
                 mode = str(backend.get("mode", "http"))
                 if mode not in {"http", "command"}:
                     errors.append(f"routes.{route_id}.backend.mode must be 'http' or 'command'")
@@ -1333,22 +1341,46 @@ def backend_headers(
         headers["Authorization"] = "Bearer " + api_key
     hmac_env = str(cfg.get("backend_hmac_key_env", "") or "")
     hmac_key = os.environ.get(hmac_env, "") if hmac_env else ""
+    if backend.get("require_signature") and not hmac_key:
+        raise GatewayError(500, "backend_signature_required", "backend signature key is required for this route")
     if hmac_key:
-        canonical = "\n".join(
-            [
-                "POST",
-                backend_path or "/",
-                body_sha256,
-                headers["X-ASG-Agent-Id"],
-                headers["X-ASG-Route-Id"],
-                headers.get("X-ASG-Run-Id", ""),
-                headers.get("X-ASG-Task-Id", ""),
-                timestamp,
-            ]
+        canonical = backend_signature_canonical(
+            "POST",
+            backend_path or "/",
+            body_sha256,
+            headers["X-ASG-Agent-Id"],
+            headers["X-ASG-Route-Id"],
+            headers.get("X-ASG-Run-Id", ""),
+            headers.get("X-ASG-Task-Id", ""),
+            timestamp,
         )
         signature = hmac.new(hmac_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
         headers["X-ASG-Signature"] = "sha256=" + signature
     return headers
+
+
+def backend_signature_canonical(
+    method: str,
+    backend_path: str,
+    body_sha256: str,
+    agent_id: str,
+    route_id: str,
+    run_id: str,
+    task_id: str,
+    timestamp: str,
+) -> str:
+    return "\n".join(
+        [
+            method.upper(),
+            backend_path or "/",
+            body_sha256,
+            agent_id,
+            route_id,
+            run_id,
+            task_id,
+            timestamp,
+        ]
+    )
 
 
 def backend_url(backend: dict[str, Any], default_path: str) -> str:

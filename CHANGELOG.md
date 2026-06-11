@@ -10,6 +10,7 @@
 - Split non-approvable action guard categories from approvable categories and require category coverage in approval records.
 - Enforced route input policy fields including `max_messages`, `require_message_type`, `require_structured_task`, `allow_raw_external_content`, `disallow_external_urls`, and `max_batch_size`.
 - Added `/readyz` and canonical backend HMAC signing over method, path, body hash, ASG identity headers, and timestamp.
+- Added route-level `backend.require_signature` so selected backends fail closed when `backend_hmac_key_env` is unset, and added ASG HMAC verification to the result receipt collector.
 - Added `/v1/results` audit receipt forwarding for Mac/controller notification routes so worker reports can trigger follow-up checks without forwarding raw report content.
 - Added ASG-managed artifact quarantine storage with `/v1/artifacts`, `/v1/artifacts/{id}/metadata`, and `/v1/artifacts/{id}/content`; artifacts move from `unchecked` to `verified`, `needs_review`, or `blocked`, and content retrieval is forced through route/capability/taint policy.
 - Changed new artifact manifests and quarantine indexes to UTC date-partitioned storage while keeping read fallback for the earlier flat artifact layout.

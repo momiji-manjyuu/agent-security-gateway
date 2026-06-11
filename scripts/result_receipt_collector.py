@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
+import hashlib
+import hmac
 import http.server
 import json
 import os
 import stat
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -36,6 +40,8 @@ class CollectorConfig:
     store_path: Path
     token: str
     max_body_bytes: int
+    hmac_key: str
+    signature_max_age_seconds: int
 
 
 def _env(name: str, default: str = "") -> str:
@@ -76,6 +82,8 @@ def load_config_from_env() -> CollectorConfig:
         store_path=Path(_env("ASG_RECEIPT_COLLECTOR_STORE", "~/.agent-security-gateway/result-receipts.jsonl")).expanduser(),
         token=_read_token(),
         max_body_bytes=_parse_int("ASG_RECEIPT_COLLECTOR_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, minimum=1, maximum=10 * 1024 * 1024),
+        hmac_key=_env("ASG_RECEIPT_COLLECTOR_HMAC_KEY"),
+        signature_max_age_seconds=_parse_int("ASG_RECEIPT_COLLECTOR_SIGNATURE_MAX_AGE_SECONDS", 300, minimum=1, maximum=86_400),
     )
 
 
@@ -85,6 +93,40 @@ def json_error(code: str, message: str, request_id: str) -> dict[str, Any]:
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_timestamp(value: str) -> dt.datetime:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def backend_signature_canonical(
+    method: str,
+    backend_path: str,
+    body_sha256: str,
+    agent_id: str,
+    route_id: str,
+    run_id: str,
+    task_id: str,
+    timestamp: str,
+) -> str:
+    return "\n".join(
+        [
+            method.upper(),
+            backend_path or "/",
+            body_sha256,
+            agent_id,
+            route_id,
+            run_id,
+            task_id,
+            timestamp,
+        ]
+    )
 
 
 def append_receipt(config: CollectorConfig, record: dict[str, Any]) -> None:
@@ -114,7 +156,8 @@ class CollectorHandler(http.server.BaseHTTPRequestHandler):
             if self.path != "/asg/result-receipts":
                 raise CollectorError(404, "not_found", "not found")
             self.verify_auth(config)
-            payload = self.read_json_body(config)
+            raw_body, payload = self.read_json_body(config)
+            self.verify_signature(config, raw_body)
             if payload.get("receipt_type") != "asg_result_audit":
                 raise CollectorError(400, "invalid_receipt", "receipt_type must be asg_result_audit")
             record = {
@@ -143,7 +186,42 @@ class CollectorHandler(http.server.BaseHTTPRequestHandler):
         if self.headers.get("Authorization", "") != expected:
             raise CollectorError(401, "unauthorized", "missing or invalid bearer token")
 
-    def read_json_body(self, config: CollectorConfig) -> dict[str, Any]:
+    def verify_signature(self, config: CollectorConfig, raw_body: bytes) -> None:
+        if not config.hmac_key:
+            return
+        signature = self.headers.get("X-ASG-Signature", "")
+        if not signature:
+            raise CollectorError(401, "signature_required", "missing ASG signature")
+        timestamp = self.headers.get("X-ASG-Timestamp", "")
+        if not timestamp:
+            raise CollectorError(401, "signature_required", "missing ASG timestamp")
+        body_sha256 = hashlib.sha256(raw_body).hexdigest()
+        header_body_sha256 = self.headers.get("X-ASG-Request-SHA256", "")
+        if not hmac.compare_digest(header_body_sha256, body_sha256):
+            raise CollectorError(403, "signature_invalid", "request body hash does not match ASG header")
+        try:
+            parsed_timestamp = parse_timestamp(timestamp)
+        except ValueError as exc:
+            raise CollectorError(403, "signature_invalid", "invalid ASG timestamp") from exc
+        age = abs((dt.datetime.now(dt.timezone.utc) - parsed_timestamp).total_seconds())
+        if age > config.signature_max_age_seconds:
+            raise CollectorError(403, "signature_stale", "ASG signature timestamp is outside the allowed freshness window")
+        path = urllib.parse.urlsplit(self.path).path or "/"
+        canonical = backend_signature_canonical(
+            "POST",
+            path,
+            body_sha256,
+            self.headers.get("X-ASG-Agent-Id", ""),
+            self.headers.get("X-ASG-Route-Id", ""),
+            self.headers.get("X-ASG-Run-Id", ""),
+            self.headers.get("X-ASG-Task-Id", ""),
+            timestamp,
+        )
+        expected = "sha256=" + hmac.new(config.hmac_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise CollectorError(403, "signature_invalid", "ASG signature is invalid")
+
+    def read_json_body(self, config: CollectorConfig) -> tuple[bytes, dict[str, Any]]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
@@ -157,7 +235,7 @@ class CollectorHandler(http.server.BaseHTTPRequestHandler):
             raise CollectorError(400, "invalid_json", "request body must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise CollectorError(400, "invalid_json", "request body must be a JSON object")
-        return payload
+        return raw, payload
 
     def write_json(self, status: int, body: dict[str, Any]) -> None:
         encoded = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -202,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
                     "port": config.port,
                     "store_path": str(config.store_path),
                     "auth_required": bool(config.token),
+                    "signature_required": bool(config.hmac_key),
+                    "signature_max_age_seconds": config.signature_max_age_seconds,
                 },
                 sort_keys=True,
             )
