@@ -11,7 +11,7 @@
   "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
   "max_body_bytes": 524288,
   "port": 8788,
-  "require_known_run_id": false,
+  "require_known_run_id": true,
   "review_risk_score": 4,
   "agents": {
     "mac_gpt55": {

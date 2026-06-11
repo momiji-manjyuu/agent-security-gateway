@@ -8,6 +8,7 @@
     "retention_days": 90
   },
   "kill_switch_file": "~/.agent-security-gateway/KILL_SWITCH",
+  "require_known_run_id": true,
   "agents": {
     "mac_gpt55": {
       "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",

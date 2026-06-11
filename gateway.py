@@ -446,6 +446,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     max_body, max_body_ok = parse_int(cfg.get("max_body_bytes"), default=524_288)
     if not max_body_ok or max_body <= 0:
         errors.append("max_body_bytes must be a positive integer")
+    if "require_known_run_id" in cfg and not isinstance(cfg.get("require_known_run_id"), bool):
+        errors.append("require_known_run_id must be a boolean")
     artifact_store = cfg.get("artifact_store", {})
     if artifact_store is not None and not isinstance(artifact_store, dict):
         errors.append("artifact_store must be an object")
@@ -644,6 +646,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
     if errors:
         raise ValueError("invalid config: " + "; ".join(errors))
+
+
+def config_warnings(cfg: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    if cfg.get("require_known_run_id") is False:
+        warnings.append("require_known_run_id is false; unknown run_id values are allowed with an audit warning")
+    return warnings
 
 
 def parse_datetime(value: str) -> dt.datetime:
@@ -3382,7 +3391,18 @@ def inspect_cli(config_path: Path, text: str) -> None:
 
 def validate_config_cli(config_path: Path) -> None:
     cfg = load_config(config_path)
-    print(json.dumps({"ok": True, "app": APP_NAME, "config": str(config_path), "routes": len(cfg.get("routes") or {})}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "app": APP_NAME,
+                "config": str(config_path),
+                "routes": len(cfg.get("routes") or {}),
+                "warnings": config_warnings(cfg),
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def verify_audit_cli(path: Path) -> None:

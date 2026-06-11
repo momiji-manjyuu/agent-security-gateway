@@ -492,7 +492,7 @@ Set `backend.require_signature: true` on a route to fail closed if the configure
 
 ## Run Scope
 
-If `metadata.run_id` or `X-ASG-Run-Id` is present and known, the gateway applies `allowed_routes`, `denied_routes`, and `expires_at`. Unknown run IDs are allowed with an audit warning unless `require_known_run_id` is true. A route can set `require_run_id: true`.
+If `metadata.run_id` or `X-ASG-Run-Id` is present and known, the gateway applies `allowed_routes`, `denied_routes`, and `expires_at`. Unknown run IDs are allowed with an audit warning unless `require_known_run_id` is true. New generated configs and examples set `require_known_run_id: true`; the code default remains false for compatibility, and `validate-config` reports a warning when a config leaves it false. A route can set `require_run_id: true`.
 
 ## Taint Tracking
 

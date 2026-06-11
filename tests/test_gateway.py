@@ -1,4 +1,6 @@
 import base64
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -15,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import gateway  # noqa: E402
 import proxy as security  # noqa: E402
+import scripts.init_runtime_config as init_runtime_config  # noqa: E402
 
 
 class FakeBackendHandler(gateway.http.server.BaseHTTPRequestHandler):
@@ -573,6 +576,43 @@ class GatewayTests(unittest.TestCase):
             status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="run-expired"))
             self.assertEqual(status, 403)
             self.assert_error(body, "run_expired")
+
+    def test_validate_config_cli_warns_when_require_known_run_id_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = False
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps(cfg), encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                gateway.validate_config_cli(config_path)
+            body = json.loads(stdout.getvalue())
+            self.assertIn("require_known_run_id is false", body["warnings"][0])
+
+    def test_validate_config_rejects_non_boolean_require_known_run_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = "false"
+            with self.assertRaisesRegex(ValueError, "require_known_run_id must be a boolean"):
+                gateway.validate_config(cfg)
+
+    def test_init_runtime_config_generates_require_known_run_id_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = init_runtime_config.argparse.Namespace(
+                bind="127.0.0.1",
+                port=8788,
+                runtime_dir=Path(tmp),
+                external_cidr=[],
+                enable_forward=False,
+                home_lab=False,
+                pi_backend_url="http://pi1-agent.internal:8000/v1",
+                knowledge_backend_url="http://ubuntu1-knowledge.internal:8801",
+                image_backend_url="http://windows-image.internal:8188",
+                mac_hermes_backend_url="http://mac-controller.internal:8642/v1",
+                mac_hermes_model="hermes-agent",
+            )
+            cfg = init_runtime_config.build_config(args, "mac-token", "pi-token", "human-token")
+            self.assertIs(cfg["require_known_run_id"], True)
 
     def test_taint_policy(self):
         with tempfile.TemporaryDirectory() as tmp:

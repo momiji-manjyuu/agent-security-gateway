@@ -63,6 +63,7 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
             "audit_log": str(args.runtime_dir / "audit.jsonl"),
             "kill_switch_file": str(args.runtime_dir / "KILL_SWITCH"),
             "approval_store": str(args.runtime_dir / "approvals.jsonl"),
+            "require_known_run_id": True,
         }
     )
     cfg["agents"] = {
