@@ -706,6 +706,31 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(status, 403)
             self.assert_error(body, "input_policy_denied")
 
+    def test_x_research_route_rejects_control_zero_width_and_bidi_text(self):
+        cases = [
+            {"query": "OpenAI\u200b agent security"},
+            {"query": "OpenAI\u202e agent security"},
+            {"query": "OpenAI\x1f agent security"},
+            {"query": "OpenAI\nagent security"},
+            {"question": "Find posts about\u2066 agent security"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            for override in cases:
+                with self.subTest(override=override):
+                    payload = self.x_research_payload(**override)
+                    status, body = self.request_json(
+                        base,
+                        "/v1/tasks",
+                        payload,
+                        token="pi-token-1234567890",
+                        capability="request_x_research",
+                        route="mac.x_research.request",
+                    )
+                    self.assertEqual(status, 403)
+                    self.assert_error(body, "input_policy_denied")
+
     def test_input_guard_and_action_guard_blocks(self):
         cases = [
             ({"target_url": "https://example.com"}, "blocked_by_action_guard"),

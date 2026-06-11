@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -963,11 +964,30 @@ def policy_positive_int(policy: dict[str, Any], field: str, default: int) -> int
     return value
 
 
+def x_research_text_has_forbidden_control(value: str) -> bool:
+    return any(unicodedata.category(ch) in {"Cc", "Cf"} for ch in value)
+
+
 def require_short_single_line_string(value: Any, field: str, max_chars: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise GatewayError(403, "input_policy_denied", f"x_research_request.{field} must be a non-empty string")
     if "\r" in value or "\n" in value:
         raise GatewayError(403, "input_policy_denied", f"x_research_request.{field} must be a single line")
+    cleaned = value.strip()
+    if len(cleaned) > max_chars:
+        raise GatewayError(403, "input_policy_denied", f"x_research_request.{field} exceeds {max_chars} characters")
+    return cleaned
+
+
+def require_x_research_query_text(value: Any, field: str, max_chars: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise GatewayError(403, "input_policy_denied", f"x_research_request.{field} must be a non-empty string")
+    if x_research_text_has_forbidden_control(value):
+        raise GatewayError(
+            403,
+            "input_policy_denied",
+            f"x_research_request.{field} contains disallowed control or format characters",
+        )
     cleaned = value.strip()
     if len(cleaned) > max_chars:
         raise GatewayError(403, "input_policy_denied", f"x_research_request.{field} exceeds {max_chars} characters")
@@ -997,9 +1017,9 @@ def enforce_x_research_request_policy(payload: dict[str, Any], decision: RouteDe
     if max_results_limit > X_RESEARCH_HARD_MAX_RESULTS:
         raise GatewayError(403, "input_policy_denied", f"route max_x_results policy must be at most {X_RESEARCH_HARD_MAX_RESULTS}")
 
-    require_short_single_line_string(req.get("query"), "query", max_query_chars)
+    require_x_research_query_text(req.get("query"), "query", max_query_chars)
     if "question" in req:
-        require_short_single_line_string(req.get("question"), "question", max_question_chars)
+        require_x_research_query_text(req.get("question"), "question", max_question_chars)
 
     if "max_results" in req:
         if isinstance(req.get("max_results"), bool):
