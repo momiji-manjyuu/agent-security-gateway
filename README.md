@@ -750,6 +750,7 @@ Run tests:
 
 ```bash
 python3 -m unittest discover -s tests
+python3 scripts/eval_redteam.py --min-detection 1.0 --max-false-positive 0.0
 ```
 
 ## Migration From agent-security-proxy
