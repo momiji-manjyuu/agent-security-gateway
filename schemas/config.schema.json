@@ -122,7 +122,8 @@
             "inspect_only",
             "openai_chat_completions",
             "http_json",
-            "command"
+            "command",
+            "artifact_review"
           ]
         },
         "aliases": {
@@ -147,6 +148,11 @@
             "require_signature": {
               "type": "boolean",
               "default": false
+            },
+            "max_review_chars": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 40000
             }
           }
         },

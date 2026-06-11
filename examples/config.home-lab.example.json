@@ -14,8 +14,14 @@
       "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "trust_tier": "privileged_core",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.10.10/32"],
-      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "download_artifact"],
-      "allowed_routes": ["security.inspect_only", "pi.web_research.chat", "ubuntu1.knowledge.search_trusted", "security.artifacts.download"]
+      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "download_artifact", "review_artifact"],
+      "allowed_routes": [
+        "security.inspect_only",
+        "pi.web_research.chat",
+        "ubuntu1.knowledge.search_trusted",
+        "security.artifacts.download",
+        "security.artifacts.review_summary"
+      ]
     },
     "pi_research_1": {
       "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -80,6 +86,29 @@
       "required_capability": "download_artifact",
       "input_policy": {
         "accepted_taint": ["untrusted_web", "untrusted_pdf", "untrusted_github", "sandbox_output", "model_output", "promoted_knowledge"],
+        "allow_missing_taint": false
+      },
+      "artifact_policy": {
+        "allowed_statuses": ["verified"]
+      }
+    },
+    "security.artifacts.review_summary": {
+      "kind": "artifact_review",
+      "aliases": ["asg/artifacts-review-summary"],
+      "backend": {
+        "mode": "http",
+        "base_url": "http://mac-controller.internal:8642/v1",
+        "path": "/chat/completions",
+        "api_key_env": "MAC_ARTIFACT_REVIEW_BACKEND_KEY",
+        "timeout_seconds": 120,
+        "model_rewrite": "local-artifact-reviewer",
+        "max_tokens": 800,
+        "max_review_chars": 40000
+      },
+      "allowed_callers": ["mac_gpt55"],
+      "required_capability": "review_artifact",
+      "input_policy": {
+        "accepted_taint": ["untrusted_web", "untrusted_pdf", "untrusted_github", "sandbox_output", "model_output"],
         "allow_missing_taint": false
       },
       "artifact_policy": {
