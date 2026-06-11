@@ -71,6 +71,7 @@ class ResultReceiptCollectorTests(unittest.TestCase):
             bind="127.0.0.1",
             port=0,
             store_path=store_path,
+            anchor_store_path=store_path.with_name("audit-anchors.jsonl"),
             token="collector-token",
             max_body_bytes=8192,
             hmac_key="",
@@ -112,6 +113,40 @@ class ResultReceiptCollectorTests(unittest.TestCase):
             status, body = self.request_json(base, "/asg/result-receipts", {"ok": True})
             self.assertEqual(status, 400)
             self.assertEqual(body["error"]["code"], "invalid_receipt")
+
+    def test_stores_valid_audit_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_store = Path(tmp) / "receipts.jsonl"
+            anchor_store = Path(tmp) / "anchors.jsonl"
+            config = self.make_config(receipt_store)
+            config = collector.dataclasses.replace(config, anchor_store_path=anchor_store)
+            base = self.start_collector(config)
+            payload = {
+                "anchor_type": "asg_audit_anchor",
+                "latest_hash": "a" * 64,
+                "line_count": 12,
+                "timestamp": "2026-06-11T00:00:00+00:00",
+            }
+            status, body = self.request_json(base, "/asg/audit-anchors", payload)
+            self.assertEqual(status, 200)
+            self.assertTrue(body["stored"])
+            record = json.loads(anchor_store.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["anchor"]["latest_hash"], "a" * 64)
+            self.assertEqual(record["anchor"]["line_count"], 12)
+            self.assertFalse(receipt_store.exists())
+
+    def test_rejects_invalid_audit_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self.start_collector(self.make_config(Path(tmp) / "receipts.jsonl"))
+            payload = {
+                "anchor_type": "asg_audit_anchor",
+                "latest_hash": "not-a-hash",
+                "line_count": 1,
+                "timestamp": "2026-06-11T00:00:00+00:00",
+            }
+            status, body = self.request_json(base, "/asg/audit-anchors", payload)
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"]["code"], "invalid_anchor")
 
     def signed_headers(
         self,

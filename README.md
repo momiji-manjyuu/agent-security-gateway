@@ -580,6 +580,46 @@ Verify an audit log:
 python3 gateway.py verify-audit --path ~/.agent-security-gateway/audit.jsonl
 ```
 
+Export the current off-host anchor payload:
+
+```bash
+python3 gateway.py --config ~/.agent-security-gateway/config.json export-audit-anchor
+```
+
+The anchor JSON contains `latest_hash`, `line_count`, and `timestamp`. To verify
+an audit log against a previously stored anchor:
+
+```bash
+python3 gateway.py verify-audit \
+  --path ~/.agent-security-gateway/audit.jsonl \
+  --expect-anchor <previous-latest_hash>
+```
+
+Example cron entry to push anchors from an ASG host to a Mac collector every
+five minutes:
+
+```cron
+*/5 * * * * cd /path/to/agent-security-gateway && python3 gateway.py --config /home/user/.agent-security-gateway/config.json export-audit-anchor | curl -fsS http://mac-controller.internal:8789/asg/audit-anchors -H "Authorization: Bearer $(cat /home/user/.agent-security-gateway/receipt-collector.token)" -H "Content-Type: application/json" --data-binary @-
+```
+
+Example user systemd timer shape:
+
+```ini
+# ~/.config/systemd/user/asg-audit-anchor-push.service
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/agent-security-gateway
+ExecStart=/bin/sh -c 'python3 gateway.py --config /home/user/.agent-security-gateway/config.json export-audit-anchor | curl -fsS http://mac-controller.internal:8789/asg/audit-anchors -H "Authorization: Bearer $(cat /home/user/.agent-security-gateway/receipt-collector.token)" -H "Content-Type: application/json" --data-binary @-'
+
+# ~/.config/systemd/user/asg-audit-anchor-push.timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
 ## Quick Start
 
 ```bash
@@ -665,6 +705,7 @@ storage instead of Hermes notification:
 export ASG_RECEIPT_COLLECTOR_BIND="192.168.1.10"
 export ASG_RECEIPT_COLLECTOR_PORT="8789"
 export ASG_RECEIPT_COLLECTOR_STORE="$HOME/.agent-security-gateway/result-receipts.jsonl"
+export ASG_RECEIPT_COLLECTOR_ANCHOR_STORE="$HOME/.agent-security-gateway/audit-anchors.jsonl"
 export ASG_RECEIPT_COLLECTOR_TOKEN_FILE="$HOME/.agent-security-gateway/receipt-collector.token"
 export ASG_RECEIPT_COLLECTOR_HMAC_KEY="replace-with-the-shared-ASG-backend-HMAC-key"
 export ASG_RECEIPT_COLLECTOR_SIGNATURE_MAX_AGE_SECONDS="300"
@@ -678,7 +719,9 @@ only `POST /asg/result-receipts` payloads whose `receipt_type` is
 `asg_result_audit`. If `ASG_RECEIPT_COLLECTOR_HMAC_KEY` is set, the collector
 requires `X-ASG-Signature`, `X-ASG-Timestamp`, and `X-ASG-Request-SHA256`,
 rejects stale signatures, and verifies the same canonical string ASG uses for
-backend HMAC signing.
+backend HMAC signing. The collector also accepts authenticated
+`POST /asg/audit-anchors` requests and stores them append-only in
+`ASG_RECEIPT_COLLECTOR_ANCHOR_STORE`.
 
 Common error codes include `unauthorized`, `client_ip_denied`, `capability_required`, `capability_denied`, `route_required`, `route_conflict`, `unknown_route`, `unknown_route_alias`, `route_denied`, `caller_not_allowed`, `run_scope_denied`, `run_expired`, `taint_denied`, `input_policy_denied`, `blocked_by_input_guard`, `manual_review_required`, `blocked_by_action_guard`, `approval_required`, `self_approval_denied`, `backend_error`, `backend_timeout`, `blocked_by_output_guard`, `rate_limited`, `kill_switch_active`, `request_too_large`, and `invalid_json`.
 
