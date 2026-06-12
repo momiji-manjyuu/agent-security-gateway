@@ -507,6 +507,85 @@ curl -s http://127.0.0.1:8788/v1/runs \
 
 The response returns the `run_id`, `expires_at`, `allowed_routes`, `denied_routes`, and `allowed_callers`. If `run_id` is omitted, ASG generates `run_<32hex>`. A supplied `run_id` must match `^[A-Za-z0-9._-]{1,128}$`. `allowed_routes` is required and must reference configured routes. `denied_routes` and `allowed_callers` are optional string arrays. Exactly one of `ttl_seconds` or `expires_at` is required, and the resulting expiry cannot exceed `run_store.max_ttl_seconds`, which defaults to 604800 seconds.
 
+## Quarantined Artifact Reviewer (Isolated Reader)
+
+The `local-artifact-reviewer` backend is the isolated reader for the
+`artifact_review` route. It must expose an OpenAI-compatible
+`POST /chat/completions` endpoint, and the route's `backend.model_rewrite`
+must be `local-artifact-reviewer` so ASG and the backend agree on the model
+contract.
+
+Reviewer backend contract:
+
+- Disable tools and function calling. The reviewer must not receive or execute
+  tools, tool schemas, function calls, command execution, browser access, or
+  other side effects.
+- Run with no Web or network egress. The reviewer reads only the artifact text
+  ASG sends in the request.
+- Keep requests stateless. Do not persist chat memory, retrieval context, or
+  prior artifact content between requests.
+- Use deterministic inference. ASG sends `temperature: 0`; backend wrappers
+  should not override it upward.
+- Return exactly one JSON object matching
+  `schemas/reviewed_summary.schema.json`: `claims`, `source`,
+  `injection_flags`, and `confidence`. ASG overwrites `source.derived_from`
+  with the source artifact ID and checks `confidence` is between 0 and 1.
+- Keep the reviewer separate from Web-research workers. The model that reads
+  quarantined artifacts must not share context or memory with the worker that
+  collected them. A dedicated isolated Qwen instance is recommended.
+- Make the backend reachable only from ASG, using host firewall rules, private
+  network segmentation, WireGuard, mTLS, or an equivalent boundary.
+
+ASG builds the reviewer request with a fixed system prompt that says
+`artifact_text` is untrusted data, not instructions. The controller does not
+read the artifact's raw text; it receives only the schema-validated structured
+summary from the tool-less reviewer. This Dual-LLM pattern keeps prompt
+injection out of the controller context during knowledge promotion. The output
+taint is always `reviewed_untrusted_summary`. If the backend returns free-form
+text, tool calls, malformed JSON, or a schema-invalid object, ASG fails closed
+to `review_status: "needs_review"` and does not forward backend prose.
+
+Production enablement runbook:
+
+1. Start the reviewer backend as `local-artifact-reviewer` with tools disabled,
+   no egress, stateless request handling, and access restricted to ASG.
+2. Set `MAC_ARTIFACT_REVIEW_BACKEND_KEY` in the ASG service environment. This
+   is the backend credential ASG looks up by route config; callers do not pass
+   backend credentials.
+3. Point `security.artifacts.review_summary.backend.base_url` to the reviewer,
+   for example `http://mac-controller.internal:8642/v1`, and keep
+   `artifact_policy.allowed_statuses: ["verified"]`.
+4. Grant the controller agent, such as `mac_gpt55`, the `review_artifact`
+   capability and `security.artifacts.review_summary` route. In the home-lab
+   example this is already present. Keep the human review route
+   `security.artifacts.review`, which accesses `needs_review`, limited to
+   `human_operator`.
+5. Restart ASG, then run the live smoke test:
+
+   ```bash
+   python3 scripts/smoke_artifact_review.py \
+     --base-url http://127.0.0.1:8788 \
+     --controller-token-file ~/.agent-security-gateway/tokens/mac_gpt55.token \
+     --submit-token-file ~/.agent-security-gateway/tokens/pi_research_1.token
+   ```
+
+   The smoke script also accepts `ASG_BASE_URL`, `ASG_CONTROLLER_TOKEN`, and
+   `ASG_SUBMIT_TOKEN`; token values are never printed.
+
+Operational flow for controllers and workers:
+
+1. A worker submits unverified text to `POST /v1/artifacts` through
+   `security.artifacts.submit`.
+2. The worker or controller confirms the returned artifact status is
+   `verified`.
+3. The controller calls `security.artifacts.review_summary` with
+   `message_type: "artifact_review_request"` and only
+   `artifact_ref.artifact_id`.
+4. The controller treats only `review_status: "verified"` and the returned
+   reviewed-summary fields (`summary` in the API response) as usable output.
+   `needs_review` is escalated to the human review route. The controller must
+   not directly download or read the raw artifact text for knowledge promotion.
+
 ## Backend Forwarding
 
 Route kinds:
