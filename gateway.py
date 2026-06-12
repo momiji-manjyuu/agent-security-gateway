@@ -46,6 +46,8 @@ DEFAULT_CONFIG_PATH = RUNTIME_DIR / "config.json"
 DEFAULT_AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
 DEFAULT_KILL_SWITCH = RUNTIME_DIR / "KILL_SWITCH"
 DEFAULT_APPROVAL_STORE = RUNTIME_DIR / "approvals.jsonl"
+DEFAULT_RUN_STORE = RUNTIME_DIR / "runs.jsonl"
+DEFAULT_RUN_MAX_TTL_SECONDS = 604_800
 DEFAULT_ARTIFACT_STORE = RUNTIME_DIR / "artifacts"
 DEFAULT_ARTIFACT_RETENTION_DAYS = 90
 MAX_TIMEOUT_SECONDS = 600
@@ -149,6 +151,8 @@ ARTIFACT_STATUSES = {"unchecked", "verified", "needs_review", "blocked"}
 ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-f0-9]{32}$")
 ARTIFACT_SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 ARTIFACT_PARTITION_PATTERN = re.compile(r"^\d{4}/\d{2}/\d{2}$")
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+RUN_REASON_MAX_CHARS = 200
 ARTIFACT_TEXT_MEDIA_TYPES = {
     "application/json",
     "application/ld+json",
@@ -222,6 +226,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "kill_switch_file": str(DEFAULT_KILL_SWITCH),
     "audit_log": str(DEFAULT_AUDIT_PATH),
     "approval_store": str(DEFAULT_APPROVAL_STORE),
+    "run_store": {
+        "path": str(DEFAULT_RUN_STORE),
+        "max_ttl_seconds": DEFAULT_RUN_MAX_TTL_SECONDS,
+    },
     "artifact_store": {
         "path": str(DEFAULT_ARTIFACT_STORE),
         "max_artifact_bytes": 10_485_760,
@@ -361,6 +369,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "block_internal_paths": True,
             },
         },
+        "security.runs.register": {
+            "kind": "inspect_only",
+            "description": "Register a short-lived run scope before dispatching work to agents.",
+            "aliases": ["asg/runs-register"],
+            "allowed_callers": ["mac_gpt55"],
+            "required_capability": "register_run",
+            "input_policy": {
+                "accepted_taint": ["trusted_instruction", "human_approved"],
+                "allow_missing_taint": True,
+            },
+            "output_policy": {
+                "block_secrets": True,
+                "block_private_urls": True,
+                "block_internal_paths": True,
+            },
+        },
     },
     "runs": {},
 }
@@ -466,6 +490,20 @@ def validate_config(cfg: dict[str, Any]) -> None:
         errors.append("max_body_bytes must be a positive integer")
     if "require_known_run_id" in cfg and not isinstance(cfg.get("require_known_run_id"), bool):
         errors.append("require_known_run_id must be a boolean")
+    run_store = cfg.get("run_store", {})
+    if run_store is not None and not isinstance(run_store, (dict, str)):
+        errors.append("run_store must be a path string or an object")
+        run_store = {}
+    if isinstance(run_store, str):
+        if not run_store.strip():
+            errors.append("run_store must be a non-empty path string")
+    elif isinstance(run_store, dict):
+        store_path = run_store.get("path", str(DEFAULT_RUN_STORE))
+        if not isinstance(store_path, str) or not store_path.strip():
+            errors.append("run_store.path must be a non-empty string")
+        max_ttl, max_ttl_ok = parse_int(run_store.get("max_ttl_seconds", DEFAULT_RUN_MAX_TTL_SECONDS), default=DEFAULT_RUN_MAX_TTL_SECONDS)
+        if not max_ttl_ok or max_ttl <= 0:
+            errors.append("run_store.max_ttl_seconds must be a positive integer")
     artifact_store = cfg.get("artifact_store", {})
     if artifact_store is not None and not isinstance(artifact_store, dict):
         errors.append("artifact_store must be an object")
@@ -862,19 +900,18 @@ def enforce_route_policy(verified: VerifiedAgent, decision: RouteDecision, cfg: 
     if capability != required and capability not in route_capabilities:
         raise GatewayError(403, "capability_denied", f"route '{decision.route_id}' requires capability '{required}'")
 
-    enforce_run_scope(decision, cfg)
+    enforce_run_scope(decision, cfg, verified.agent_id)
     enforce_taint_policy(decision)
 
 
-def enforce_run_scope(decision: RouteDecision, cfg: dict[str, Any]) -> None:
+def enforce_run_scope(decision: RouteDecision, cfg: dict[str, Any], agent_id: str | None = None) -> None:
     route = decision.route
     run_id = decision.run_id
     if route.get("require_run_id") and not run_id:
         raise GatewayError(403, "run_scope_denied", f"route '{decision.route_id}' requires run_id")
     if not run_id:
         return
-    runs = cfg.get("runs") or {}
-    run = runs.get(run_id)
+    run, run_source = resolve_run_scope_record(cfg, run_id)
     if run is None:
         if cfg.get("require_known_run_id"):
             raise GatewayError(403, "run_scope_denied", f"unknown run_id '{run_id}'")
@@ -890,6 +927,9 @@ def enforce_run_scope(decision: RouteDecision, cfg: dict[str, Any]) -> None:
     allowed_routes = set(str(item) for item in run.get("allowed_routes") or [])
     if allowed_routes and decision.route_id not in allowed_routes:
         raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' does not allow route '{decision.route_id}'")
+    allowed_callers = set(str(item) for item in run.get("allowed_callers") or [])
+    if run_source == "dynamic" and allowed_callers and agent_id not in allowed_callers:
+        raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' is not allowed for agent '{agent_id}'")
 
 
 def enforce_taint_policy(decision: RouteDecision) -> None:
@@ -1318,6 +1358,224 @@ def apply_route_action_guard_policy(result: ActionGuardResult, decision: RouteDe
 
 def approval_store_path(cfg: dict[str, Any]) -> Path:
     return expand_path(str(cfg.get("approval_store", DEFAULT_APPROVAL_STORE)))
+
+
+def run_store_path(cfg: dict[str, Any]) -> Path:
+    store = cfg.get("run_store", {})
+    if isinstance(store, dict):
+        return expand_path(str(store.get("path", DEFAULT_RUN_STORE)))
+    return expand_path(str(store or DEFAULT_RUN_STORE))
+
+
+def run_store_max_ttl_seconds(cfg: dict[str, Any]) -> int:
+    store = cfg.get("run_store", {})
+    if isinstance(store, dict):
+        value, ok = parse_int(store.get("max_ttl_seconds", DEFAULT_RUN_MAX_TTL_SECONDS), default=DEFAULT_RUN_MAX_TTL_SECONDS)
+        return value if ok and value > 0 else DEFAULT_RUN_MAX_TTL_SECONDS
+    return DEFAULT_RUN_MAX_TTL_SECONDS
+
+
+def append_jsonl_record(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with security.AUDIT_THREAD_LOCK:
+        with lock_path.open("a+b") as lock_fh:
+            security.acquire_audit_file_lock(lock_fh)
+            try:
+                try:
+                    os.chmod(lock_path, stat.S_IRUSR | stat.S_IWUSR)
+                except FileNotFoundError:
+                    pass
+                existed = path.exists()
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                if not existed:
+                    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+            finally:
+                security.release_audit_file_lock(lock_fh)
+
+
+def string_array(value: Any, *, field: str, allow_empty: bool) -> list[str]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise GatewayError(400, "invalid_json", f"{field} must be a {'string array' if allow_empty else 'non-empty string array'}")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise GatewayError(400, "invalid_json", f"{field} must contain strings")
+        result.append(item.strip())
+    return result
+
+
+def route_array(value: Any, *, field: str, allow_empty: bool, cfg: dict[str, Any]) -> list[str]:
+    values = string_array(value, field=field, allow_empty=allow_empty)
+    routes = cfg.get("routes") or {}
+    missing = [route_id for route_id in values if route_id not in routes]
+    if missing:
+        raise GatewayError(400, "invalid_json", f"{field} references undefined route: {missing[0]}")
+    return values
+
+
+def normalize_dynamic_run_record(record: dict[str, Any], cfg: dict[str, Any], *, expected_run_id: str | None = None) -> dict[str, Any] | None:
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    if expected_run_id is not None and run_id != expected_run_id:
+        return None
+    try:
+        allowed_routes = route_array(record.get("allowed_routes"), field="allowed_routes", allow_empty=False, cfg=cfg)
+        denied_routes = route_array(record.get("denied_routes", []), field="denied_routes", allow_empty=True, cfg=cfg)
+        allowed_callers = string_array(record.get("allowed_callers", []), field="allowed_callers", allow_empty=True)
+        expires_at = parse_datetime(str(record.get("expires_at")))
+    except (GatewayError, TypeError, ValueError):
+        return None
+    normalized = dict(record)
+    normalized.update(
+        {
+            "run_id": run_id,
+            "allowed_routes": allowed_routes,
+            "denied_routes": denied_routes,
+            "allowed_callers": allowed_callers,
+            "expires_at": expires_at.isoformat(),
+        }
+    )
+    return normalized
+
+
+def latest_dynamic_run_record(cfg: dict[str, Any], run_id: str) -> dict[str, Any] | None:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    path = run_store_path(cfg)
+    if not path.exists():
+        return None
+    latest: dict[str, Any] | None = None
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                normalized = normalize_dynamic_run_record(record, cfg, expected_run_id=run_id)
+                if normalized is not None:
+                    latest = normalized
+    return latest
+
+
+def resolve_run_scope_record(cfg: dict[str, Any], run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    runs = cfg.get("runs") or {}
+    if isinstance(runs, dict) and run_id in runs:
+        return runs.get(run_id), "static"
+    dynamic = latest_dynamic_run_record(cfg, run_id)
+    if dynamic is not None:
+        return dynamic, "dynamic"
+    return None, None
+
+
+def run_record_expired(record: Any, now: dt.datetime) -> tuple[bool, str]:
+    if not isinstance(record, dict):
+        return False, ""
+    try:
+        expires_at = parse_datetime(str(record.get("expires_at")))
+    except (TypeError, ValueError):
+        return False, ""
+    run_id = record.get("run_id")
+    return expires_at < now, run_id if isinstance(run_id, str) else ""
+
+
+def split_run_store_for_gc(path: Path, now: dt.datetime) -> tuple[list[str], dict[str, Any]]:
+    kept_lines: list[str] = []
+    scanned = 0
+    expired = 0
+    skipped = 0
+    expired_run_ids: list[str] = []
+    if not path.exists():
+        return kept_lines, {
+            "scanned_records": 0,
+            "expired_records": 0,
+            "skipped_records": 0,
+            "expired_run_ids": [],
+        }
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                kept_lines.append(line)
+                continue
+            scanned += 1
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                kept_lines.append(line)
+                continue
+            is_expired, run_id = run_record_expired(record, now)
+            if is_expired:
+                expired += 1
+                if run_id:
+                    expired_run_ids.append(run_id)
+                continue
+            kept_lines.append(line if line.endswith("\n") else line + "\n")
+    return kept_lines, {
+        "scanned_records": scanned,
+        "expired_records": expired,
+        "skipped_records": skipped,
+        "expired_run_ids": expired_run_ids,
+    }
+
+
+def gc_runs(cfg: dict[str, Any], *, dry_run: bool = False, now: dt.datetime | None = None) -> dict[str, Any]:
+    path = run_store_path(cfg)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    now = now.astimezone(dt.timezone.utc)
+    deleted_records = 0
+    if dry_run:
+        _, counts = split_run_store_for_gc(path, now)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_name(path.name + ".lock")
+        with security.AUDIT_THREAD_LOCK:
+            with lock_path.open("a+b") as lock_fh:
+                security.acquire_audit_file_lock(lock_fh)
+                try:
+                    try:
+                        os.chmod(lock_path, stat.S_IRUSR | stat.S_IWUSR)
+                    except FileNotFoundError:
+                        pass
+                    kept_lines, counts = split_run_store_for_gc(path, now)
+                    deleted_records = counts["expired_records"]
+                    tmp = path.with_name(path.name + ".tmp")
+                    with tmp.open("w", encoding="utf-8") as fh:
+                        fh.writelines(kept_lines)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, path)
+                    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+                finally:
+                    security.release_audit_file_lock(lock_fh)
+    summary = {
+        "ok": True,
+        "dry_run": dry_run,
+        "store": str(path),
+        "now": now.isoformat(),
+        "scanned_records": counts["scanned_records"],
+        "expired_records": counts["expired_records"],
+        "deleted_records": deleted_records,
+        "kept_records": counts["scanned_records"] - counts["expired_records"],
+        "skipped_records": counts["skipped_records"],
+        "expired_run_ids": counts["expired_run_ids"],
+    }
+    if not dry_run:
+        audit_event = {key: value for key, value in summary.items() if key != "store"}
+        audit_event["event"] = "run_gc"
+        audit_event["decision"] = "completed"
+        write_audit(cfg, audit_event)
+    return summary
 
 
 def approval_record_valid(
@@ -3058,20 +3316,82 @@ def readiness_status(cfg: dict[str, Any]) -> dict[str, Any]:
         "routes_present": bool(cfg.get("routes")),
         "audit_parent_writable": False,
         "approval_parent_writable": False,
+        "run_store_parent_writable": False,
         "artifact_store_parent_writable": False,
         "kill_switch_inactive": not expand_path(str(cfg.get("kill_switch_file", DEFAULT_KILL_SWITCH))).exists(),
     }
     audit_parent = expand_path(str(cfg.get("audit_log", DEFAULT_AUDIT_PATH))).parent
     approval_parent = approval_store_path(cfg).parent
+    run_parent = run_store_path(cfg).parent
     artifact_parent = artifact_store_root(cfg).parent
     checks["audit_parent_writable"] = audit_parent.exists() and os.access(audit_parent, os.W_OK)
     checks["approval_parent_writable"] = approval_parent.exists() and os.access(approval_parent, os.W_OK)
+    checks["run_store_parent_writable"] = run_parent.exists() and os.access(run_parent, os.W_OK)
     checks["artifact_store_parent_writable"] = artifact_parent.exists() and os.access(artifact_parent, os.W_OK)
     return {
         "ok": all(bool(value) for value in checks.values()),
         "app": APP_NAME,
         "version": VERSION,
         "checks": checks,
+    }
+
+
+def run_registration_expires_at(payload: dict[str, Any], cfg: dict[str, Any], now: dt.datetime) -> str:
+    has_ttl = "ttl_seconds" in payload
+    has_expires = "expires_at" in payload
+    if has_ttl == has_expires:
+        raise GatewayError(400, "invalid_json", "run registration requires exactly one of ttl_seconds or expires_at")
+    max_ttl = run_store_max_ttl_seconds(cfg)
+    latest = now + dt.timedelta(seconds=max_ttl)
+    if has_ttl:
+        ttl = payload.get("ttl_seconds")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+            raise GatewayError(400, "invalid_json", "ttl_seconds must be a positive integer")
+        if ttl > max_ttl:
+            raise GatewayError(400, "invalid_json", "ttl_seconds exceeds run_store.max_ttl_seconds")
+        expires_at = now + dt.timedelta(seconds=ttl)
+    else:
+        raw = payload.get("expires_at")
+        if not isinstance(raw, str) or not raw.strip():
+            raise GatewayError(400, "invalid_json", "expires_at must be an ISO-8601 datetime")
+        try:
+            expires_at = parse_datetime(raw)
+        except ValueError as exc:
+            raise GatewayError(400, "invalid_json", "expires_at must be an ISO-8601 datetime") from exc
+        if expires_at <= now:
+            raise GatewayError(400, "invalid_json", "expires_at must be in the future")
+        if expires_at > latest:
+            raise GatewayError(400, "invalid_json", "expires_at exceeds run_store.max_ttl_seconds")
+    return expires_at.isoformat(timespec="seconds")
+
+
+def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], verified: VerifiedAgent) -> dict[str, Any]:
+    raw_run_id = payload.get("run_id")
+    if raw_run_id is None:
+        run_id = "run_" + secrets.token_hex(16)
+    elif isinstance(raw_run_id, str) and RUN_ID_PATTERN.fullmatch(raw_run_id):
+        run_id = raw_run_id
+    else:
+        raise GatewayError(403, "input_policy_denied", "run_id contains disallowed characters")
+
+    allowed_routes = route_array(payload.get("allowed_routes"), field="allowed_routes", allow_empty=False, cfg=cfg)
+    denied_routes = route_array(payload.get("denied_routes", []), field="denied_routes", allow_empty=True, cfg=cfg)
+    allowed_callers = string_array(payload.get("allowed_callers", []), field="allowed_callers", allow_empty=True)
+    raw_reason = payload.get("reason", "")
+    if raw_reason is None:
+        raw_reason = ""
+    if not isinstance(raw_reason, str):
+        raise GatewayError(400, "invalid_json", "reason must be a string")
+    now = dt.datetime.now(dt.timezone.utc)
+    return {
+        "run_id": run_id,
+        "allowed_routes": allowed_routes,
+        "denied_routes": denied_routes,
+        "allowed_callers": allowed_callers,
+        "expires_at": run_registration_expires_at(payload, cfg, now),
+        "created_by": verified.agent_id,
+        "created_at": now.isoformat(timespec="seconds"),
+        "reason": raw_reason.strip()[:RUN_REASON_MAX_CHARS],
     }
 
 
@@ -3122,6 +3442,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == "/v1/approvals":
             self.handle_approval()
+            return
+        if parsed.path == "/v1/runs":
+            self.handle_run_register()
             return
         self.write_json(404, json_error("not_found", "not found", "req_" + uuid.uuid4().hex))
 
@@ -3583,13 +3906,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 "reason": str(payload.get("reason", "")),
             }
             path = approval_store_path(cfg)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-            try:
-                os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-            except FileNotFoundError:
-                pass
+            append_jsonl_record(path, record)
             write_audit(
                 cfg,
                 {
@@ -3605,6 +3922,59 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
             self.write_json(200, {"ok": True, "request_id": request_id, "approval_id": record["approval_id"]})
+        except GatewayError as exc:
+            self.deny(cfg, exc, request_id, client_ip, verified, decision)
+        except Exception as exc:  # noqa: BLE001
+            self.internal_error(cfg, exc, request_id, client_ip)
+
+    def handle_run_register(self) -> None:
+        cfg = self.server.config  # type: ignore[attr-defined]
+        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        client_ip = self.client_address[0]
+        verified: VerifiedAgent | None = None
+        decision: RouteDecision | None = None
+        try:
+            self.check_kill_switch(cfg, request_id, client_ip)
+            payload = self.read_json_body(cfg)
+            verified = verify_agent(self.headers, cfg, client_ip)
+            route_payload = dict(payload)
+            route_payload.pop("run_id", None)
+            decision = resolve_route_decision(self.headers, route_payload, cfg)
+            if decision.route_id != "security.runs.register":
+                raise GatewayError(403, "route_denied", "/v1/runs requires route 'security.runs.register'")
+            enforce_route_policy(verified, decision, cfg)
+            enforce_input_policy(payload, decision)
+            record = build_run_registration_record(payload, cfg, verified)
+            inbound = scan_inbound(payload, cfg)
+            if inbound.scan.blocked:
+                raise GatewayError(403, "blocked_by_input_guard", "run registration payload was blocked by input guard")
+            append_jsonl_record(run_store_path(cfg), record)
+            write_audit(
+                cfg,
+                {
+                    "event": "run_registration",
+                    "decision": "stored",
+                    **audit_base(request_id, verified, client_ip, decision),
+                    "registered_run_id": record["run_id"],
+                    "registered_allowed_routes": record["allowed_routes"][:10],
+                    "registered_allowed_route_count": len(record["allowed_routes"]),
+                    "registered_denied_route_count": len(record["denied_routes"]),
+                    "registered_allowed_callers": record["allowed_callers"],
+                    "registered_expires_at": record["expires_at"],
+                    "reason": record["reason"][:RUN_REASON_MAX_CHARS],
+                    "scan": security.public_scan_for_audit(inbound.scan, cfg),
+                },
+            )
+            self.write_json(
+                200,
+                {
+                    "run_id": record["run_id"],
+                    "expires_at": record["expires_at"],
+                    "allowed_routes": record["allowed_routes"],
+                    "denied_routes": record["denied_routes"],
+                    "allowed_callers": record["allowed_callers"],
+                },
+            )
         except GatewayError as exc:
             self.deny(cfg, exc, request_id, client_ip, verified, decision)
         except Exception as exc:  # noqa: BLE001
@@ -3904,6 +4274,16 @@ def gc_artifacts_cli(config_path: Path, *, dry_run: bool, now_text: str | None =
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def gc_runs_cli(config_path: Path, *, dry_run: bool, now_text: str | None = None) -> None:
+    cfg = load_config(config_path)
+    try:
+        now = parse_datetime(now_text) if now_text else None
+    except ValueError as exc:
+        raise SystemExit("--now must be an ISO-8601 timestamp") from exc
+    summary = gc_runs(cfg, dry_run=dry_run, now=now)
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Agent Security Gateway")
     parser.add_argument("--config", type=Path, default=Path(os.environ.get("ASG_CONFIG", DEFAULT_CONFIG_PATH)))
@@ -3926,6 +4306,9 @@ def main(argv: list[str] | None = None) -> int:
     p_gc = sub.add_parser("gc-artifacts")
     p_gc.add_argument("--dry-run", action="store_true")
     p_gc.add_argument("--now", help=argparse.SUPPRESS)
+    p_gc_runs = sub.add_parser("gc-runs")
+    p_gc_runs.add_argument("--dry-run", action="store_true")
+    p_gc_runs.add_argument("--now", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -3949,6 +4332,8 @@ def main(argv: list[str] | None = None) -> int:
         export_audit_anchor_cli(args.path or expand_path(str(load_config(args.config)["audit_log"])))
     elif args.command == "gc-artifacts":
         gc_artifacts_cli(args.config, dry_run=args.dry_run, now_text=args.now)
+    elif args.command == "gc-runs":
+        gc_runs_cli(args.config, dry_run=args.dry_run, now_text=args.now)
     return 0
 
 

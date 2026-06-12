@@ -34,6 +34,27 @@
     "require_known_run_id": {
       "type": "boolean"
     },
+    "run_store": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "max_ttl_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 604800
+            }
+          }
+        }
+      ]
+    },
     "artifact_store": {
       "type": "object",
       "additionalProperties": true,
@@ -268,6 +289,12 @@
           }
         },
         "denied_routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_callers": {
           "type": "array",
           "items": {
             "type": "string"

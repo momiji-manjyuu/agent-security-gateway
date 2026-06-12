@@ -60,6 +60,7 @@ class GatewayTests(unittest.TestCase):
         cfg["audit_log"] = str(Path(tmp) / "audit.jsonl")
         cfg["kill_switch_file"] = str(Path(tmp) / "KILL_SWITCH")
         cfg["approval_store"] = str(Path(tmp) / "approvals.jsonl")
+        cfg["run_store"] = {"path": str(Path(tmp) / "runs.jsonl"), "max_ttl_seconds": 604800}
         cfg["artifact_store"]["path"] = str(Path(tmp) / "artifacts")
         cfg["rate_limit"]["enabled"] = False
         cfg["agents"] = {
@@ -76,9 +77,11 @@ class GatewayTests(unittest.TestCase):
                     "generate_image",
                     "download_artifact",
                     "review_artifact",
+                    "register_run",
                 ],
                 "allowed_routes": [
                     "security.inspect_only",
+                    "security.runs.register",
                     "pi.web_research.chat",
                     "ubuntu1.knowledge.submit_source_card",
                     "ubuntu1.knowledge.search_trusted",
@@ -476,6 +479,16 @@ class GatewayTests(unittest.TestCase):
             "reason": "test approval",
         }
 
+    def run_register_payload(self, **overrides: object) -> dict:
+        payload: dict[str, object] = {
+            "run_id": "dyn-run-1",
+            "allowed_routes": ["pi.web_research.chat"],
+            "ttl_seconds": 3600,
+            "reason": "test run registration",
+        }
+        payload.update(overrides)
+        return payload
+
     def write_approval_record(self, cfg: dict, action_hash: str, categories: list[str], target_agent_id: str = "mac_gpt55") -> None:
         record = {
             "approval_id": "appr-direct",
@@ -603,6 +616,238 @@ class GatewayTests(unittest.TestCase):
             status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="run-expired"))
             self.assertEqual(status, 403)
             self.assert_error(body, "run_expired")
+
+    def test_controller_can_register_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            payload = self.run_register_payload(
+                run_id="dyn-run-success",
+                allowed_routes=["pi.web_research.chat", "ubuntu1.knowledge.search_trusted"],
+                denied_routes=["windows_image.comfyui.generate"],
+                allowed_callers=["mac_gpt55"],
+            )
+            status, body = self.request_json(
+                base,
+                "/v1/runs",
+                payload,
+                capability="register_run",
+                route="security.runs.register",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["run_id"], "dyn-run-success")
+            self.assertEqual(body["allowed_routes"], payload["allowed_routes"])
+            self.assertEqual(body["denied_routes"], payload["denied_routes"])
+            self.assertEqual(body["allowed_callers"], payload["allowed_callers"])
+            self.assertNotIn("store", body)
+
+            record = json.loads(Path(cfg["run_store"]["path"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["run_id"], "dyn-run-success")
+            self.assertEqual(record["created_by"], "mac_gpt55")
+            self.assertEqual(record["allowed_routes"], payload["allowed_routes"])
+
+            audit_event = json.loads(Path(cfg["audit_log"]).read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(audit_event["event"], "run_registration")
+            self.assertEqual(audit_event["registered_run_id"], "dyn-run-success")
+            self.assertEqual(audit_event["agent_id"], "mac_gpt55")
+
+    def test_known_run_id_accepts_registered_run_and_denies_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = True
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="dyn-run-known"))
+            self.assertEqual(status, 403)
+            self.assert_error(body, "run_scope_denied")
+
+            status, _ = self.request_json(
+                base,
+                "/v1/runs",
+                self.run_register_payload(run_id="dyn-run-known", allowed_callers=["mac_gpt55"]),
+                capability="register_run",
+                route="security.runs.register",
+            )
+            self.assertEqual(status, 200)
+            status, _ = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="dyn-run-known"))
+            self.assertEqual(status, 200)
+
+    def test_registered_run_allowed_routes_and_denied_routes_are_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = True
+            base = self.start_gateway(cfg)
+            status, _ = self.request_json(
+                base,
+                "/v1/runs",
+                self.run_register_payload(run_id="dyn-run-search-only", allowed_routes=["ubuntu1.knowledge.search_trusted"]),
+                capability="register_run",
+                route="security.runs.register",
+            )
+            self.assertEqual(status, 200)
+            status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="dyn-run-search-only"))
+            self.assertEqual(status, 403)
+            self.assert_error(body, "run_scope_denied")
+
+            status, _ = self.request_json(
+                base,
+                "/v1/runs",
+                self.run_register_payload(
+                    run_id="dyn-run-explicit-deny",
+                    allowed_routes=["pi.web_research.chat"],
+                    denied_routes=["pi.web_research.chat"],
+                ),
+                capability="register_run",
+                route="security.runs.register",
+            )
+            self.assertEqual(status, 200)
+            status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="dyn-run-explicit-deny"))
+            self.assertEqual(status, 403)
+            self.assert_error(body, "run_scope_denied")
+
+    def test_registered_expired_run_is_denied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = True
+            record = {
+                "run_id": "dyn-run-expired",
+                "allowed_routes": ["pi.web_research.chat"],
+                "denied_routes": [],
+                "allowed_callers": [],
+                "expires_at": "2000-01-01T00:00:00+00:00",
+                "created_by": "mac_gpt55",
+                "created_at": "1999-12-31T00:00:00+00:00",
+                "reason": "expired test run",
+            }
+            gateway.append_jsonl_record(gateway.run_store_path(cfg), record)
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="dyn-run-expired"))
+            self.assertEqual(status, 403)
+            self.assert_error(body, "run_expired")
+
+    def test_registered_run_allowed_callers_prevents_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = True
+            base = self.start_gateway(cfg)
+            status, _ = self.request_json(
+                base,
+                "/v1/runs",
+                self.run_register_payload(run_id="dyn-run-wrong-caller", allowed_callers=["pi_research_1"]),
+                capability="register_run",
+                route="security.runs.register",
+            )
+            self.assertEqual(status, 200)
+            status, body = self.request_json(base, "/v1/chat/completions", self.chat_payload(run_id="dyn-run-wrong-caller"))
+            self.assertEqual(status, 403)
+            self.assert_error(body, "run_scope_denied")
+
+    def test_worker_cannot_register_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(
+                base,
+                "/v1/runs",
+                self.run_register_payload(run_id="dyn-run-worker-denied"),
+                token="pi-token-1234567890",
+                capability="register_run",
+                route="security.runs.register",
+            )
+            self.assertEqual(status, 403)
+            self.assertIn(body["error"]["code"], {"capability_denied", "route_denied", "caller_not_allowed"})
+
+    def test_registered_run_does_not_expand_agent_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            cfg["require_known_run_id"] = True
+            cfg["agents"]["pi_research_1"]["allowed_capabilities"].append("delegate_web_research")
+            cfg["routes"]["pi.web_research.chat"]["allowed_callers"].append("pi_research_1")
+            gateway.append_jsonl_record(
+                gateway.run_store_path(cfg),
+                {
+                    "run_id": "dyn-run-no-route-expand",
+                    "allowed_routes": ["pi.web_research.chat"],
+                    "denied_routes": [],
+                    "allowed_callers": ["pi_research_1"],
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                    "created_by": "mac_gpt55",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "reason": "invariant test",
+                },
+            )
+            base = self.start_gateway(cfg)
+            status, body = self.request_json(
+                base,
+                "/v1/chat/completions",
+                self.chat_payload(run_id="dyn-run-no-route-expand"),
+                token="pi-token-1234567890",
+                capability="delegate_web_research",
+                route="pi.web_research.chat",
+            )
+            self.assertEqual(status, 403)
+            self.assert_error(body, "route_denied")
+
+    def test_gc_runs_removes_only_expired_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            path = gateway.run_store_path(cfg)
+            records = [
+                {
+                    "run_id": "dyn-run-old",
+                    "allowed_routes": ["pi.web_research.chat"],
+                    "denied_routes": [],
+                    "allowed_callers": [],
+                    "expires_at": "2026-01-01T00:00:00+00:00",
+                    "created_by": "mac_gpt55",
+                    "created_at": "2025-12-31T00:00:00+00:00",
+                    "reason": "old",
+                },
+                {
+                    "run_id": "dyn-run-new",
+                    "allowed_routes": ["pi.web_research.chat"],
+                    "denied_routes": [],
+                    "allowed_callers": [],
+                    "expires_at": "2026-12-31T00:00:00+00:00",
+                    "created_by": "mac_gpt55",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "reason": "new",
+                },
+            ]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records), encoding="utf-8")
+
+            now = gateway.parse_datetime("2026-06-01T00:00:00Z")
+            dry = gateway.gc_runs(cfg, dry_run=True, now=now)
+            self.assertEqual(dry["expired_records"], 1)
+            self.assertIn("dyn-run-old", path.read_text(encoding="utf-8"))
+
+            summary = gateway.gc_runs(cfg, dry_run=False, now=now)
+            self.assertEqual(summary["deleted_records"], 1)
+            remaining = path.read_text(encoding="utf-8")
+            self.assertNotIn("dyn-run-old", remaining)
+            self.assertIn("dyn-run-new", remaining)
+
+    def test_run_registration_invalid_inputs_fail_closed(self):
+        cases = [
+            ("undefined route", self.run_register_payload(allowed_routes=["missing.route"]), 400, "invalid_json"),
+            ("missing expiry", {"run_id": "dyn-run-no-expiry", "allowed_routes": ["pi.web_research.chat"]}, 400, "invalid_json"),
+            ("ttl too large", self.run_register_payload(ttl_seconds=604801), 400, "invalid_json"),
+            ("bad run id", self.run_register_payload(run_id="../bad"), 403, "input_policy_denied"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            base = self.start_gateway(cfg)
+            for name, payload, expected_status, expected_code in cases:
+                with self.subTest(name=name):
+                    status, body = self.request_json(
+                        base,
+                        "/v1/runs",
+                        payload,
+                        capability="register_run",
+                        route="security.runs.register",
+                    )
+                    self.assertEqual(status, expected_status)
+                    self.assert_error(body, expected_code)
 
     def test_validate_config_cli_warns_when_require_known_run_id_false(self):
         with tempfile.TemporaryDirectory() as tmp:

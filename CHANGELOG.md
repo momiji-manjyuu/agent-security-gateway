@@ -6,6 +6,7 @@
 - Added route-based policy resolution for multi-backend AI systems.
 - Added `gateway.py` with `/healthz`, `/inspect`, `/routes`, `/v1/chat/completions`, `/v1/tasks`, `/v1/results`, and `/v1/approvals`.
 - Added route conflict detection, model alias routing, run-level scope, taint enforcement, action guard, and route-owned backend credentials.
+- Added `/v1/runs` runtime run registration, file-backed `run_store`, dynamic run scope enforcement, and `gc-runs`.
 - Hardened `/v1/approvals` so only human/operator callers with `approve_action` can create target approvals, and target agents cannot self-approve.
 - Split non-approvable action guard categories from approvable categories and require category coverage in approval records.
 - Enforced route input policy fields including `max_messages`, `require_message_type`, `require_structured_task`, `allow_raw_external_content`, `disallow_external_urls`, and `max_batch_size`.
