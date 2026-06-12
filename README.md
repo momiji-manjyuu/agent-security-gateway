@@ -756,6 +756,10 @@ export ASG_SHIM_CAPABILITY="notify_audited_result"
 export ASG_SHIM_TAINT="model_output"
 export ASG_SHIM_MODEL_ALIAS="asg/mac-result-receipt"
 export ASG_SHIM_RESULT_MESSAGE_TYPE="worker_report"
+export ASG_SHIM_RESULTS_MAX_PER_MINUTE="20"
+export ASG_SHIM_429_MAX_RETRIES="5"
+export ASG_SHIM_429_BACKOFF_SECONDS="1.0"
+export ASG_SHIM_429_BACKOFF_MAX_SECONDS="30.0"
 export ASG_SHIM_TOKEN_FILE="$HOME/.agent-security-gateway-shim/token"
 python3 scripts/openai_asg_shim.py serve
 ```
@@ -764,7 +768,12 @@ In `/v1/results` mode, the shim accepts OpenAI-compatible
 `/v1/chat/completions` requests locally, converts the stripped chat messages
 into an ASG result packet, and returns a normal OpenAI chat completion whose
 message content is the ASG audit receipt JSON, including `summary_ja` when the
-gateway returned one.
+gateway returned one. Workers should batch report traffic so this path stays at
+or below 20 receipts per minute. The shim also enforces a local per-minute cap
+(default `ASG_SHIM_RESULTS_MAX_PER_MINUTE=20`) and retries ASG `429 rate_limited`
+responses with `Retry-After`/exponential backoff. Retry behavior is bounded by
+`ASG_SHIM_429_MAX_RETRIES`, `ASG_SHIM_429_BACKOFF_SECONDS`, and
+`ASG_SHIM_429_BACKOFF_MAX_SECONDS`.
 
 Run a minimal Mac/controller receipt backend only when you want receipt JSONL
 storage instead of Hermes notification:

@@ -13,14 +13,17 @@ import argparse
 import dataclasses
 import http.server
 import json
+import math
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +32,14 @@ APP_NAME = "openai-asg-shim"
 VERSION = "0.1.0"
 DEFAULT_MAX_BODY_BYTES = 524_288
 DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_RESULTS_MAX_PER_MINUTE = 20
+DEFAULT_429_MAX_RETRIES = 5
+DEFAULT_429_BACKOFF_SECONDS = 1.0
+DEFAULT_429_BACKOFF_MAX_SECONDS = 30.0
 ALLOWED_ASG_PATHS = {"/v1/chat/completions", "/v1/results"}
+
+_RESULT_RATE_LOCK = threading.Lock()
+_RESULT_SEND_TIMES: deque[float] = deque()
 
 
 class ShimError(Exception):
@@ -57,6 +67,10 @@ class ShimConfig:
     max_body_bytes: int
     strip_tooling: bool
     allowed_message_roles: set[str]
+    results_max_per_minute: int = DEFAULT_RESULTS_MAX_PER_MINUTE
+    rate_limit_max_retries: int = DEFAULT_429_MAX_RETRIES
+    rate_limit_backoff_seconds: float = DEFAULT_429_BACKOFF_SECONDS
+    rate_limit_backoff_max_seconds: float = DEFAULT_429_BACKOFF_MAX_SECONDS
 
 
 def _env(name: str, default: str = "") -> str:
@@ -86,6 +100,17 @@ def _parse_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     except ValueError as exc:
         raise ShimError(500, "invalid_config", f"{name} must be an integer") from exc
     if value < minimum or value > maximum:
+        raise ShimError(500, "invalid_config", f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _parse_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = _env(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ShimError(500, "invalid_config", f"{name} must be a number") from exc
+    if not math.isfinite(value) or value < minimum or value > maximum:
         raise ShimError(500, "invalid_config", f"{name} must be between {minimum} and {maximum}")
     return value
 
@@ -143,6 +168,20 @@ def load_config_from_env() -> ShimConfig:
     port = _parse_int("ASG_SHIM_PORT", 18088, minimum=1, maximum=65_535)
     timeout_seconds = _parse_int("ASG_SHIM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS, minimum=1, maximum=600)
     max_body_bytes = _parse_int("ASG_SHIM_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, minimum=1, maximum=50 * 1024 * 1024)
+    results_max_per_minute = _parse_int("ASG_SHIM_RESULTS_MAX_PER_MINUTE", DEFAULT_RESULTS_MAX_PER_MINUTE, minimum=1, maximum=60)
+    rate_limit_max_retries = _parse_int("ASG_SHIM_429_MAX_RETRIES", DEFAULT_429_MAX_RETRIES, minimum=0, maximum=10)
+    rate_limit_backoff_seconds = _parse_float(
+        "ASG_SHIM_429_BACKOFF_SECONDS",
+        DEFAULT_429_BACKOFF_SECONDS,
+        minimum=0.1,
+        maximum=60.0,
+    )
+    rate_limit_backoff_max_seconds = _parse_float(
+        "ASG_SHIM_429_BACKOFF_MAX_SECONDS",
+        DEFAULT_429_BACKOFF_MAX_SECONDS,
+        minimum=0.1,
+        maximum=300.0,
+    )
     model_alias = _env("ASG_SHIM_MODEL_ALIAS")
     model_id = _env("ASG_SHIM_MODEL_ID", model_alias or route_id)
     return ShimConfig(
@@ -161,6 +200,10 @@ def load_config_from_env() -> ShimConfig:
         max_body_bytes=max_body_bytes,
         strip_tooling=_parse_bool("ASG_SHIM_STRIP_TOOLING", True),
         allowed_message_roles=_parse_roles(_env("ASG_SHIM_ALLOWED_MESSAGE_ROLES", "user,assistant")),
+        results_max_per_minute=results_max_per_minute,
+        rate_limit_max_retries=rate_limit_max_retries,
+        rate_limit_backoff_seconds=rate_limit_backoff_seconds,
+        rate_limit_backoff_max_seconds=rate_limit_backoff_max_seconds,
     )
 
 
@@ -233,6 +276,40 @@ def build_asg_result_payload(payload: dict[str, Any], config: ShimConfig) -> dic
     return result
 
 
+def wait_for_result_send_slot(config: ShimConfig) -> None:
+    """Keep /v1/results submissions at or below the configured per-minute cap."""
+    if config.asg_path != "/v1/results":
+        return
+    while True:
+        now = time.monotonic()
+        with _RESULT_RATE_LOCK:
+            while _RESULT_SEND_TIMES and now - _RESULT_SEND_TIMES[0] >= 60.0:
+                _RESULT_SEND_TIMES.popleft()
+            if len(_RESULT_SEND_TIMES) < config.results_max_per_minute:
+                _RESULT_SEND_TIMES.append(now)
+                return
+            sleep_for = max(0.1, 60.0 - (now - _RESULT_SEND_TIMES[0]))
+        time.sleep(sleep_for)
+
+
+def retry_after_seconds(headers: Any) -> float | None:
+    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw is None:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def rate_limit_sleep_seconds(config: ShimConfig, attempt: int, retry_after: float | None) -> float:
+    if retry_after is not None:
+        return min(config.rate_limit_backoff_max_seconds, retry_after)
+    exponential = config.rate_limit_backoff_seconds * (2 ** max(0, attempt - 1))
+    return min(config.rate_limit_backoff_max_seconds, max(config.rate_limit_backoff_seconds, exponential))
+
+
 def openai_result_response(body: dict[str, Any], config: ShimConfig, request_id: str) -> dict[str, Any]:
     response_id = str(body.get("request_id") or request_id).removeprefix("req_")
     return {
@@ -293,36 +370,43 @@ def forward_chat(payload: dict[str, Any], config: ShimConfig, request_id: str) -
         "X-Agent-Capability": config.capability,
         "X-Request-ID": request_id,
     }
-    request = urllib.request.Request(
-        config.asg_base_url + config.asg_path,
-        data=body,
-        method="POST",
-        headers=headers,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw) if raw.strip() else {}
-            if not isinstance(parsed, dict):
-                parsed = {"value": parsed}
-            if config.asg_path == "/v1/results":
-                parsed = openai_result_response(parsed, config, request_id)
-            return response.status, parsed
-    except urllib.error.HTTPError as exc:
+    attempt = 0
+    while True:
+        wait_for_result_send_slot(config)
+        request = urllib.request.Request(
+            config.asg_base_url + config.asg_path,
+            data=body,
+            method="POST",
+            headers=headers,
+        )
         try:
-            raw = exc.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw) if raw.strip() else {}
-            if not isinstance(parsed, dict):
-                parsed = {"value": parsed}
-            return exc.code, parsed
-        finally:
-            exc.close()
-    except (socket.timeout, TimeoutError) as exc:
-        raise ShimError(504, "asg_timeout", "ASG request timed out") from exc
-    except urllib.error.URLError as exc:
-        raise ShimError(502, "asg_error", f"ASG request failed: {type(exc).__name__}") from exc
-    except json.JSONDecodeError as exc:
-        raise ShimError(502, "asg_error", "ASG response was not valid JSON") from exc
+            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw) if raw.strip() else {}
+                if not isinstance(parsed, dict):
+                    parsed = {"value": parsed}
+                if config.asg_path == "/v1/results":
+                    parsed = openai_result_response(parsed, config, request_id)
+                return response.status, parsed
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                parsed = json.loads(raw) if raw.strip() else {}
+                if not isinstance(parsed, dict):
+                    parsed = {"value": parsed}
+                if exc.code == 429 and config.asg_path == "/v1/results" and attempt < config.rate_limit_max_retries:
+                    attempt += 1
+                    time.sleep(rate_limit_sleep_seconds(config, attempt, retry_after_seconds(exc.headers)))
+                    continue
+                return exc.code, parsed
+            finally:
+                exc.close()
+        except (socket.timeout, TimeoutError) as exc:
+            raise ShimError(504, "asg_timeout", "ASG request timed out") from exc
+        except urllib.error.URLError as exc:
+            raise ShimError(502, "asg_error", f"ASG request failed: {type(exc).__name__}") from exc
+        except json.JSONDecodeError as exc:
+            raise ShimError(502, "asg_error", "ASG response was not valid JSON") from exc
 
 
 class ShimHandler(http.server.BaseHTTPRequestHandler):
@@ -480,6 +564,10 @@ def main(argv: list[str] | None = None) -> int:
                     "port": config.port,
                     "strip_tooling": config.strip_tooling,
                     "allowed_message_roles": sorted(config.allowed_message_roles),
+                    "results_max_per_minute": config.results_max_per_minute,
+                    "rate_limit_max_retries": config.rate_limit_max_retries,
+                    "rate_limit_backoff_seconds": config.rate_limit_backoff_seconds,
+                    "rate_limit_backoff_max_seconds": config.rate_limit_backoff_max_seconds,
                 },
                 sort_keys=True,
             )
