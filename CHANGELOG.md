@@ -13,6 +13,7 @@
 - Added route-level `backend.require_signature` so selected backends fail closed when `backend_hmac_key_env` is unset, and added ASG HMAC verification to the result receipt collector.
 - Changed generated and example configs to set `require_known_run_id: true`, while `validate-config` now warns when compatibility mode leaves it false.
 - Added route-local `report_policy.max_receipts_per_minute` for `/v1/results` audit receipt forwarding routes.
+- Added client-side `/v1/results` rate limiting and 429 retry backoff to the OpenAI-compatible worker shim.
 - Hardened `x_research_request` so `query` and `question` reject control, zero-width, and bidirectional format characters.
 - Added audit anchor export, collector storage for off-host anchors, and `verify-audit --expect-anchor` tail-hash verification.
 - Expanded the red-team corpus and added CI thresholds for minimum attack detection and maximum benign false positives.

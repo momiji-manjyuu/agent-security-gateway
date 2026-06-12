@@ -6,6 +6,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,9 +22,14 @@ class FakeASGHandler(shim.http.server.BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
+        self.server.request_count = getattr(self.server, "request_count", 0) + 1  # type: ignore[attr-defined]
         self.server.last_path = self.path  # type: ignore[attr-defined]
         self.server.last_headers = dict(self.headers)  # type: ignore[attr-defined]
         self.server.last_body = json.loads(raw.decode("utf-8"))  # type: ignore[attr-defined]
+        response_status = getattr(self.server, "response_status", 200)
+        response_statuses = getattr(self.server, "response_statuses", None)
+        if response_statuses:
+            response_status = response_statuses.pop(0)
         if self.path == "/v1/results":
             response_body = {
                 "ok": True,
@@ -39,8 +45,12 @@ class FakeASGHandler(shim.http.server.BaseHTTPRequestHandler):
                 "object": "chat.completion",
                 "choices": [{"message": {"role": "assistant", "content": "shim ok"}}],
             }
+        if response_status == 429:
+            response_body = {"error": "rate_limited", "request_id": "req-rate-limited"}
         encoded = json.dumps(response_body).encode("utf-8")
-        self.send_response(getattr(self.server, "response_status", 200))
+        self.send_response(response_status)
+        if response_status == 429:
+            self.send_header("Retry-After", "0.01")
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
@@ -51,6 +61,10 @@ class FakeASGHandler(shim.http.server.BaseHTTPRequestHandler):
 
 
 class OpenAIASGShimTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with shim._RESULT_RATE_LOCK:
+            shim._RESULT_SEND_TIMES.clear()
+
     def start_fake_asg(self) -> tuple[str, shim.http.server.ThreadingHTTPServer]:
         server = shim.http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeASGHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -195,6 +209,96 @@ class OpenAIASGShimTests(unittest.TestCase):
         self.assertEqual(outbound["metadata"]["taint"], ["model_output"])
         self.assertEqual(outbound["metadata"]["source_model"], "caller-model")
         self.assertNotIn("model", outbound)
+
+    def test_results_mode_retries_429_with_backoff(self):
+        asg_base, fake_asg = self.start_fake_asg()
+        fake_asg.response_statuses = [429, 200]  # type: ignore[attr-defined]
+        config = shim.dataclasses.replace(
+            self.make_config(asg_base),
+            asg_path="/v1/results",
+            route_id="mac.result_receipt.notify",
+            capability="notify_audited_result",
+            taint=["model_output"],
+            model_id="asg/mac-result-receipt",
+            model_alias="asg/mac-result-receipt",
+            rate_limit_backoff_seconds=0.01,
+            rate_limit_backoff_max_seconds=0.01,
+        )
+        base = self.start_shim(config)
+        payload = {"model": "caller-model", "messages": [{"role": "user", "content": "work completed"}]}
+        status, body = self.request_json(base, "/v1/chat/completions", payload)
+
+        self.assertEqual(status, 200)
+        receipt = json.loads(body["choices"][0]["message"]["content"])
+        self.assertEqual(receipt["receipt_type"], "asg_result_audit")
+        self.assertEqual(fake_asg.request_count, 2)  # type: ignore[attr-defined]
+
+    def test_results_mode_does_not_retry_429_when_retries_are_zero(self):
+        asg_base, fake_asg = self.start_fake_asg()
+        fake_asg.response_statuses = [429, 200]  # type: ignore[attr-defined]
+        config = shim.dataclasses.replace(
+            self.make_config(asg_base),
+            asg_path="/v1/results",
+            route_id="mac.result_receipt.notify",
+            capability="notify_audited_result",
+            taint=["model_output"],
+            model_id="asg/mac-result-receipt",
+            model_alias="asg/mac-result-receipt",
+            rate_limit_max_retries=0,
+        )
+        base = self.start_shim(config)
+        payload = {"model": "caller-model", "messages": [{"role": "user", "content": "work completed"}]}
+        status, body = self.request_json(base, "/v1/chat/completions", payload)
+
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"], "rate_limited")
+        self.assertEqual(fake_asg.request_count, 1)  # type: ignore[attr-defined]
+
+    def test_results_mode_local_rate_limit_waits_for_send_slot(self):
+        config = shim.dataclasses.replace(
+            self.make_config("http://127.0.0.1:1"),
+            asg_path="/v1/results",
+            results_max_per_minute=2,
+        )
+        now = [1000.0]
+        sleeps: list[float] = []
+
+        def monotonic() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        with mock.patch.object(shim.time, "monotonic", monotonic), mock.patch.object(shim.time, "sleep", sleep):
+            shim.wait_for_result_send_slot(config)
+            shim.wait_for_result_send_slot(config)
+            shim.wait_for_result_send_slot(config)
+
+        self.assertEqual(sleeps, [60.0])
+        with shim._RESULT_RATE_LOCK:
+            self.assertEqual(list(shim._RESULT_SEND_TIMES), [1060.0])
+
+    def test_rate_limit_sleep_prefers_retry_after_and_clamps_to_max(self):
+        config = shim.dataclasses.replace(
+            self.make_config("http://127.0.0.1:1"),
+            rate_limit_backoff_seconds=5.0,
+            rate_limit_backoff_max_seconds=2.0,
+        )
+        self.assertEqual(shim.rate_limit_sleep_seconds(config, 1, 0.25), 0.25)
+        self.assertEqual(shim.rate_limit_sleep_seconds(config, 1, 10.0), 2.0)
+
+        exponential_config = shim.dataclasses.replace(
+            self.make_config("http://127.0.0.1:1"),
+            rate_limit_backoff_seconds=1.0,
+            rate_limit_backoff_max_seconds=10.0,
+        )
+        self.assertEqual(shim.rate_limit_sleep_seconds(exponential_config, 3, None), 4.0)
+
+    def test_parse_float_rejects_non_finite_values(self):
+        with mock.patch.dict(shim.os.environ, {"ASG_SHIM_429_BACKOFF_SECONDS": "nan"}):
+            with self.assertRaises(shim.ShimError):
+                shim._parse_float("ASG_SHIM_429_BACKOFF_SECONDS", 1.0, minimum=0.1, maximum=60.0)
 
     def test_chat_forwarding_strips_tooling_and_control_roles_by_default(self):
         asg_base, fake_asg = self.start_fake_asg()
