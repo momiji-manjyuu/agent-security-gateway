@@ -1707,6 +1707,77 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(body["reason"], "review_schema_invalid")
             self.assertNotIn("plain text is not accepted", json.dumps(body))
 
+    def test_artifact_review_tool_call_response_becomes_needs_review_without_leak(self):
+        tool_arguments = "{\"note\":\"backend-control-marker-123\"}"
+        backend_body = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "emit_unstructured_review",
+                                    "arguments": tool_arguments,
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_url, _ = self.start_backend(response_body=backend_body)
+            cfg = self.make_config(tmp, backend_url=backend_url)
+            root = Path(cfg["artifact_store"]["path"])
+            source = self.write_artifact_fixture(
+                root,
+                artifact_id="art_" + "a" * 32,
+                content=b"Public note text for tool call response handling.",
+                created_at=gateway.utc_now(),
+            )
+            base = self.start_gateway(cfg)
+            payload = {
+                "route_id": "security.artifacts.review_summary",
+                "capability": "review_artifact",
+                "taint": ["untrusted_web"],
+                "message_type": "artifact_review_request",
+                "artifact_ref": {"artifact_id": source["artifact_id"]},
+            }
+            status, body = self.request_json(
+                base,
+                "/v1/tasks",
+                payload,
+                capability="review_artifact",
+                route="security.artifacts.review_summary",
+            )
+            self.assertEqual(status, 200)
+            self.assertFalse(body["ok"])
+            self.assertEqual(body["review_status"], "needs_review")
+            self.assertEqual(body["reason"], "review_schema_invalid")
+            self.assertNotIn("tool_calls", json.dumps(body))
+            self.assertNotIn("backend-control-marker-123", json.dumps(body))
+
+    def test_artifact_review_config_validation_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp)
+            route = cfg["routes"]["security.artifacts.review_summary"]
+            route["backend"]["mode"] = "command"
+            with self.assertRaisesRegex(ValueError, "backend.mode must be 'http' for artifact_review routes"):
+                gateway.validate_config(cfg)
+
+            cfg = self.make_config(tmp)
+            cfg["routes"]["security.artifacts.review_summary"]["backend"]["max_review_chars"] = 0
+            with self.assertRaisesRegex(ValueError, "backend.max_review_chars must be a positive integer"):
+                gateway.validate_config(cfg)
+
+            cfg = self.make_config(tmp)
+            del cfg["routes"]["security.artifacts.review_summary"]["backend"]["base_url"]
+            with self.assertRaisesRegex(ValueError, "backend.base_url must be an absolute http"):
+                gateway.validate_config(cfg)
+
     def test_artifact_review_denies_unverified_source_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
