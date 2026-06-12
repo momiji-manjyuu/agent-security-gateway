@@ -2,6 +2,10 @@
   "bind": "127.0.0.1",
   "port": 8788,
   "audit_log": "~/.agent-security-gateway/audit.jsonl",
+  "run_store": {
+    "path": "~/.agent-security-gateway/runs.jsonl",
+    "max_ttl_seconds": 604800
+  },
   "artifact_store": {
     "path": "~/.agent-security-gateway/artifacts",
     "max_artifact_bytes": 10485760,
@@ -14,9 +18,10 @@
       "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "trust_tier": "privileged_core",
       "allowed_client_cidrs": ["127.0.0.1/32", "192.168.10.10/32"],
-      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "download_artifact", "review_artifact"],
+      "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "download_artifact", "review_artifact", "register_run"],
       "allowed_routes": [
         "security.inspect_only",
+        "security.runs.register",
         "pi.web_research.chat",
         "ubuntu1.knowledge.search_trusted",
         "security.artifacts.download",
@@ -62,6 +67,16 @@
       "required_capability": "approve_action",
       "input_policy": {
         "accepted_taint": ["human_approved"],
+        "allow_missing_taint": true
+      }
+    },
+    "security.runs.register": {
+      "kind": "inspect_only",
+      "aliases": ["asg/runs-register"],
+      "allowed_callers": ["mac_gpt55"],
+      "required_capability": "register_run",
+      "input_policy": {
+        "accepted_taint": ["trusted_instruction", "human_approved"],
         "allow_missing_taint": true
       }
     },

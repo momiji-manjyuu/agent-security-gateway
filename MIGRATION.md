@@ -20,6 +20,7 @@ Old proxy configs used one `target`. Gateway configs use:
 - `agents.<agent_id>.allowed_routes`
 - `routes.<route_id>.backend`
 - optional `runs.<run_id>`
+- optional `run_store.path` and `run_store.max_ttl_seconds` for runtime run registration records
 
 Move backend URLs and backend credential environment variable names into `routes`. Do not expose those values to callers.
 
@@ -30,6 +31,7 @@ Move backend URLs and backend credential environment variable names into `routes
 - `/v1/chat/completions` now requires a route through `X-ASG-Route`, `metadata.route_id`, or a configured model alias.
 - `/v1/tasks`, `/v1/results`, and `/v1/approvals` are new MVP endpoints.
 - `/v1/approvals` now requires a separate human/operator caller with `approve_action` on route `security.approvals.create`.
+- `/v1/runs` registers short-lived dynamic run scopes and requires a controller caller with `register_run` on route `security.runs.register`.
 - Approval record schema changed. Target fields are now `target_agent_id`, `target_route_id`, and `target_capability`; the approver is recorded separately as `approver_agent_id`.
 - Old approval records with `agent_id`, `route_id`, and `capability` may be ignored or require migration.
 - `input_policy` fields are now enforced, so requests previously accepted may now be rejected.

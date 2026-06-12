@@ -487,6 +487,26 @@ curl -s http://127.0.0.1:8788/v1/approvals \
   }'
 ```
 
+### `POST /v1/runs`
+
+Stores a file-backed runtime run scope before the controller dispatches work to agents. This endpoint requires a controller token with `register_run` capability and route `security.runs.register`; worker tokens should not have either permission.
+
+```bash
+curl -s http://127.0.0.1:8788/v1/runs \
+  -H "Authorization: Bearer $ASG_AGENT_TOKEN" \
+  -H "X-Agent-Capability: register_run" \
+  -H "X-ASG-Route: security.runs.register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "allowed_routes": ["pi.web_research.chat"],
+    "allowed_callers": ["pi_research_1"],
+    "ttl_seconds": 3600,
+    "reason": "web research task batch"
+  }'
+```
+
+The response returns the `run_id`, `expires_at`, `allowed_routes`, `denied_routes`, and `allowed_callers`. If `run_id` is omitted, ASG generates `run_<32hex>`. A supplied `run_id` must match `^[A-Za-z0-9._-]{1,128}$`. `allowed_routes` is required and must reference configured routes. `denied_routes` and `allowed_callers` are optional string arrays. Exactly one of `ttl_seconds` or `expires_at` is required, and the resulting expiry cannot exceed `run_store.max_ttl_seconds`, which defaults to 604800 seconds.
+
 ## Backend Forwarding
 
 Route kinds:
@@ -565,7 +585,28 @@ Set `backend.require_signature: true` on a route to fail closed if the configure
 
 ## Run Scope
 
-If `metadata.run_id` or `X-ASG-Run-Id` is present and known, the gateway applies `allowed_routes`, `denied_routes`, and `expires_at`. Unknown run IDs are allowed with an audit warning unless `require_known_run_id` is true. New generated configs and examples set `require_known_run_id: true`; the code default remains false for compatibility, and `validate-config` reports a warning when a config leaves it false. A route can set `require_run_id: true`.
+If `metadata.run_id` or `X-ASG-Run-Id` is present and known, the gateway applies `allowed_routes`, `denied_routes`, and `expires_at`. Static `runs.<run_id>` entries take precedence. If no static entry exists, ASG looks up the latest valid record in `run_store.path`, defaulting to `~/.agent-security-gateway/runs.jsonl`. Unknown run IDs are allowed with an audit warning unless `require_known_run_id` is true. New generated configs and examples set `require_known_run_id: true`; the code default remains false for compatibility, and `validate-config` reports a warning when a config leaves it false. A route can set `require_run_id: true`.
+
+## Run Registration
+
+Use runtime registration when workers create task-specific run IDs that cannot be listed in static config:
+
+1. The controller calls `POST /v1/runs` with route `security.runs.register` and capability `register_run`.
+2. ASG validates the requested route scope, caller scope, and expiry, then appends a JSONL run record and writes a `run_registration` audit event.
+3. The controller gives the returned `run_id` to the worker.
+4. The worker includes that `run_id` in `metadata.run_id` or `X-ASG-Run-Id`.
+5. With `require_known_run_id: true`, registered and unexpired runs are allowed only inside their run scope; unregistered runs fail closed with `run_scope_denied`.
+
+Run scope only narrows permissions. Agent `allowed_routes`, agent `allowed_capabilities`, route `allowed_callers`, and route required capability are enforced before run scope. Registering a run with `allowed_routes: ["pi.web_research.chat"]` does not let an agent call that route unless the agent already has the route and capability.
+
+Dynamic run records can include `allowed_callers` to prevent run ID reuse by another agent. If present, the caller's `agent_id` must match one of those values. Expired records fail closed with `run_expired` even before garbage collection runs.
+
+Remove expired dynamic records with:
+
+```bash
+python3 gateway.py --config ~/.agent-security-gateway/config.json gc-runs --dry-run
+python3 gateway.py --config ~/.agent-security-gateway/config.json gc-runs
+```
 
 ## Taint Tracking
 
@@ -720,6 +761,13 @@ Check and remove expired artifacts:
 ```bash
 python3 gateway.py --config ~/.agent-security-gateway/config.json gc-artifacts --dry-run
 python3 gateway.py --config ~/.agent-security-gateway/config.json gc-artifacts
+```
+
+Check and remove expired dynamic runs:
+
+```bash
+python3 gateway.py --config ~/.agent-security-gateway/config.json gc-runs --dry-run
+python3 gateway.py --config ~/.agent-security-gateway/config.json gc-runs
 ```
 
 Run a worker-side OpenAI-compatible shim when a worker runtime cannot attach ASG

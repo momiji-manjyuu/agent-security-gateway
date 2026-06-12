@@ -63,6 +63,10 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
             "audit_log": str(args.runtime_dir / "audit.jsonl"),
             "kill_switch_file": str(args.runtime_dir / "KILL_SWITCH"),
             "approval_store": str(args.runtime_dir / "approvals.jsonl"),
+            "run_store": {
+                "path": str(args.runtime_dir / "runs.jsonl"),
+                "max_ttl_seconds": gateway.DEFAULT_RUN_MAX_TTL_SECONDS,
+            },
             "require_known_run_id": True,
         }
     )
@@ -70,10 +74,11 @@ def build_config(args: argparse.Namespace, mac_token: str, pi_token: str, human_
         "mac_gpt55": {
             "token_sha256": gateway.hash_token(mac_token),
             "trust_tier": "privileged_core",
-            "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "generate_image"],
+            "allowed_capabilities": ["inspect", "delegate_web_research", "search_trusted_knowledge", "generate_image", "register_run"],
             "allowed_client_cidrs": sorted({"127.0.0.1/32", bind_cidr}),
             "allowed_routes": [
                 "security.inspect_only",
+                "security.runs.register",
                 "pi.web_research.chat",
                 "ubuntu1.knowledge.search_trusted",
                 "windows_image.comfyui.generate",
