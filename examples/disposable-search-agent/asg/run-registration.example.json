@@ -1,0 +1,6 @@
+{
+  "allowed_routes": ["docker90.web_research.task", "docker90.artifacts.submit"],
+  "allowed_callers": ["controller", "docker90_search"],
+  "ttl_seconds": 900,
+  "reason": "Disposable public web research"
+}

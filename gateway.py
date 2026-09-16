@@ -26,6 +26,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import unicodedata
@@ -60,6 +61,7 @@ REPORT_POLICY_BOOL_FIELDS = {
     "notify_on_block",
 }
 NON_APPROVABLE_ACTION_CATEGORIES = {
+    "inspection_limit",
     "caller_controlled_backend",
     "private_network_target",
     "metadata_endpoint",
@@ -223,6 +225,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bind": "127.0.0.1",
     "port": 8788,
     "max_body_bytes": 524_288,
+    "request_read_timeout_seconds": 15,
+    "max_concurrent_requests": 32,
     "kill_switch_file": str(DEFAULT_KILL_SWITCH),
     "audit_log": str(DEFAULT_AUDIT_PATH),
     "approval_store": str(DEFAULT_APPROVAL_STORE),
@@ -289,6 +293,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "require_message_type": "artifact",
             },
             "artifact_policy": {
+                "allowed_operations": ["submit"],
                 "max_artifact_bytes": 10_485_760,
             },
             "output_policy": {
@@ -319,6 +324,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "allow_missing_taint": False,
             },
             "artifact_policy": {
+                "allowed_operations": ["metadata", "content"],
                 "allowed_statuses": ["verified"],
             },
             "output_policy": {
@@ -345,6 +351,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "allow_missing_taint": False,
             },
             "artifact_policy": {
+                "allowed_operations": ["metadata", "content"],
                 "allowed_statuses": ["needs_review"],
             },
             "output_policy": {
@@ -488,6 +495,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
     max_body, max_body_ok = parse_int(cfg.get("max_body_bytes"), default=524_288)
     if not max_body_ok or max_body <= 0:
         errors.append("max_body_bytes must be a positive integer")
+    for field, default in (("request_read_timeout_seconds", 15), ("max_concurrent_requests", 32)):
+        value = cfg.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 600:
+            errors.append(f"{field} must be between 1 and 600")
     if "require_known_run_id" in cfg and not isinstance(cfg.get("require_known_run_id"), bool):
         errors.append("require_known_run_id must be a boolean")
     run_store = cfg.get("run_store", {})
@@ -544,6 +555,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
             errors.append(f"routes.{route_id} must be an object")
             continue
         kind = str(route.get("kind", ""))
+        if isinstance(route.get("input_policy"), dict) and route["input_policy"].get("allow_defensive_secret_instructions"):
+            errors.append(f"routes.{route_id}.input_policy.allow_defensive_secret_instructions is no longer supported; put defensive instructions in the configured backend")
         if kind not in ROUTE_KINDS:
             errors.append(f"routes.{route_id}.kind must be one of {sorted(ROUTE_KINDS)}")
         required_capability = route.get("required_capability")
@@ -612,6 +625,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
             errors.append(f"routes.{route_id}.artifact_policy must be an object")
             artifact_policy = {}
         if isinstance(artifact_policy, dict):
+            operations = artifact_policy.get("allowed_operations", [])
+            if not isinstance(operations, list) or any(not isinstance(op, str) or op not in {"submit", "metadata", "content", "review"} for op in operations):
+                errors.append(f"routes.{route_id}.artifact_policy.allowed_operations contains invalid operations")
             if "allowed_statuses" in artifact_policy:
                 statuses = artifact_policy.get("allowed_statuses")
                 if not isinstance(statuses, list) or not statuses:
@@ -693,9 +709,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
     if isinstance(runs, dict):
         for run_id, run in runs.items():
+            if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+                errors.append("static run IDs must use the bounded run identifier grammar")
             if not isinstance(run, dict):
                 errors.append(f"runs.{run_id} must be an object")
                 continue
+            callers = run.get("allowed_callers", [])
+            if not isinstance(callers, list) or any(not isinstance(caller, str) or caller not in agents for caller in callers):
+                errors.append(f"runs.{run_id}.allowed_callers must reference configured agents")
             for field in ("allowed_routes", "denied_routes"):
                 values = run.get(field, [])
                 if values and not isinstance(values, list):
@@ -805,14 +826,19 @@ def resolve_capability(headers: Any, payload: dict[str, Any], *, inspect_default
 
 
 def resolve_optional_id(headers: Any, payload: dict[str, Any], header_name: str, metadata_name: str) -> str | None:
-    header = header_value(headers, header_name)
     meta = metadata(payload)
-    value = header
-    if not value and isinstance(meta.get(metadata_name), str):
-        value = meta[metadata_name].strip()
-    if not value and isinstance(payload.get(metadata_name), str):
-        value = payload[metadata_name].strip()
-    return value or None
+    header_values = headers.get_all(header_name, []) if hasattr(headers, "get_all") else [headers.get(header_name)]
+    values = [*header_values, meta.get(metadata_name), payload.get(metadata_name)]
+    present = []
+    for value in values:
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not RUN_ID_PATTERN.fullmatch(value):
+            raise GatewayError(400, "invalid_identifier", f"{metadata_name} must be a bounded identifier")
+        present.append(value)
+    if len(set(present)) > 1:
+        raise GatewayError(400, "scope_conflict", f"conflicting {metadata_name} values")
+    return present[0] if present else None
 
 
 def resolve_taint(payload: dict[str, Any]) -> list[str]:
@@ -928,7 +954,7 @@ def enforce_run_scope(decision: RouteDecision, cfg: dict[str, Any], agent_id: st
     if allowed_routes and decision.route_id not in allowed_routes:
         raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' does not allow route '{decision.route_id}'")
     allowed_callers = set(str(item) for item in run.get("allowed_callers") or [])
-    if run_source == "dynamic" and allowed_callers and agent_id not in allowed_callers:
+    if allowed_callers and agent_id not in allowed_callers:
         raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' is not allowed for agent '{agent_id}'")
 
 
@@ -956,6 +982,8 @@ def payload_message_type(payload: dict[str, Any]) -> str:
 
 
 def enforce_input_policy(payload: dict[str, Any], decision: RouteDecision) -> None:
+    if "receipt_type" in payload:
+        raise GatewayError(403, "input_policy_denied", "receipt_type is reserved for gateway-generated receipts")
     policy = decision.route.get("input_policy", {})
     if not isinstance(policy, dict):
         raise GatewayError(403, "input_policy_denied", "route input_policy is invalid")
@@ -1211,10 +1239,13 @@ def route_allows_private_instruction_hosts(decision: RouteDecision, text: str) -
 
 
 def route_allows_defensive_secret_instruction(decision: RouteDecision, text: str) -> bool:
-    return bool(route_input_policy(decision).get("allow_defensive_secret_instructions")) and bool(DEFENSIVE_SECRET_INSTRUCTION_PATTERN.search(text))
+    # A natural-language clause cannot authorize another clause in the request.
+    return False
 
 
 def route_allows_input_finding(decision: RouteDecision, finding: security.Finding, text: str) -> bool:
+    if finding.category.startswith("boundary:"):
+        return False
     policy = route_input_policy(decision)
     allowed = policy.get("allow_scanner_findings") or []
     if isinstance(allowed, list) and finding.category in {str(item) for item in allowed}:
@@ -1242,7 +1273,7 @@ def apply_route_inbound_scan_policy(inbound: security.InboundScan, decision: Rou
         return inbound
     inbound.scan.findings = kept
     inbound.scan.risk_score = sum(finding.severity for finding in kept)
-    inbound.scan.blocked = inbound.scan.risk_score >= int(cfg.get("block_risk_score", 8))
+    inbound.scan.blocked = any(f.category.startswith("boundary:") for f in kept) or inbound.scan.risk_score >= int(cfg.get("block_risk_score", 8))
     inbound.scan.requires_review = inbound.scan.risk_score >= int(cfg.get("review_risk_score", 4))
     for category in sorted(set(ignored_categories)):
         decision.warnings.append("route_ignored_input_finding:" + category)
@@ -1279,11 +1310,16 @@ def is_private_host(host: str) -> bool:
         return False
 
 
-def action_guard(headers: Any, payload: dict[str, Any]) -> ActionGuardResult:
+def action_guard(headers: Any, payload: dict[str, Any], cfg: dict[str, Any] | None = None) -> ActionGuardResult:
     findings: list[security.Finding] = []
     content = security.extract_content(payload)
     control_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    normalized, _ = security.normalize_untrusted_text(content + "\n" + control_text, DEFAULT_CONFIG)
+    effective_cfg = DEFAULT_CONFIG if cfg is None else cfg
+    normalized, removed = security.normalize_untrusted_text(content, effective_cfg)
+    if removed["truncated"] or len(content) > int(effective_cfg.get("normalize", {}).get("max_content_chars", 40_000)):
+        findings.append(security.Finding("action_guard:inspection_limit", 10, "complete action exceeds inspection limit"))
+    normalized += "\n" + "\n".join(security.normalize_untrusted_text(text, effective_cfg)[0]
+                                    for text in security.multipart_texts(payload))
 
     if header_value(headers, "X-Target-URL"):
         findings.append(security.Finding("action_guard:caller_controlled_backend", 10, "X-Target-URL is not allowed"))
@@ -1319,7 +1355,8 @@ def action_guard(headers: Any, payload: dict[str, Any]) -> ActionGuardResult:
             continue
         seen.add(key)
         deduped.append(finding)
-    return ActionGuardResult("sha256:" + sha256_text(normalized), deduped)
+    # Bind approval to every original field, not a lossy or shortened projection.
+    return ActionGuardResult("sha256:" + sha256_text(control_text), deduped)
 
 
 def route_allows_action_finding(decision: RouteDecision, finding: security.Finding, text: str) -> bool:
@@ -1328,6 +1365,7 @@ def route_allows_action_finding(decision: RouteDecision, finding: security.Findi
     if finding.category == "action_guard:secret_exfiltration":
         return route_allows_defensive_secret_instruction(decision, text)
     if finding.category in {
+        "action_guard:inspection_limit",
         "action_guard:caller_controlled_backend",
         "action_guard:metadata_endpoint",
         "action_guard:dangerous_uri_scheme",
@@ -1341,7 +1379,8 @@ def route_allows_action_finding(decision: RouteDecision, finding: security.Findi
 
 
 def apply_route_action_guard_policy(result: ActionGuardResult, decision: RouteDecision, payload: dict[str, Any]) -> ActionGuardResult:
-    text = security.extract_content(payload) + "\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    text = "\n".join([security.extract_content(payload), json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                      *security.multipart_texts(payload)])
     kept: list[security.Finding] = []
     ignored_categories: list[str] = []
     for finding in result.findings:
@@ -1848,7 +1887,6 @@ def receipt_summary_ja(receipt: dict[str, Any]) -> str:
 
 def audit_receipt_chat_messages(receipt: dict[str, Any]) -> list[dict[str, str]]:
     allowed_fields = (
-        "summary_ja",
         "receipt_type",
         "ok",
         "decision",
@@ -1860,17 +1898,18 @@ def audit_receipt_chat_messages(receipt: dict[str, Any]) -> list[dict[str, str]]
         "capability",
         "run_id",
         "task_id",
-        "message_type",
-        "taint",
-        "warnings",
         "content_sha256",
         "content_length",
-        "scan",
-        "action_guard",
-        "delivery",
     )
     summary = {field: receipt.get(field) for field in allowed_fields if field in receipt}
-    summary_line = receipt_summary_ja(receipt)
+    # IDs chosen by a caller are correlation data, not prose for the model.
+    for field in ("run_id", "task_id"):
+        if summary.get(field) is not None:
+            summary[field] = "sha256_" + sha256_text(str(summary[field]))
+    summary["scan"] = {"finding_count": receipt_finding_count(receipt)}
+    if receipt.get("message_type") in {"source_card", "worker_report", "verification_result", "sandbox_result", "model_report"}:
+        summary["message_type"] = receipt["message_type"]
+    summary_line = receipt_summary_ja(summary)
     summary["summary_ja"] = summary_line
     content = (
         summary_line
@@ -2220,9 +2259,11 @@ def forward_artifact_review(
     client_ip: str,
 ) -> tuple[int, dict[str, Any]]:
     backend = decision.route.get("backend", {})
+    enforce_artifact_operation(decision, "review")
     root = artifact_store_root(cfg)
     artifact_id = artifact_review_artifact_id(payload)
     source_manifest = load_artifact_manifest(root, artifact_id)
+    decision = authorize_artifact_scope(source_manifest, decision, verified, cfg)
     enforce_artifact_access_policy(source_manifest, decision, cfg)
     media_type = normalize_media_type(source_manifest.get("media_type"))
     if not media_type_is_text(media_type):
@@ -2233,6 +2274,7 @@ def forward_artifact_review(
     content = blob.read_bytes()
     if hashlib.sha256(content).hexdigest() != source_manifest.get("content_sha256"):
         raise GatewayError(500, "artifact_integrity_error", "artifact content hash does not match manifest")
+    verify_stored_artifact_content(content, source_manifest, cfg)
     try:
         artifact_text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -2411,24 +2453,23 @@ def openai_response(content: str, model: str) -> dict[str, Any]:
 
 
 def output_text_for_route(payload: dict[str, Any], route_kind: str) -> str:
-    if route_kind == "openai_chat_completions":
-        return security.extract_openai_response_text(payload)
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return security.complete_text(payload)
 
 
 def enforce_output_guard(payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> security.ScanResult:
-    text = output_text_for_route(payload, str(decision.route.get("kind")))
-    scan = security.scan_output_text(text, cfg, None)
+    scan = security.output_guard_scan_for_upstream(payload, cfg, None)
     output_policy = decision.route.get("output_policy", {})
     if isinstance(output_policy, dict) and output_policy.get("require_json_object"):
         try:
-            parsed = json.loads(text)
+            # JSON shape validation and complete security inspection need
+            # different projections; decoded scan text is not JSON syntax.
+            parsed = json.loads(security.extract_openai_response_text(payload)) if decision.route.get("kind") == "openai_chat_completions" else payload
             if not isinstance(parsed, dict):
                 scan.findings.append(security.Finding("output_guard:not_json_object", 8, "route requires a JSON object output"))
         except json.JSONDecodeError:
             scan.findings.append(security.Finding("output_guard:not_json_object", 8, "route requires a JSON object output"))
         scan.risk_score = sum(f.severity for f in scan.findings)
-        scan.blocked = scan.risk_score >= int(cfg.get("output_guard", {}).get("block_risk_score", cfg.get("block_risk_score", 8)))
+        scan.blocked = scan.blocked or scan.risk_score >= int(cfg.get("output_guard", {}).get("block_risk_score", cfg.get("block_risk_score", 8)))
         scan.requires_review = scan.risk_score >= int(cfg.get("output_guard", {}).get("review_risk_score", cfg.get("review_risk_score", 4)))
     return scan
 
@@ -2477,14 +2518,11 @@ def route_report_policy(route: dict[str, Any]) -> dict[str, Any]:
 
 
 def report_policy_enabled(path: str, decision: RouteDecision, field: str) -> bool:
-    if path != "/v1/results":
-        return False
+    # Policy belongs to the authorized route, independent of endpoint spelling.
     return bool(route_report_policy(decision.route).get(field, False))
 
 
 def report_policy_notify_on_block(path: str, decision: RouteDecision) -> bool:
-    if path != "/v1/results":
-        return False
     policy = route_report_policy(decision.route)
     if "notify_on_block" in policy:
         return bool(policy.get("notify_on_block"))
@@ -2492,8 +2530,6 @@ def report_policy_notify_on_block(path: str, decision: RouteDecision) -> bool:
 
 
 def check_report_receipt_rate_limit(path: str, verified: VerifiedAgent, decision: RouteDecision) -> None:
-    if path != "/v1/results":
-        return
     policy = route_report_policy(decision.route)
     if not policy.get("forward_audit_receipt"):
         return
@@ -3090,7 +3126,12 @@ def safe_artifact_filename(value: Any) -> str:
 def normalize_media_type(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         return "application/octet-stream"
-    return value.split(";", 1)[0].strip().lower() or "application/octet-stream"
+    if len(value) > 255 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise GatewayError(400, "invalid_media_type", "media_type contains control characters")
+    media_type = value.split(";", 1)[0].strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*", media_type):
+        raise GatewayError(400, "invalid_media_type", "media_type must be a valid type/subtype")
+    return media_type
 
 
 def detect_artifact_media_type(content: bytes) -> tuple[str, str]:
@@ -3130,7 +3171,7 @@ def artifact_media_type_matches(declared: str, detected: str) -> bool:
 def add_scan_finding(scan: security.ScanResult, finding: security.Finding, cfg: dict[str, Any]) -> None:
     scan.findings.append(finding)
     scan.risk_score = sum(item.severity for item in scan.findings)
-    scan.blocked = scan.risk_score >= int(cfg.get("block_risk_score", 8))
+    scan.blocked = scan.blocked or scan.risk_score >= int(cfg.get("block_risk_score", 8))
     scan.requires_review = scan.risk_score >= int(cfg.get("review_risk_score", 4))
 
 
@@ -3287,6 +3328,36 @@ def artifact_access_payload(headers: Any, manifest: dict[str, Any]) -> dict[str,
     return payload
 
 
+def enforce_artifact_operation(decision: RouteDecision, operation: str) -> None:
+    required = {"submit": {"submit_artifact"}, "metadata": {"download_artifact", "review_quarantined_artifact"}, "content": {"download_artifact", "review_quarantined_artifact"}, "review": {"review_artifact"}}
+    allowed = route_artifact_policy(decision).get("allowed_operations", [])
+    if not isinstance(allowed, list) or operation not in allowed or decision.capability not in required[operation]:
+        raise GatewayError(403, "artifact_operation_denied", f"artifact {operation} requires an artifact capability")
+
+
+def verify_stored_artifact_content(content: bytes, manifest: dict[str, Any], cfg: dict[str, Any]) -> None:
+    # A previous scanner's verified label cannot authorize unchecked legacy bytes.
+    if manifest.get("status") == "verified":
+        inspection = inspect_artifact_content(content, normalize_media_type(manifest.get("media_type")), cfg)
+        if inspection["status"] != "verified":
+            raise GatewayError(403, "artifact_reinspection_required", "stored artifact no longer passes content inspection")
+
+
+def authorize_artifact_scope(manifest: dict[str, Any], decision: RouteDecision, verified: VerifiedAgent, cfg: dict[str, Any]) -> RouteDecision:
+    scope = {}
+    for field in ("run_id", "task_id"):
+        stored = manifest.get(field)
+        requested = getattr(decision, field)
+        if stored is not None and (not isinstance(stored, str) or not RUN_ID_PATTERN.fullmatch(stored)):
+            raise GatewayError(403, "artifact_scope_denied", "stored artifact scope is invalid")
+        if requested and stored and requested != stored:
+            raise GatewayError(403, "artifact_scope_denied", "artifact scope does not match request")
+        scope[field] = stored or requested
+    effective = dataclasses.replace(decision, **scope, taint=list(manifest.get("taint", [])))
+    enforce_route_policy(verified, effective, cfg)
+    return effective
+
+
 def enforce_artifact_access_policy(manifest: dict[str, Any], decision: RouteDecision, cfg: dict[str, Any]) -> None:
     enforce_artifact_retention(manifest, cfg)
     status = str(manifest.get("status", ""))
@@ -3398,7 +3469,37 @@ def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
     server_version = "AgentSecurityGateway/" + VERSION
 
+    def setup(self) -> None:
+        super().setup()
+        deadline = float(self.server.config.get("request_read_timeout_seconds", 15))
+        self.connection.settimeout(deadline)
+        # A socket idle timeout alone does not bound a slowly dripped request.
+        self._read_deadline = threading.Timer(deadline, self.expire_request_read)
+        self._read_deadline.daemon = True
+        self._read_deadline.start()
+
+    def expire_request_read(self) -> None:
+        self._read_expired = True
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except OSError:
+            # Windows can raise from header parsing when the timer shuts down
+            # the socket. A deliberate read expiry is normal termination.
+            if not getattr(self, "_read_expired", False):
+                raise
+
+    def finish(self) -> None:
+        self._read_deadline.cancel()
+        super().finish()
+
     def do_GET(self) -> None:  # noqa: N802
+        self._read_deadline.cancel()
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/healthz":
             cfg = self.server.config  # type: ignore[attr-defined]
@@ -3459,7 +3560,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_artifact_submit(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         decision: RouteDecision | None = None
@@ -3470,11 +3571,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             decision = resolve_route_decision(self.headers, payload, cfg)
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
+            enforce_artifact_operation(decision, "submit")
             enforce_input_policy(payload, decision)
 
             metadata_payload = artifact_policy_payload(payload)
             metadata_inbound = scan_inbound_for_route(metadata_payload, cfg, decision)
-            metadata_action = apply_route_action_guard_policy(action_guard(self.headers, metadata_payload), decision, metadata_payload)
+            metadata_action = apply_route_action_guard_policy(action_guard(self.headers, metadata_payload, cfg), decision, metadata_payload)
             if metadata_inbound.scan.blocked:
                 raise GatewayError(403, "blocked_by_input_guard", "artifact metadata was blocked by input guard")
             if metadata_inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get("block_on_review", cfg.get("review_policy", {}).get("block_forward", False))):
@@ -3541,7 +3643,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_artifact_metadata(self, artifact_id: str) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         decision: RouteDecision | None = None
@@ -3553,6 +3655,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             decision = resolve_route_decision(self.headers, artifact_access_payload(self.headers, manifest), cfg)
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
+            enforce_artifact_operation(decision, "metadata")
             enforce_input_policy(artifact_access_payload(self.headers, manifest), decision)
             enforce_artifact_access_policy(manifest, decision, cfg)
             write_audit(
@@ -3574,7 +3677,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_artifact_content(self, artifact_id: str) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         decision: RouteDecision | None = None
@@ -3587,6 +3690,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             decision = resolve_route_decision(self.headers, access_payload, cfg)
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
+            enforce_artifact_operation(decision, "content")
             enforce_input_policy(access_payload, decision)
             enforce_artifact_access_policy(manifest, decision, cfg)
             blob = artifact_blob_read_path(root, str(manifest.get("content_sha256", "")))
@@ -3595,6 +3699,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             content = blob.read_bytes()
             if hashlib.sha256(content).hexdigest() != manifest.get("content_sha256"):
                 raise GatewayError(500, "artifact_integrity_error", "artifact content hash does not match manifest")
+            verify_stored_artifact_content(content, manifest, cfg)
             write_audit(
                 cfg,
                 {
@@ -3612,7 +3717,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.write_bytes(
                 200,
                 content,
-                str(manifest.get("media_type") or "application/octet-stream"),
+                normalize_media_type(manifest.get("media_type")),
                 {
                     "Content-Disposition": f'attachment; filename="{filename}"',
                     "X-ASG-Artifact-Id": artifact_id,
@@ -3627,7 +3732,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_routes(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         try:
             self.check_kill_switch(cfg, request_id, client_ip)
@@ -3647,7 +3752,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_inspect(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         try:
@@ -3660,7 +3765,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if capability not in set(str(item) for item in verified.agent.get("allowed_capabilities") or []):
                 raise GatewayError(403, "capability_denied", f"capability '{capability}' is not allowed for agent '{verified.agent_id}'")
             inbound = scan_inbound(payload, cfg)
-            action = action_guard(self.headers, payload)
+            action = action_guard(self.headers, payload, cfg)
             event = {
                 "event": "inspect",
                 "decision": "allow",
@@ -3689,7 +3794,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_routed_request(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         decision: RouteDecision | None = None
@@ -3703,7 +3808,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             enforce_input_policy(payload, decision)
             message_type = payload_message_type(payload)
             inbound = scan_inbound_for_route(payload, cfg, decision)
-            action = apply_route_action_guard_policy(action_guard(self.headers, payload), decision, payload)
+            action = apply_route_action_guard_policy(action_guard(self.headers, payload, cfg), decision, payload)
             event = {
                 **audit_base(request_id, verified, client_ip, decision),
                 "content_sha256": inbound.scan.normalized_sha256,
@@ -3842,7 +3947,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_approval(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         decision: RouteDecision | None = None
@@ -3929,7 +4034,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_run_register(self) -> None:
         cfg = self.server.config  # type: ignore[attr-defined]
-        request_id = self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex
+        request_id = "req_" + uuid.uuid4().hex
         client_ip = self.client_address[0]
         verified: VerifiedAgent | None = None
         decision: RouteDecision | None = None
@@ -3994,7 +4099,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if kind == "inspect_only":
             inbound = scan_inbound(payload, cfg)
             return 200, {
-                "request_id": self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex,
+                "request_id": request_id or "req_" + uuid.uuid4().hex,
                 "route_id": decision.route_id,
                 "scan": inbound.scan.public_dict(),
                 "structured_extract": inbound.structured_extract,
@@ -4011,7 +4116,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 payload,
                 decision,
                 verified,
-                request_id=request_id or self.headers.get("X-Request-ID") or "req_" + uuid.uuid4().hex,
+                request_id=request_id or "req_" + uuid.uuid4().hex,
                 client_ip=client_ip or self.client_address[0],
             )
         raise GatewayError(502, "backend_error", f"unsupported route kind: {kind}")
@@ -4081,11 +4186,22 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             raise GatewayError(503, "kill_switch_active", "kill switch is active")
 
     def check_rate_limit(self, cfg: dict[str, Any], verified: VerifiedAgent, decision: RouteDecision, client_ip: str) -> None:
-        allowed, retry_after = security.RATE_LIMITER.check(f"agent:{verified.agent_id}:{client_ip}:{decision.capability}", cfg)
+        if getattr(self, "_admitted", False):
+            return
+        self.admit_agent(cfg, verified, client_ip)
+
+    def admit_agent(self, cfg: dict[str, Any], verified: VerifiedAgent, client_ip: str) -> None:
+        allowed, retry_after = security.RATE_LIMITER.check(f"agent:{verified.agent_id}:{client_ip}", cfg)
         if not allowed:
             raise GatewayError(429, "rate_limited", f"rate limited; retry after {retry_after} seconds")
+        self._admitted = True
 
     def read_json_body(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        # Admission uses only the authenticated identity, before parsing caller fields.
+        verified = verify_agent(self.headers, cfg, self.client_address[0])
+        self.admit_agent(cfg, verified, self.client_address[0])
+        if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+            raise GatewayError(400, "invalid_json", "one Content-Length and no Transfer-Encoding are required")
         length_text = self.headers.get("Content-Length", "0")
         try:
             length = int(length_text)
@@ -4094,7 +4210,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         max_body = int(cfg.get("max_body_bytes", 524_288))
         if length < 0 or length > max_body:
             raise GatewayError(413, "request_too_large", "request body is too large")
-        raw = self.rfile.read(length)
+        try:
+            raw = self.rfile.read(length)
+        except OSError as exc:
+            self._read_expired = True
+            raise GatewayError(408, "request_timeout", "request body read failed") from exc
+        self._read_deadline.cancel()
+        if len(raw) != length:
+            raise GatewayError(400, "invalid_json", "incomplete request body")
         try:
             payload = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
@@ -4143,6 +4266,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self.write_json(500, json_error("internal_error", "internal error", request_id))
 
     def write_json(self, status: int, body: dict[str, Any], extra_headers: dict[str, str] | None = None) -> None:
+        if getattr(self, "_read_expired", False):
+            self.close_connection = True
+            return
         encoded = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4171,6 +4297,28 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
 class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     config: dict[str, Any]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._capacity: threading.BoundedSemaphore | None = None
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if self._capacity is None:
+            self._capacity = threading.BoundedSemaphore(int(getattr(self, "config", {}).get("max_concurrent_requests", 32)))
+        if not self._capacity.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._capacity.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._capacity.release()
 
 
 def serve(config_path: Path) -> None:

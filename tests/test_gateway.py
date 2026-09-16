@@ -264,6 +264,7 @@ class GatewayTests(unittest.TestCase):
                         "allow_missing_taint": False,
                     },
                     "artifact_policy": {
+                        "allowed_operations": ["review"],
                         "allowed_statuses": ["verified"],
                     },
                     "output_policy": {"block_secrets": True, "block_private_urls": True, "block_internal_paths": True},
@@ -338,9 +339,9 @@ class GatewayTests(unittest.TestCase):
         server.config = cfg
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
         host, port = server.server_address
         return f"http://{host}:{port}"
 
@@ -350,9 +351,9 @@ class GatewayTests(unittest.TestCase):
             server.response_body = response_body  # type: ignore[attr-defined]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
         host, port = server.server_address
         return f"http://{host}:{port}", server
 
@@ -1031,13 +1032,12 @@ class GatewayTests(unittest.TestCase):
             cfg = self.make_config(tmp, backend_url=backend_url)
             policy = cfg["routes"]["pi.web_research.chat"]["input_policy"]
             policy["allowed_private_instruction_hosts"] = ["192.168.1.60"]
-            policy["allow_defensive_secret_instructions"] = True
             gateway.validate_config(cfg)
             base = self.start_gateway(cfg)
             payload = self.chat_payload()
             payload["messages"][0]["content"] = (
                 "Use the configured ASG report path at http://192.168.1.60:8788/v1/results "
-                "after the local check. Do not print or reveal any token."
+                "after the local check."
             )
             status, _ = self.request_json(base, "/v1/chat/completions", payload)
             self.assertEqual(status, 200)
@@ -1412,7 +1412,10 @@ class GatewayTests(unittest.TestCase):
             forwarded = json.dumps(backend.last_body, ensure_ascii=False)  # type: ignore[attr-defined]
             message_content = backend.last_body["messages"][0]["content"]  # type: ignore[index]
             first_line = message_content.splitlines()[0]
-            self.assertTrue(first_line.startswith("ソースカード報告: pi_research_1 からの task task-report / run run-report を許可"))
+            self.assertTrue(first_line.startswith("ソースカード報告: pi_research_1 からの task sha256_"))
+            self.assertIn("sha256_" + gateway.sha256_text("task-report"), message_content)
+            self.assertNotIn("task-report", message_content)
+            self.assertNotIn("run-report", message_content)
             self.assertIn("生のワーカー報告本文は転送していません", message_content)
             self.assertIn("asg_result_audit", forwarded)
             self.assertNotIn("Agent Security Gateway received a worker completion report", forwarded)

@@ -27,9 +27,9 @@ class ResultReceiptCollectorTests(unittest.TestCase):
         server.config = config
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
         host, port = server.server_address
         return f"http://{host}:{port}"
 

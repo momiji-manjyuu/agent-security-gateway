@@ -1,0 +1,16 @@
+{
+  "llm_inspector": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:14000/v1",
+    "model": "deepseek-v4-flash",
+    "api_key_env": "",
+    "require_api_key": false,
+    "max_chars": 3000,
+    "max_tokens": 1500,
+    "timeout_seconds": 55,
+    "min_risk_score": 0,
+    "block_score": 0.82,
+    "inspect_blocked": false,
+    "fail_closed": true
+  }
+}

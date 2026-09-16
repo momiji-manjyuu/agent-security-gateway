@@ -1,0 +1,29 @@
+services:
+  worker:
+    build: .
+    image: disposable-search-worker:local
+    network_mode: none
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stdin_open: true
+    tty: false
+    restart: "no"
+    pids_limit: 64
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    ulimits:
+      core: 0
+      nofile:
+        soft: 128
+        hard: 128
+    logging:
+      driver: none
+    labels:
+      local.disposable-search: "true"

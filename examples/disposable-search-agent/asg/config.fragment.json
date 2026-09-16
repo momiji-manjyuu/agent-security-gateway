@@ -1,0 +1,69 @@
+{
+  "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
+  "require_known_run_id": true,
+  "agents": {
+    "controller": {
+      "token_sha256": "REPLACE_WITH_EXISTING_CONTROLLER_TOKEN_SHA256",
+      "trust_tier": "privileged_core",
+      "allowed_client_cidrs": ["127.0.0.1/32"],
+      "allowed_capabilities": ["delegate_web_research"],
+      "allowed_routes": ["docker90.web_research.task"]
+    },
+    "docker90_search": {
+      "token_sha256": "REPLACE_WITH_WORKER_TOKEN_SHA256",
+      "trust_tier": "web_dmz",
+      "allowed_client_cidrs": ["127.0.0.1/32"],
+      "allowed_capabilities": ["submit_artifact"],
+      "allowed_routes": ["docker90.artifacts.submit"]
+    }
+  },
+  "routes": {
+    "docker90.web_research.task": {
+      "kind": "http_json",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://127.0.0.1:18790",
+        "path": "/v1/tasks",
+        "method": "POST",
+        "api_key_env": "ASG_SEARCH_BACKEND_KEY",
+        "require_signature": true,
+        "timeout_seconds": 240
+      },
+      "allowed_callers": ["controller"],
+      "required_capability": "delegate_web_research",
+      "require_run_id": true,
+      "input_policy": {
+        "accepted_taint": ["trusted_instruction"],
+        "allow_missing_taint": false,
+        "require_message_type": "task_instruction",
+        "require_structured_task": true,
+        "allow_raw_external_content": false,
+        "max_messages": 0,
+        "forbid_shell_from_chat": true,
+        "block_on_review": true
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "docker90.artifacts.submit": {
+      "kind": "inspect_only",
+      "allowed_callers": ["docker90_search"],
+      "required_capability": "submit_artifact",
+      "require_run_id": true,
+      "input_policy": {
+        "accepted_taint": ["untrusted_web", "sandbox_output"],
+        "allow_missing_taint": false,
+        "require_message_type": "artifact"
+      },
+      "artifact_policy": {"allowed_operations": ["submit"], "max_artifact_bytes": 65536},
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    }
+  }
+}

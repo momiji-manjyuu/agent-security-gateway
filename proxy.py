@@ -306,6 +306,7 @@ class RateLimiter:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._events: dict[str, list[float]] = {}
+        self._expires: dict[str, float] = {}
 
     def check(self, key: str, cfg: dict[str, Any], override: dict[str, Any] | None = None) -> tuple[bool, int]:
         options = dict(cfg.get("rate_limit", {}))
@@ -323,6 +324,12 @@ class RateLimiter:
         now = time.monotonic()
         cutoff = now - window
         with self._lock:
+            for expired_key in [item for item, deadline in self._expires.items() if deadline <= now]:
+                self._events.pop(expired_key, None)
+                self._expires.pop(expired_key, None)
+            # Never evict a live bucket to grant a fresh allowance.
+            if key not in self._events and len(self._events) >= 4096:
+                return False, max(1, int(window))
             events = [timestamp for timestamp in self._events.get(key, []) if timestamp >= cutoff]
             if len(events) >= max_requests:
                 retry_after = max(1, int(events[0] + window - now) + 1)
@@ -330,11 +337,13 @@ class RateLimiter:
                 return False, retry_after
             events.append(now)
             self._events[key] = events
+            self._expires[key] = now + window
             return True, 0
 
     def reset(self) -> None:
         with self._lock:
             self._events.clear()
+            self._expires.clear()
 
 
 RATE_LIMITER = RateLimiter()
@@ -405,9 +414,8 @@ def normalize_untrusted_text(text: str, cfg: dict[str, Any]) -> tuple[str, dict[
     removed: dict[str, int] = {"format": 0, "control": 0, "html_comments": 0, "truncated": 0}
     if options.get("unicode_nfkc", True):
         text = unicodedata.normalize("NFKC", text)
-    if options.get("strip_html_comments", True):
-        text, count = re.subn(r"<!--.*?-->", "", text, flags=re.DOTALL)
-        removed["html_comments"] = count
+    # Comments are data too: callers of this helper may forward the original.
+    # Keep their bodies visible to every scanner and to action inspection.
 
     output: list[str] = []
     for ch in text:
@@ -458,6 +466,9 @@ def untrusted_url_findings(url: str, *, category_prefix: str) -> list[Finding]:
 def scan_text(text: str, cfg: dict[str, Any]) -> ScanResult:
     normalized, removed = normalize_untrusted_text(text, cfg)
     findings: list[Finding] = []
+    too_large = len(text) > int(cfg.get("normalize", {}).get("max_content_chars", 40_000)) or removed["truncated"] > 0
+    if too_large:
+        findings.append(Finding("boundary:scan_limit", 10, "complete input exceeds the inspection limit"))
 
     if "[request_control:untrusted_message_role]" in normalized:
         findings.append(Finding("request_control:untrusted_message_role", 5, "untrusted caller supplied a privileged message role"))
@@ -501,18 +512,60 @@ def scan_text(text: str, cfg: dict[str, Any]) -> ScanResult:
         removed_chars=removed,
         findings=findings,
         risk_score=score,
-        blocked=score >= int(cfg.get("block_risk_score", 8)),
+        blocked=too_large or score >= int(cfg.get("block_risk_score", 8)),
         requires_review=score >= int(cfg.get("review_risk_score", 4)),
     )
 
 
-def extract_content(payload: Any) -> str:
+def complete_text(value: Any, *, redact_image_urls: bool = False) -> str:
+    """Inspect all decoded keys and values, including unknown extension fields."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if redact_image_urls and value.get("type") == "image_url" and isinstance(value.get("image_url"), dict):
+            image = value["image_url"]
+            if isinstance(image.get("url"), str):
+                report = content_to_text([{"type": "image_url", "image_url": {"url": image["url"]}}])
+                value = {**value, "image_url": {**image, "url": report}}
+        return "\n".join(str(key) + "\n" + complete_text(value[key], redact_image_urls=redact_image_urls) for key in sorted(value))
+    if isinstance(value, list):
+        return "\n".join(complete_text(item, redact_image_urls=redact_image_urls) for item in value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def multipart_texts(value: Any) -> list[str]:
+    """Text parts may be concatenated by a client without JSON separators."""
+    texts: list[str] = []
+    if isinstance(value, list):
+        parts = [item["text"] for item in value if isinstance(item, dict)
+                 and item.get("type") in ("text", "input_text", "output_text")
+                 and isinstance(item.get("text"), str)]
+        if len(parts) > 1:
+            texts.append("".join(parts))
+        for item in value:
+            texts.extend(multipart_texts(item))
+    elif isinstance(value, dict):
+        for key in sorted(value):
+            texts.extend(multipart_texts(value[key]))
+    return texts
+
+
+def merge_scan_results(scan: ScanResult, extra: ScanResult, thresholds: dict[str, Any]) -> None:
+    # An alternate projection must not count the same finding twice or turn
+    # an earlier hard block into an allow.
+    scan.findings.extend(f for f in extra.findings if f not in scan.findings)
+    scan.risk_score = sum(f.severity for f in scan.findings)
+    scan.blocked = scan.blocked or extra.blocked or scan.risk_score >= int(thresholds.get("block_risk_score", 8))
+    scan.requires_review = scan.requires_review or extra.requires_review or scan.risk_score >= int(thresholds.get("review_risk_score", 4))
+
+
+def extract_content(payload: Any, *, redact_image_urls: bool = False) -> str:
     if isinstance(payload, str):
         return payload
     if not isinstance(payload, dict):
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
-    chunks: list[str] = []
+    chunks: list[str] = [complete_text(payload, redact_image_urls=redact_image_urls)]
     if isinstance(payload.get("messages"), list):
         for msg in payload["messages"]:
             if not isinstance(msg, dict):
@@ -521,13 +574,11 @@ def extract_content(payload: Any) -> str:
             chunks.append(f"[{role}]")
             if str(role).lower() in UNTRUSTED_CONTROL_ROLES:
                 chunks.append(f"[request_control:untrusted_message_role] {role}")
-            chunks.append(content_to_text(msg.get("content")))
-            chunks.extend(extract_message_control_fields(msg))
-    elif "input" in payload:
-        chunks.append(content_to_text(payload.get("input")))
-    else:
-        chunks.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    chunks.extend(extract_request_control_fields(payload))
+            chunks.extend(f"[message_control:{field}]" for field in MESSAGE_CONTROL_FIELDS if field in msg)
+    for field in REQUEST_CONTROL_FIELDS:
+        if field in payload:
+            marker = f"[request_control:{field}]"
+            chunks.append(marker + (" " + json.dumps(payload[field]) if field == "stream" else ""))
     return "\n".join(chunks)
 
 
@@ -1241,7 +1292,7 @@ def apply_llm_inspector(scan: ScanResult, cfg: dict[str, Any]) -> None:
     if inspector_finding:
         scan.findings.append(inspector_finding)
         scan.risk_score += inspector_finding.severity
-        scan.blocked = scan.risk_score >= int(cfg.get("block_risk_score", 8))
+        scan.blocked = scan.blocked or scan.risk_score >= int(cfg.get("block_risk_score", 8))
         scan.requires_review = scan.risk_score >= int(cfg.get("review_risk_score", 4))
 
 
@@ -1443,6 +1494,7 @@ def scan_output_text(text: str, cfg: dict[str, Any], capability: str | None = No
         )
 
     scan = scan_text(text, output_normalize_config(effective_cfg))
+    inspection_incomplete = any(f.category == "boundary:scan_limit" for f in scan.findings)
     findings = list(scan.findings)
     normalized = scan.normalized_text
 
@@ -1461,7 +1513,7 @@ def scan_output_text(text: str, cfg: dict[str, Any], capability: str | None = No
 
     scan.findings = findings
     scan.risk_score = sum(f.severity for f in findings)
-    scan.blocked = scan.risk_score >= int(guard.get("block_risk_score", effective_cfg.get("block_risk_score", 8)))
+    scan.blocked = inspection_incomplete or scan.risk_score >= int(guard.get("block_risk_score", effective_cfg.get("block_risk_score", 8)))
     scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", effective_cfg.get("review_risk_score", 4)))
     return scan
 
@@ -1525,9 +1577,18 @@ class VerifiedAgent:
 def scan_inbound_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> InboundScan:
     extracted = extract_content(payload)
     scan = scan_text(extracted, cfg)
+    semantic_texts = multipart_texts(payload)
+    for text in semantic_texts:
+        merge_scan_results(scan, scan_text(text, cfg), cfg)
+    # Inspect complete URLs locally, but preserve image URL redaction for the
+    # optional inspector and derived text sent to a model or audit consumer.
+    projected = extract_content(payload, redact_image_urls=True)
+    if projected != extracted:
+        scan.normalized_text, _ = normalize_untrusted_text(projected, cfg)
+        scan.normalized_sha256 = sha256_text(scan.normalized_text)
     apply_llm_inspector(scan, cfg)
     return InboundScan(
-        extracted_text=extracted,
+        extracted_text="\n".join([extracted, *semantic_texts]),
         scan=scan,
         structured_extract=build_structured_extract(scan, cfg),
     )
@@ -1557,8 +1618,15 @@ def build_audit_base(
     return event
 
 
-def output_guard_scan_for_upstream(upstream: dict[str, Any], cfg: dict[str, Any], capability: str) -> ScanResult:
-    return scan_output_text(extract_openai_response_text(upstream), cfg, capability)
+def output_guard_scan_for_upstream(upstream: dict[str, Any], cfg: dict[str, Any], capability: str | None) -> ScanResult:
+    scan = scan_output_text(complete_text(upstream), cfg, capability)
+    effective = output_guard_config_for_capability(cfg, capability)
+    if not effective.get("output_guard", {}).get("enabled", True):
+        return scan
+    thresholds = {**effective, **effective.get("output_guard", {})}
+    for text in multipart_texts(upstream):
+        merge_scan_results(scan, scan_output_text(text, cfg, capability), thresholds)
+    return scan
 
 
 def output_guard_audit_event(

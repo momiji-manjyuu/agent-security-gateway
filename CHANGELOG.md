@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hardened complete-payload inspection, receipt-only forwarding, output metadata scanning, artifact operation/run authorization, media types, request deadlines, and rate limits. Removed the defensive-secret-instruction bypass; see `MIGRATION.md`.
+- Added 30 security-boundary regression tests and a disposable Docker research-worker example with fixed Qwen/DeepSeek model brokers, signed ASG integration, and CI coverage.
+
 - Reworked the project into Agent Security Gateway.
 - Added route-based policy resolution for multi-backend AI systems.
 - Added `gateway.py` with `/healthz`, `/inspect`, `/routes`, `/v1/chat/completions`, `/v1/tasks`, `/v1/results`, and `/v1/approvals`.

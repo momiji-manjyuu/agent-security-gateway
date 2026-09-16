@@ -1,0 +1,14 @@
+{
+  "route_id": "docker90.web_research.task",
+  "capability": "delegate_web_research",
+  "run_id": "REPLACE_WITH_REGISTERED_RUN_ID",
+  "task_id": "research-001",
+  "taint": ["trusted_instruction"],
+  "message_type": "task_instruction",
+  "task": {
+    "objective": "Dockerのnoneネットワークの動作を調べてください。",
+    "inputs": [{"url": "https://docs.docker.com/engine/network/drivers/none/"}],
+    "constraints": {"search": false, "max_sources": 3, "allowed_hosts": ["docs.docker.com"]},
+    "output_contract": {"format": "artifact_ref"}
+  }
+}

@@ -438,6 +438,7 @@ Example route:
     "allow_missing_taint": false
   },
   "artifact_policy": {
+    "allowed_operations": ["review"],
     "allowed_statuses": ["verified"]
   }
 }
@@ -554,7 +555,8 @@ Production enablement runbook:
    backend credentials.
 3. Point `security.artifacts.review_summary.backend.base_url` to the reviewer,
    for example `http://mac-controller.internal:8642/v1`, and keep
-   `artifact_policy.allowed_statuses: ["verified"]`.
+   `artifact_policy.allowed_statuses: ["verified"]` and
+   `artifact_policy.allowed_operations: ["review"]`.
 4. Grant the controller agent, such as `mac_gpt55`, the `review_artifact`
    capability and `security.artifacts.review_summary` route. In the home-lab
    example this is already present. Keep the human review route
@@ -588,6 +590,13 @@ Operational flow for controllers and workers:
 
 ## Backend Forwarding
 
+### Migrating existing boundary policies
+
+Existing deployments should review [MIGRATION.md](MIGRATION.md) before updating.
+Artifact operations now require explicit permissions, request scope IDs use a
+bounded grammar, and incomplete inspections fail closed. These changes also
+apply to previously stored artifacts when their bytes are read.
+
 Route kinds:
 
 - `inspect_only`: no backend forwarding.
@@ -596,7 +605,7 @@ Route kinds:
 - `command`: supported but disabled unless a command route explicitly sets `enabled: true`.
 - `artifact_review`: loads a verified artifact by `artifact_ref.artifact_id`, sends raw text only to the route-configured isolated review backend, validates the backend JSON summary, stores a derived `reviewed_untrusted_summary` artifact, and returns only schema-approved fields.
 
-For `/v1/results` routes with `report_policy.forward_audit_receipt: true`,
+For routes with `report_policy.forward_audit_receipt: true` on every accepted routed endpoint,
 `http_json` sends the generated audit receipt as the backend body. For
 `openai_chat_completions`, the gateway converts the generated receipt into a
 short OpenAI-compatible chat message before forwarding. The first line is the
@@ -610,7 +619,6 @@ ASG endpoints can opt in to narrow scanner exceptions:
 "input_policy": {
   "accepted_taint": ["trusted_instruction"],
   "allowed_private_instruction_hosts": ["192.168.1.60"],
-  "allow_defensive_secret_instructions": true,
   "allow_scanner_findings": [
     "input_dlp:local_path",
     "prompt_injection:tool_escalation"
@@ -941,6 +949,24 @@ Environment variables use the `ASG_` prefix.
 ## Firewalling
 
 Do not rely on the gateway alone. Backends should reject direct caller traffic with host firewall rules, private network segmentation, WireGuard, mTLS, or a reverse proxy boundary. Low-trust workers should submit through staging routes, not directly call privileged services.
+
+## Disposable web-research worker
+
+The [Docker worker example](examples/disposable-search-agent/README.md) combines a
+network-disabled disposable container, a trusted fixed-target model broker, signed
+ASG requests, and quarantined results. Parent responses contain artifact IDs and
+status fields only. It includes Qwen worker and DeepSeek inspector integrations;
+configure their fixed host-side endpoints for your deployment.
+
+Run the example checks without Docker or live model credentials:
+
+```bash
+python3 -m unittest discover -s examples/disposable-search-agent/tests
+python3 examples/disposable-search-agent/tests/check_asg_compatibility.py .
+```
+
+The example requires Python 3.12+. Its README also covers real Docker isolation
+checks and the optional search API configuration.
 
 ## Development
 

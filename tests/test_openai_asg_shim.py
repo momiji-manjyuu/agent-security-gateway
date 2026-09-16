@@ -69,9 +69,9 @@ class OpenAIASGShimTests(unittest.TestCase):
         server = shim.http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeASGHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
         host, port = server.server_address
         return f"http://{host}:{port}", server
 
@@ -80,9 +80,9 @@ class OpenAIASGShimTests(unittest.TestCase):
         server.config = config
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
         host, port = server.server_address
         return f"http://{host}:{port}"
 

@@ -30,6 +30,11 @@ jobs:
         run: python -m py_compile gateway.py proxy.py tests/test_gateway.py scripts/init_runtime_config.py scripts/generate_token.py scripts/smoke_test.py scripts/eval_redteam.py
       - name: Unit tests
         run: python -m unittest discover -s tests
+      - name: Disposable worker boundaries and ASG compatibility
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m unittest discover -s examples/disposable-search-agent/tests
+          python examples/disposable-search-agent/tests/check_asg_compatibility.py .
       - name: Red-team corpus
         run: python scripts/eval_redteam.py --min-detection 1.0 --max-false-positive 0.0
       - name: Validate example config
