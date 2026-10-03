@@ -1,5 +1,15 @@
 # Agent Security Gateway
 
+For routes that must always use a registered run, set `require_known_run_id: true`
+on the route. This also requires a run ID and tightens the global setting;
+`false` cannot relax a global requirement.
+Chat routes can opt into a `backend.fleet_pin` with fixed `model`, `deployment`,
+and `backend` identifiers. ASG then requires matching Fleet headers, one attempt,
+no fallback, and matching response model, returning `_asg_backend_receipt` from
+those headers. This receipt does not attest weights/templates or prevent retries;
+those remain separate admission gates. Existing routes without this option keep
+their behavior.
+
 Agent Security Gateway is a central policy gateway for multi-agent and multi-node AI systems. It authenticates callers, resolves route IDs to backend agents, enforces capability and run-level policies, inspects prompts and actions, guards outputs, and keeps append-only audit logs.
 
 Agent Security Gateway は、複数のAIエージェント/ノードを束ねる中央監査ゲートウェイです。呼び出し元を認証し、route_idをbackendへ解決し、capability・run scope・taint・action policyを検査し、入力/出力/API操作を監査します。

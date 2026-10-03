@@ -159,6 +159,10 @@
             "artifact_review"
           ]
         },
+        "require_known_run_id": {
+          "type": "boolean",
+          "description": "Require a registered run on this route; also requires run_id and cannot weaken the global requirement."
+        },
         "aliases": {
           "type": "array",
           "items": {
@@ -178,6 +182,16 @@
           "type": "object",
           "additionalProperties": true,
           "properties": {
+            "fleet_pin": {
+              "type": "object",
+              "required": ["model", "deployment", "backend"],
+              "additionalProperties": false,
+              "properties": {
+                "model": {"type": "string"},
+                "deployment": {"type": "string"},
+                "backend": {"type": "string"}
+              }
+            },
             "require_signature": {
               "type": "boolean",
               "default": false

@@ -555,6 +555,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
             errors.append(f"routes.{route_id} must be an object")
             continue
         kind = str(route.get("kind", ""))
+        if "require_known_run_id" in route and type(route["require_known_run_id"]) is not bool:
+            errors.append(f"routes.{route_id}.require_known_run_id must be a boolean")
         if isinstance(route.get("input_policy"), dict) and route["input_policy"].get("allow_defensive_secret_instructions"):
             errors.append(f"routes.{route_id}.input_policy.allow_defensive_secret_instructions is no longer supported; put defensive instructions in the configured backend")
         if kind not in ROUTE_KINDS:
@@ -669,6 +671,15 @@ def validate_config(cfg: dict[str, Any]) -> None:
                     method = str(backend.get("method", "POST")).upper()
                     if kind == "http_json" and method != "POST":
                         errors.append(f"routes.{route_id}.backend.method must be POST")
+                if "fleet_pin" in backend:
+                    pin = backend["fleet_pin"]
+                    fields = {"model", "deployment", "backend"}
+                    if kind != "openai_chat_completions" or not isinstance(pin, dict) or set(pin) != fields:
+                        errors.append(f"routes.{route_id}.backend.fleet_pin must contain model, deployment, backend for a chat route")
+                    elif any(not isinstance(pin[k], str) or not re.fullmatch(r"[A-Za-z0-9._@/-]{1,160}", pin[k]) for k in fields):
+                        errors.append(f"routes.{route_id}.backend.fleet_pin contains invalid identifiers")
+                    elif pin["model"] != (backend.get("model_rewrite") or backend.get("model")):
+                        errors.append(f"routes.{route_id}.backend.fleet_pin.model must match the fixed backend model")
                 timeout, timeout_ok = parse_int(backend.get("timeout_seconds", 180), default=180)
                 if not timeout_ok or not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
                     errors.append(f"routes.{route_id}.backend.timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")
@@ -933,13 +944,13 @@ def enforce_route_policy(verified: VerifiedAgent, decision: RouteDecision, cfg: 
 def enforce_run_scope(decision: RouteDecision, cfg: dict[str, Any], agent_id: str | None = None) -> None:
     route = decision.route
     run_id = decision.run_id
-    if route.get("require_run_id") and not run_id:
+    if (route.get("require_run_id") or route.get("require_known_run_id")) and not run_id:
         raise GatewayError(403, "run_scope_denied", f"route '{decision.route_id}' requires run_id")
     if not run_id:
         return
     run, run_source = resolve_run_scope_record(cfg, run_id)
     if run is None:
-        if cfg.get("require_known_run_id"):
+        if cfg.get("require_known_run_id") or route.get("require_known_run_id"):
             raise GatewayError(403, "run_scope_denied", f"unknown run_id '{run_id}'")
         decision.warnings.append("unknown_run_id_allowed")
         return
@@ -2028,6 +2039,22 @@ def forward_http_json(
         raise GatewayError(502, "backend_error", f"backend request failed: {type(exc).__name__}") from exc
 
 
+def fleet_backend_receipt(parsed: dict[str, Any], headers: Any, pin: dict[str, Any]) -> dict[str, Any]:
+    """Opt-in receipt from fixed Fleet transport headers, never caller/body claims.
+
+    This does not attest weight revision/template or prevent upstream retries.
+    """
+    expected = {
+        "X-Fleet-Requested-Model": pin["model"], "X-Fleet-Served-Model": pin["model"],
+        "X-Fleet-Deployment": pin["deployment"], "X-Fleet-Backend": pin["backend"],
+        "X-Fleet-Fallback": "false", "X-Fleet-Attempts": "1",
+    }
+    if parsed.get("model") != pin["model"] or any(headers.get(k) != v for k, v in expected.items()):
+        raise GatewayError(502, "backend_identity_denied", "Fleet identity, fallback or attempt receipt mismatch")
+    return {"model": pin["model"], "deployment": pin["deployment"], "backend": pin["backend"],
+            "fallback": False, "attempts": 1}
+
+
 def forward_openai_chat(
     cfg: dict[str, Any],
     payload: dict[str, Any],
@@ -2050,10 +2077,19 @@ def forward_openai_chat(
     timeout = float(backend.get("timeout_seconds", 180))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
+            pin = backend.get("fleet_pin")
+            if pin is not None:
+                raw_bytes = response.read(65_537)
+                if len(raw_bytes) > 65_536:
+                    raise GatewayError(502, "backend_response_limit", "Pinned Fleet response exceeded limit")
+                raw = raw_bytes.decode("utf-8", errors="strict")
+            else:
+                raw = response.read().decode("utf-8", errors="replace")
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 raise GatewayError(502, "backend_error", "backend response was not a JSON object")
+            if pin is not None:
+                parsed["_asg_backend_receipt"] = fleet_backend_receipt(parsed, response.headers, pin)
             return response.status, parsed
     except (socket.timeout, TimeoutError) as exc:
         raise GatewayError(504, "backend_timeout", "backend request timed out") from exc
