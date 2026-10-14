@@ -54,5 +54,5 @@ python scripts/asgctl.py runs register --token-file <親のトークン> --body 
 
 ## まだ無いもの（今後のフェーズ）
 
-`apply`（全自動の適用）、`asg-mcp`、囮・キルスイッチの自動化、評価ゾーンの導入。設計は
+`apply`（全自動の適用）、囮・キルスイッチの自動化、評価ゾーンの導入。親機の MCP は [presets/parent/mcp/](../presets/parent/mcp/README.md)。設計は
 [docs/design/setup-and-connectivity.md](../docs/design/setup-and-connectivity.md)。
