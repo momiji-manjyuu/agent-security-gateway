@@ -253,12 +253,16 @@ class TunnelPresetTests(unittest.TestCase):
         text = (self.base / 'New-AsgTunnelKey.ps1').read_text(encoding='utf-8')
         for needle in ('restrict,port-forwarding', 'permitopen=', 'permitlisten=', "127\\.0\\.0\\.1", 'refusing to overwrite', '/inheritance:r'):
             self.assertIn(needle, text)
+        # `restrict` alone still allows remote commands; a forced command and a pinned opposite direction are required.
+        self.assertIn('command=\"echo asg-tunnel-only\"', text)
+        self.assertIn('permitopen=`"127.0.0.1:1`"', text)   # reverse-mode key cannot open local forwards
+        self.assertIn('permitlisten=`"127.0.0.1:1`"', text)  # local-mode key cannot listen for reverse forwards
         self.assertNotIn('Get-Content $key ', text)  # the private key is never read or printed
 
     def test_task_script_defaults_to_plan_only_and_pins_a_single_loopback_forward(self):
         text = (self.base / 'Install-AsgTunnelTask.ps1').read_text(encoding='utf-8')
-        for needle in ('[switch]$Apply', 'plan only', 'ExitOnForwardFailure=yes', 'StrictHostKeyChecking=yes', 'BatchMode=yes',
-                       '-L 127.0.0.1:${LocalPort}:127.0.0.1:${HubPort}', '-RunLevel Limited'):
+        for needle in ('[switch]$Apply', 'plan only', 'ExitOnForwardFailure=yes', 'StrictHostKeyChecking=yes', 'BatchMode=yes', 'IdentitiesOnly=yes',
+                       '-L 127.0.0.1:${LocalPort}:127.0.0.1:${HubPort}', '-RunLevel Limited', 'while (`$true)', 'EncodedCommand'):
             self.assertIn(needle, text)
         self.assertNotIn('0.0.0.0', text)
         self.assertNotIn('GatewayPorts', text)

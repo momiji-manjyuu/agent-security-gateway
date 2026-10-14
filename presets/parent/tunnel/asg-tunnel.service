@@ -6,7 +6,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/ssh -N -T -i %h/.ssh/asg-tunnel_ed25519 -o BatchMode=yes -o ExitOnForwardFailure=yes \
+ExecStart=/usr/bin/ssh -N -T -i %h/.ssh/asg-tunnel_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes \
   -L 127.0.0.1:8788:127.0.0.1:8788 HUB_USER@HUB_HOST
 Restart=always
