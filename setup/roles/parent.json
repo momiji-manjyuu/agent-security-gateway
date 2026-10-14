@@ -15,6 +15,6 @@
   "steps": [
     {"step": "Install Python 3.10+", "needs": ["python"]},
     {"step": "Open the SSH tunnel to the hub (loopback only)", "needs": ["tunnel_listen"]},
-    {"step": "Register asg-mcp / skill with the parent agent harness (not yet implemented)", "manual": true}
+    {"step": "Register asg-mcp and the asg-parent skill with the parent agent harness (presets/parent/mcp/README.md)", "manual": true}
   ]
 }

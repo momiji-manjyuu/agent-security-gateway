@@ -1,0 +1,20 @@
+{
+  "base_url": "http://127.0.0.1:8788",
+  "token_file": "~/.asg/parent.token",
+  "agent_id": "parent_controller",
+  "receipts_file": "~/.agent-security-gateway/result-receipts.jsonl",
+  "tools": {
+    "inspect": { "enabled": true },
+    "artifact_status": { "enabled": true, "route": "security.artifacts.download", "capability": "download_artifact" },
+    "delegate_research": {
+      "enabled": false,
+      "register_route": "security.runs.register",
+      "task_route": "lab.web_research.task",
+      "submit_route": "lab.artifacts.submit",
+      "worker_agent": "lab_worker",
+      "capability": "delegate_web_research",
+      "ttl_seconds": 900
+    },
+    "review_summary": { "enabled": false, "route": "security.artifacts.review_summary", "capability": "review_artifact" }
+  }
+}
