@@ -31,14 +31,26 @@ if ($Remove) {
 if (-not (Test-Path -LiteralPath $KeyFile)) { throw "asg-tunnel: key not found: $KeyFile (run New-AsgTunnelKey.ps1 first)" }
 
 $ssh = (Get-Command ssh).Source
-$sshArgs = "-N -T -i `"$KeyFile`" -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 " +
+$sshArgs = "-N -T -i `"$KeyFile`" -o BatchMode=yes -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 " +
            "-o StrictHostKeyChecking=yes -L 127.0.0.1:${LocalPort}:127.0.0.1:${HubPort} ${HubUser}@${HubHost}"
-$plan = [ordered]@{ task = $TaskName; run = "$ssh $sshArgs"; trigger = 'at logon'; restart = 'every 1 minute, unlimited'; runs_as = $env:USERNAME }
-if (-not $Apply) { $plan | ConvertTo-Json; Write-Output 'plan only. Re-run with -Apply to register the task.'; return }
+
+# The task itself loops: when ssh ends for ANY reason (network drop, hub restart, killed) wait and start it again.
+# Task Scheduler's own "restart on failure" does not fire for these cases, so it is not relied on.
+$loop = "while (`$true) { & '$ssh' $sshArgs; Start-Sleep -Seconds 10 }"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loop))
+$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$psArgs = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
+
+$plan = [ordered]@{ task = $TaskName; loop = $loop; trigger = 'at logon'; retry = 'ssh restarted 10 seconds after it ends, forever'; runs_as = $env:USERNAME }
+if (-not $Apply) { $plan | ConvertTo-Json; Write-Output 'plan only. Re-run with -Apply to register (an existing task with this name is replaced).'; return }
 
 # The hub host key must already be trusted (StrictHostKeyChecking=yes): connect once by hand and verify the fingerprint.
-$action = New-ScheduledTaskAction -Execute $ssh -Argument $sshArgs
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+}
+$action = New-ScheduledTaskAction -Execute $ps -Argument $psArgs
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Description 'ASG loopback tunnel (managed by asg presets)' | Out-Null
 Write-Output "registered task $TaskName (starts at next logon; start now: Start-ScheduledTask $TaskName)"
