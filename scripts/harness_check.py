@@ -191,7 +191,36 @@ def adapter_hermes(work: Path, fx: dict, model_url: str, model: str):
     return ([exe, "-z", PROMPT, "--ignore-rules", "-t", "asg"], {"HERMES_HOME": str(home)}, [])
 
 
-ADAPTERS = {"opencode": adapter_opencode, "pi": adapter_pi, "openclaw": adapter_openclaw, "hermes": adapter_hermes}
+def adapter_dsh(work: Path, fx: dict, model_url: str, model: str):
+    """DeepSeek Harness: a composed profile (plugin list). Dedicated DSH_HOME and profile; the user's ~/.dsh is untouched.
+    LLM goes through the pi-ai adapter to the local OpenAI-compatible endpoint; asg-mcp is mounted as a stdio MCP client;
+    shell, file, web, sub-agent and the official DeepSeek routes are disabled for this run."""
+    home = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "asg-harness" / "dsh-home"
+    exe = shutil.which("dsh") or "dsh"
+    profile = home / "profiles" / "asgcheck"
+    if not profile.exists():
+        home.mkdir(parents=True, exist_ok=True)
+        subprocess.run([exe, "--profile", "asgcheck", "--from-default-profile", "headless", "--dump-config"], env={**os.environ, "DSH_HOME": str(home)},
+                       capture_output=True, stdin=subprocess.DEVNULL, timeout=180)
+    cmd = mcp_command(fx["mcp_config"])
+    q = json.dumps
+    disabled = ["tool-bash", "tool-pwsh", "tool-jobs", "tool-fs", "tool-fs-search", "web", "web-search-deepseek", "web-fetch-http", "tool-web",
+                "tool-subagent", "tool-subagent-fork", "tool-subagent-control", "tool-subagent-list-agents", "tool-workflow", "tool-skill",
+                "llm-deepseek", "llm-deepseek-account"]
+    patch = (
+        "- id: llm-pi-ai\n  config:\n    providers:\n      asgcheck:\n        api: openai-completions\n        apiKeyEnv: ASG_CHECK_MODEL_KEY\n"
+        f"        baseURL: {q(model_url)}\n        models:\n          - id: {q(model)}\n            name: {q(model)}\n            contextWindow: 131072\n"
+        "- id: agent-default-model\n  config:\n    provider: asgcheck\n"
+        f"    model: {q(model)}\n"
+        + "".join(f"- id: {d}\n  disabled: true\n" for d in disabled)
+        + "- insert:\n    - id: mcp-asg\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: asg\n        transport: stdio\n"
+        f"        command: {q(cmd[0])}\n        args: {q(cmd[1:])}\n        failOnStartupError: true\n"
+    )
+    (profile / "cordis.patch.yml").write_text(patch, encoding="utf-8")
+    return ([exe, "--profile", "asgcheck", PROMPT], {"DSH_HOME": str(home), "ASG_CHECK_MODEL_KEY": "local-no-key"}, [])  # dummy key
+
+
+ADAPTERS = {"opencode": adapter_opencode, "pi": adapter_pi, "openclaw": adapter_openclaw, "hermes": adapter_hermes, "dsh": adapter_dsh}
 
 
 def check(name: str, model_url: str, model: str, timeout: int, keep: bool) -> int:
