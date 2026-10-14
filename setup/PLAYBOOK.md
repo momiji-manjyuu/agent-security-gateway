@@ -34,7 +34,25 @@ python scripts/asgctl.py verify --role isolated-lab --deep --human         # ゲ
 VM の作成手順は [docs/runbooks/isolated-lab-setup.md](../docs/runbooks/isolated-lab-setup.md)、ひな形は
 [presets/isolated/vm/](../presets/isolated/vm/README.md)。
 
+## フェーズ2の操作（設定や秘密を扱う。既定は変更なし）
+
+```sh
+# 秘密の生成: 値はファイルにだけ入り、画面には出ない。出るのは config に入れる token_sha256 のみ。既存ファイルは上書きしない。
+python scripts/asgctl.py secrets init --dir <保護されたフォルダ> --name docker90_search            # --kind key で共有鍵（HMAC等）
+# 設定フラグメントのマージ: 既定は dry-run。衝突は拒否（上書きしない）。--write でバックアップ→検証→置換。
+python scripts/asgctl.py fragment merge --into <config.json> --from <fragment.json> --map controller=<実際の親ID> --token-sha256 <新規エージェント>=<hex>
+python scripts/asgctl.py fragment merge ... --write                                                  # 書き込み後に ASG の再起動が必要
+# run の登録（親のトークンファイルを読むが、表示しない。接続先はループバックのみ）
+python scripts/asgctl.py runs register --token-file <親のトークン> --body run-registration.json
+```
+
+- `fragment merge` は、既存のエージェントでは**トークン・階層・CIDR を保持**し、能力とルートの追加だけを行う。
+  新規エージェントにはトークンのハッシュが必須（`REPLACE_WITH_*` が残っていれば拒否）。
+- 既存のルートと**異なる定義**は衝突として拒否する。人が差分を確認して決める。
+- 別ホストへ秘密を渡す作業（共有鍵のコピー、ハブの `authorized_keys` への追記）は**人が行う**。
+- トンネルの専用鍵と常駐化は [presets/parent/tunnel/](../presets/parent/tunnel/README.md)（登録は `-Apply` を付けた時だけ）。
+
 ## まだ無いもの（今後のフェーズ）
 
-`apply`、`secrets init`、`fragment merge`、`runs register`、`asg-mcp`、囮・キルスイッチの自動化。設計は
+`apply`（全自動の適用）、`asg-mcp`、囮・キルスイッチの自動化、評価ゾーンの導入。設計は
 [docs/design/setup-and-connectivity.md](../docs/design/setup-and-connectivity.md)。

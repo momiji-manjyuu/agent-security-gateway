@@ -4,6 +4,7 @@
 Commands:
   doctor  --role R   static checks of THIS host (versions, listeners, firewall, Hyper-V, secrets presence)
   plan    --role R   doctor plus which setup steps are still open; changes nothing
+  secrets init / fragment merge / runs register   see asgctl_ops.py (phase 2; changes are dry-run by default)
   verify  --role R   behaviour checks (health endpoints, guest self-check, egress probes)
                      --deep also lifts the guest firewall for the duration of a test (restored afterwards)
 
@@ -347,6 +348,10 @@ def render_human(report: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("secrets", "fragment", "runs"):  # phase 2 operations live in asgctl_ops
+        import asgctl_ops
+        return asgctl_ops.main(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("command", choices=["doctor", "plan", "verify"])
     ap.add_argument("--role", required=True)
