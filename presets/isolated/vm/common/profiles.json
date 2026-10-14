@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "description": "Network profiles for the isolated lab guest. 'offline' is the default and the only profile enabled without an egress proxy.",
+  "profiles": {
+    "offline": {
+      "guest_outbound": "none",
+      "guest_inbound": "ssh from host only",
+      "requires_egress_proxy": false
+    },
+    "logged_egress": {
+      "guest_outbound": "host-side logging egress proxy only (single IP:port)",
+      "guest_inbound": "ssh from host only",
+      "requires_egress_proxy": true
+    }
+  },
+  "isolation_defaults": {
+    "shared_folders": false,
+    "clipboard": false,
+    "drag_and_drop": false,
+    "usb_passthrough": false,
+    "remote_display": false,
+    "audio": false,
+    "guest_agent_file_copy": false,
+    "nested_virtualization": false,
+    "automatic_checkpoints": false,
+    "secrets_in_seed": false
+  },
+  "default_lab_subnet": {
+    "cidr": "172.29.91.0/29",
+    "host_ip": "172.29.91.1",
+    "guest_ip": "172.29.91.2"
+  }
+}

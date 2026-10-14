@@ -1,0 +1,11 @@
+version: 2
+ethernets:
+  lab0:
+    match:
+      name: "e*"
+    dhcp4: false
+    dhcp6: false
+    accept-ra: false
+    addresses:
+      - __GUEST_IP__/__PREFIX__
+__ROUTES__

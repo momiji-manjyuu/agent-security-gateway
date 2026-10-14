@@ -1,0 +1,16 @@
+# Review, then load on the Linux host:  sudo nft -f host-firewall.nft
+# Drops anything the lab guest tries to send to services on the host itself, and anything forwarded out of the lab bridge.
+# Host -> guest management SSH keeps working (replies are tracked).
+table inet asg_lab_host {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "virbr-asglab" ct state established,related accept
+    iifname "virbr-asglab" drop
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname "virbr-asglab" drop
+    oifname "virbr-asglab" ct state established,related accept
+    oifname "virbr-asglab" drop
+  }
+}
