@@ -1,0 +1,22 @@
+{
+  "role": "hub",
+  "description": "Agent Security Gateway host. ASG must listen on loopback only; other hosts reach it through SSH tunnels.",
+  "doctor": [
+    {"id": "python", "type": "python_version", "min": "3.10"},
+    {"id": "os", "type": "os_info"},
+    {"id": "ssh_client", "type": "command", "name": "ssh"},
+    {"id": "asg_port_bind", "type": "listen", "port": 8788, "expect": "loopback",
+     "hint": "Set \"bind\": \"127.0.0.1\" in the ASG config and restart; reach it from other hosts through an SSH tunnel."},
+    {"id": "asg_config_env", "type": "env_vars", "names": ["ASG_CONFIG"], "required": false},
+    {"id": "asg_secrets_env", "type": "env_vars", "names": ["ASG_AGENT_TOKEN"], "required": false}
+  ],
+  "verify": [
+    {"id": "asg_health", "type": "http_health", "url": "http://127.0.0.1:8788/healthz", "app": "agent-security-gateway"},
+    {"id": "asg_ready", "type": "http_json_ok", "url": "http://127.0.0.1:8788/readyz"}
+  ],
+  "steps": [
+    {"step": "Run ASG bound to 127.0.0.1", "needs": ["asg_port_bind"]},
+    {"step": "Create dedicated SSH keys for tunnels (restricted forwards, no shell)", "manual": true},
+    {"step": "Validate config: python gateway.py --config <config> validate-config", "manual": true}
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "role": "isolated-lab",
+  "description": "Hyper-V host for isolated Linux lab guests (evaluator zone). Windows host only in phase 1.",
+  "doctor": [
+    {"id": "os", "type": "os_info"},
+    {"id": "hyperv", "type": "hyperv_enabled"},
+    {"id": "ssh_client", "type": "command", "name": "ssh"},
+    {"id": "host_firewall_rule", "type": "firewall_rule", "name": "ASG-Lab-block-guest-to-host", "remote_address": "172.29.91.0/29",
+     "hint": "A person must review and run presets/isolated/vm/hyperv/Block-LabToHost.ps1 from an elevated session."},
+    {"id": "lab_vm", "type": "hyperv_vm", "name": "asg-lab-eval-01", "switch_type": "Internal", "checkpoint": "baseline-clean"}
+  ],
+  "verify": [
+    {"id": "guest_selfcheck", "type": "guest_selfcheck", "name": "asg-lab-eval-01", "guest_ip": "172.29.91.2"},
+    {"id": "guest_egress_blocked", "type": "guest_egress", "name": "asg-lab-eval-01", "guest_ip": "172.29.91.2",
+     "targets": ["1.1.1.1:443"]},
+    {"id": "guest_to_host_blocked", "type": "guest_egress", "name": "asg-lab-eval-01", "guest_ip": "172.29.91.2",
+     "targets": ["172.29.91.1:22", "172.29.91.1:445"], "deep": true,
+     "description": "Temporarily lifts the GUEST firewall (test only, restored afterwards) to prove the HOST rule works on its own."}
+  ],
+  "steps": [
+    {"step": "Create the lab VM (presets/isolated/vm/hyperv/New-AsgLabVm.ps1)", "needs": ["lab_vm"]},
+    {"step": "Block guest-to-host traffic on the host firewall (person runs Block-LabToHost.ps1)", "needs": ["host_firewall_rule"]},
+    {"step": "Take the baseline-clean checkpoint", "needs": ["lab_vm"]}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "role": "parent",
+  "description": "Parent agent host. Reaches ASG only through a loopback tunnel; never touches the open web.",
+  "doctor": [
+    {"id": "python", "type": "python_version", "min": "3.10"},
+    {"id": "os", "type": "os_info"},
+    {"id": "ssh_client", "type": "command", "name": "ssh"},
+    {"id": "tunnel_listen", "type": "listen", "port": 8788, "expect": "loopback", "optional": true,
+     "hint": "Open the tunnel: ssh -N -L 127.0.0.1:8788:127.0.0.1:8788 <asg-user>@<hub>"},
+    {"id": "asg_token_env", "type": "env_vars", "names": ["ASG_AGENT_TOKEN"], "required": false}
+  ],
+  "verify": [
+    {"id": "asg_via_tunnel", "type": "http_health", "url": "http://127.0.0.1:8788/healthz", "app": "agent-security-gateway"}
+  ],
+  "steps": [
+    {"step": "Install Python 3.10+", "needs": ["python"]},
+    {"step": "Open the SSH tunnel to the hub (loopback only)", "needs": ["tunnel_listen"]},
+    {"step": "Register asg-mcp / skill with the parent agent harness (not yet implemented)", "manual": true}
+  ]
+}
