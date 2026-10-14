@@ -1,0 +1,7 @@
+<!-- Isolated libvirt network: no <forward> element means no NAT and no routing to the LAN or internet.
+     The guest can still reach the host's bridge address, so apply host-firewall.nft as well. -->
+<network>
+  <name>asg-lab</name>
+  <bridge name="virbr-asglab" stp="on" delay="0"/>
+  <ip address="172.29.91.1" netmask="255.255.255.248"/>
+</network>

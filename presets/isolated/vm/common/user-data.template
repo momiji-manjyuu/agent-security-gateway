@@ -1,0 +1,61 @@
+#cloud-config
+# ASG isolated lab guest (Linux). Placeholders are filled by the platform scripts:
+#   __HOSTNAME__ __LAB_SSH_PUBLIC_KEY__ __PROFILE__ __HOST_IP__ __EGRESS_PROXY_IP__ __EGRESS_PROXY_PORT__
+# No password is ever set. Login is key-only. Nothing secret belongs in this file.
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+disable_root: true
+ssh_pwauth: false
+package_update: false
+package_upgrade: false
+users:
+  - name: lab
+    gecos: ASG lab evaluator
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - __LAB_SSH_PUBLIC_KEY__
+write_files:
+  - path: /etc/ssh/sshd_config.d/90-asg-lab.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      AllowUsers lab
+      AllowTcpForwarding no
+      AllowAgentForwarding no
+      X11Forwarding no
+  - path: /etc/asg-lab/profile
+    permissions: "0644"
+    content: "__PROFILE__\n"
+  - path: /etc/nftables.conf
+    permissions: "0644"
+    content: |
+__NFTABLES_RULES__
+  - path: /etc/cloud/cloud.cfg.d/99-asg-lab.cfg
+    permissions: "0644"
+    content: |
+      # Stop cloud-init from re-running on a restored snapshot with a different seed.
+      datasource_list: [ NoCloud, None ]
+      manage_etc_hosts: true
+  - path: /usr/local/sbin/asg-lab-selfcheck
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Prints a small JSON report. Never prints secrets.
+      profile="$(cat /etc/asg-lab/profile 2>/dev/null)"
+      fw="$(nft list ruleset 2>/dev/null | grep -c 'asg_lab')"
+      pw="$(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | cut -d' ' -f2)"
+      route="$(ip route show default 2>/dev/null | wc -l)"
+      printf '{"profile":"%s","firewall_table_present":%s,"ssh_password_auth":"%s","default_routes":%s}\n' \
+        "$profile" "$([ "$fw" -gt 0 ] && echo true || echo false)" "$pw" "$route"
+runcmd:
+  - [ systemctl, mask, apt-daily.timer, apt-daily-upgrade.timer, motd-news.timer, unattended-upgrades.service ]
+  - [ systemctl, disable, --now, snapd.service, snapd.socket ]
+  - [ sh, -c, "nft -f /etc/nftables.conf && systemctl enable nftables || true" ]
+  - [ systemctl, restart, ssh ]
+  - [ mkdir, -p, /var/lib/asg-lab ]
+  - [ touch, /var/lib/asg-lab/provisioned ]
+final_message: "asg-lab provisioned profile=__PROFILE__"

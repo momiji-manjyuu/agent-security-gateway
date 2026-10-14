@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "description": "Example inventory for an ASG deployment. Copy to inventory.local.json (git-ignored) and replace the placeholder addresses. Hostnames and addresses are examples, not real machines.",
+  "hosts": {
+    "parent": {
+      "role": "parent",
+      "address": "192.0.2.10",
+      "os": "windows",
+      "notes": "Runs the parent agent and asg-mcp. Never touches the open web."
+    },
+    "hub": {
+      "role": "hub",
+      "address": "192.0.2.20",
+      "os": "windows",
+      "asg_bind": "127.0.0.1",
+      "asg_port": 8788,
+      "notes": "ASG listens on loopback only; other hosts reach it through SSH tunnels."
+    },
+    "lab": {
+      "role": "isolated",
+      "address": "192.0.2.30",
+      "os": "windows",
+      "hypervisor": "hyperv",
+      "zones": {
+        "eval-01": {
+          "kind": "evaluator",
+          "guest_os": "linux",
+          "profile": "offline",
+          "subnet": "172.29.91.0/29",
+          "host_ip": "172.29.91.1",
+          "guest_ip": "172.29.91.2",
+          "checkpoint": "baseline-clean"
+        }
+      }
+    }
+  },
+  "tunnels": [
+    { "from": "parent", "to": "hub", "forward": "127.0.0.1:8788 -> 127.0.0.1:8788", "direction": "local" },
+    { "from": "lab", "to": "hub", "forward": "127.0.0.1:18788 -> 127.0.0.1:8788", "direction": "local" },
+    { "from": "lab", "to": "hub", "forward": "127.0.0.1:18790 <- 127.0.0.1:8790", "direction": "remote" }
+  ],
+  "secrets": {
+    "policy": "Values never appear in this file. Each host keeps its own files (mode 0600 / owner-only ACL); this file lists names only.",
+    "files": {
+      "lab_ssh_private_key": "<lab host>/ASG-Lab/keys/lab_ed25519",
+      "asg_worker_token_env": "ASG_WORKER_TOKEN",
+      "asg_backend_hmac_env": "ASG_BACKEND_HMAC_KEY"
+    }
+  }
+}

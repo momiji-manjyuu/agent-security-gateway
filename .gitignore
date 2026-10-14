@@ -21,3 +21,12 @@ KILL_SWITCH
 .vscode/
 .pytest_cache/
 .coverage
+
+# Local lab / deployment state: never commit inventories, keys or disk images.
+setup/inventory.local.json
+*_ed25519
+*.vhd
+*.vhdx
+*.qcow2
+*.img
+*.iso
