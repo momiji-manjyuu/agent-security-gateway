@@ -42,16 +42,16 @@ def run_cli(argv):
 class SecretsInitTests(unittest.TestCase):
     def test_creates_private_files_and_prints_only_the_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
-            code, out, _ = run_cli(['secrets', 'init', '--dir', tmp, '--name', 'docker90_search'])
+            code, out, _ = run_cli(['secrets', 'init', '--dir', tmp, '--name', 'lab_worker'])
             self.assertEqual(code, 0)
             report = json.loads(out)
             entry = report['files'][0]
-            token = (Path(tmp) / 'docker90_search.token').read_text(encoding='utf-8').strip()
+            token = (Path(tmp) / 'lab_worker.token').read_text(encoding='utf-8').strip()
             self.assertGreaterEqual(len(token), 32)
             self.assertNotIn(token, out)
             self.assertEqual(entry['token_sha256'], ops.gateway.hash_token(token))
             if os.name != 'nt':
-                self.assertEqual(stat.S_IMODE((Path(tmp) / 'docker90_search.token').stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE((Path(tmp) / 'lab_worker.token').stat().st_mode), 0o600)
 
     def test_never_overwrites_and_rejects_bad_names(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,40 +84,40 @@ class FragmentMergeTests(unittest.TestCase):
 
     def test_new_agent_without_a_real_hash_is_refused(self):
         _, _, conflicts = self.merge(mapping={'controller': 'win_controller_1'})
-        self.assertTrue(any('docker90_search' in c and 'token hash' in c for c in conflicts))
+        self.assertTrue(any('lab_worker' in c and 'token hash' in c for c in conflicts))
         self.assertTrue(any('unresolved placeholder' in c for c in conflicts))
 
     def test_existing_agent_keeps_token_and_cidrs_and_only_widens_scope(self):
-        merged, changes, conflicts = self.merge(mapping={'controller': 'win_controller_1'}, hashes={'docker90_search': HASH_B})
+        merged, changes, conflicts = self.merge(mapping={'controller': 'win_controller_1'}, hashes={'lab_worker': HASH_B})
         self.assertEqual(conflicts, [])
         agent = merged['agents']['win_controller_1']
         self.assertEqual(agent['token_sha256'], HASH_A)
         self.assertEqual(agent['allowed_client_cidrs'], ['127.0.0.1/32'])
         self.assertEqual(agent['allowed_capabilities'], ['inspect', 'delegate_web_research'])
-        self.assertIn('docker90.web_research.task', agent['allowed_routes'])
-        self.assertEqual(merged['agents']['docker90_search']['token_sha256'], HASH_B)
-        self.assertEqual(merged['routes']['docker90.web_research.task']['allowed_callers'], ['win_controller_1'])
+        self.assertIn('lab.web_research.task', agent['allowed_routes'])
+        self.assertEqual(merged['agents']['lab_worker']['token_sha256'], HASH_B)
+        self.assertEqual(merged['routes']['lab.web_research.task']['allowed_callers'], ['win_controller_1'])
         self.assertTrue(merged['require_known_run_id'])
         self.assertTrue(all(set(c) <= {'op', 'path', 'added'} for c in changes))
 
     def test_differing_existing_route_is_a_conflict_not_an_overwrite(self):
         config = base_config()
-        config['routes']['docker90.artifacts.submit'] = {'kind': 'inspect_only', 'allowed_callers': ['x']}
+        config['routes']['lab.artifacts.submit'] = {'kind': 'inspect_only', 'allowed_callers': ['x']}
         before = copy.deepcopy(config)
-        merged, _, conflicts = self.merge(config, {'controller': 'win_controller_1'}, {'docker90_search': HASH_B})
-        self.assertTrue(any('docker90.artifacts.submit' in c for c in conflicts))
+        merged, _, conflicts = self.merge(config, {'controller': 'win_controller_1'}, {'lab_worker': HASH_B})
+        self.assertTrue(any('lab.artifacts.submit' in c for c in conflicts))
         self.assertEqual(config, before)  # input untouched
 
     def test_identical_existing_definitions_are_a_no_op(self):
-        merged, _, _ = self.merge(mapping={'controller': 'win_controller_1'}, hashes={'docker90_search': HASH_B})
+        merged, _, _ = self.merge(mapping={'controller': 'win_controller_1'}, hashes={'lab_worker': HASH_B})
         _, changes, conflicts = ops.merge_fragment(merged, ops.substitute_ids(self.fragment(), {'controller': 'win_controller_1'}),
-                                                   {'docker90_search': HASH_B})
+                                                   {'lab_worker': HASH_B})
         self.assertEqual((changes, conflicts), ([], []))
 
     def test_top_level_value_conflict(self):
         config = base_config()
         config['require_known_run_id'] = False
-        _, _, conflicts = self.merge(config, {'controller': 'win_controller_1'}, {'docker90_search': HASH_B})
+        _, _, conflicts = self.merge(config, {'controller': 'win_controller_1'}, {'lab_worker': HASH_B})
         self.assertTrue(any(c.startswith('require_known_run_id') for c in conflicts))
 
     def write_files(self, tmp):
@@ -130,7 +130,7 @@ class FragmentMergeTests(unittest.TestCase):
             cfg = self.write_files(tmp)
             original = cfg.read_text(encoding='utf-8')
             args = ['fragment', 'merge', '--into', str(cfg), '--from', str(FRAGMENT), '--map', 'controller=win_controller_1',
-                    '--token-sha256', f'docker90_search={HASH_B}']
+                    '--token-sha256', f'lab_worker={HASH_B}']
             code, out, _ = run_cli(args)
             self.assertEqual((code, json.loads(out)['status']), (0, 'dry_run'))
             self.assertEqual(cfg.read_text(encoding='utf-8'), original)
@@ -138,7 +138,7 @@ class FragmentMergeTests(unittest.TestCase):
             report = json.loads(out)
             self.assertEqual((code, report['status']), (0, 'written'))
             self.assertEqual(Path(report['backup']).read_text(encoding='utf-8'), original)
-            self.assertIn('docker90_search', json.loads(cfg.read_text(encoding='utf-8'))['agents'])
+            self.assertIn('lab_worker', json.loads(cfg.read_text(encoding='utf-8'))['agents'])
             self.assertEqual([p.name for p in Path(tmp).glob('*.json') if '.bak' not in p.name and p.name != 'config.json'], [])
 
     def test_refused_merge_leaves_the_file_alone(self):
@@ -155,7 +155,7 @@ class FragmentMergeTests(unittest.TestCase):
             original = cfg.read_text(encoding='utf-8')
             with patch.object(ops, 'validate_candidate', return_value=(False, 'bad')):
                 code, out, _ = run_cli(['fragment', 'merge', '--into', str(cfg), '--from', str(FRAGMENT), '--map', 'controller=win_controller_1',
-                                        '--token-sha256', f'docker90_search={HASH_B}', '--write'])
+                                        '--token-sha256', f'lab_worker={HASH_B}', '--write'])
             self.assertEqual((code, json.loads(out)['status']), (1, 'refused_invalid_config'))
             self.assertEqual(cfg.read_text(encoding='utf-8'), original)
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ['config.json'])

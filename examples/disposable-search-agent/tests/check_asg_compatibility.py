@@ -47,11 +47,11 @@ def main():
         cfg["artifact_store"]["path"] = str(root / "artifacts")
         cfg["rate_limit"]["enabled"] = False
         cfg["agents"]["controller"]["token_sha256"] = hashlib.sha256(controller_token.encode()).hexdigest()
-        cfg["agents"]["docker90_search"]["token_sha256"] = hashlib.sha256(worker_token.encode()).hexdigest()
+        cfg["agents"]["lab_worker"]["token_sha256"] = hashlib.sha256(worker_token.encode()).hexdigest()
         cfg["routes"][link.TASK_ROUTE]["backend"]["base_url"] = f"http://127.0.0.1:{backend.server_port}"
         cfg["runs"] = {"run-test": {
             "allowed_routes": [link.TASK_ROUTE, link.ARTIFACT_ROUTE],
-            "allowed_callers": ["controller", "docker90_search"],
+            "allowed_callers": ["controller", "lab_worker"],
             "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=15)).isoformat()}}
         gateway.validate_config(cfg)
         asg = gateway.ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)

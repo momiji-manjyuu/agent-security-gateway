@@ -222,9 +222,9 @@ class BoundaryTests(unittest.TestCase):
         p = self.chat_payload()
         p['messages'][0]['content'] = [{'type': 'text', 'text': 'https://192.168.'},
                                      {'type': 'text', 'text': '1.91/a'}]
-        p['note'] = 'https://192.168.1.90/a'
+        p['note'] = 'https://192.168.50.30/a'
         decision = gateway.resolve_route_decision({}, p, self.cfg)
-        decision.route['input_policy']['allowed_private_instruction_hosts'] = ['192.168.1.90']
+        decision.route['input_policy']['allowed_private_instruction_hosts'] = ['192.168.50.30']
         action = gateway.apply_route_action_guard_policy(gateway.action_guard({}, p), decision, p)
         self.assertTrue(action.blocked)
 

@@ -1,5 +1,5 @@
 {
-  "route_id": "docker90.web_research.task",
+  "route_id": "lab.web_research.task",
   "capability": "delegate_web_research",
   "run_id": "REPLACE_WITH_REGISTERED_RUN_ID",
   "task_id": "research-001",

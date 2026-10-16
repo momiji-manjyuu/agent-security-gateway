@@ -79,7 +79,7 @@ class Boundaries(unittest.TestCase):
                 link.task_from_packet(data, "run-test", "research-001")
 
     def test_private_and_special_dns_answers_rejected(self):
-        for ip in ["127.0.0.1", "192.168.1.80", "192.168.1.90", "10.0.0.1", "169.254.169.254",
+        for ip in ["127.0.0.1", "192.168.50.20", "192.168.50.30", "10.0.0.1", "169.254.169.254",
                    "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "fc00::1", "::ffff:8.8.8.8",
                    "64:ff9b::c0a8:150"]:
             records = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))]
@@ -89,7 +89,7 @@ class Boundaries(unittest.TestCase):
 
     def test_mixed_dns_answers_fail_closed(self):
         values = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))
-                  for ip in ["8.8.8.8", "192.168.1.80"]]
+                  for ip in ["8.8.8.8", "192.168.50.20"]]
         with patch("socket.getaddrinfo", return_value=values), self.assertRaises(contract.BoundaryError):
             fetcher.public_addresses("example.com")
 

@@ -38,7 +38,7 @@ VM の作成手順は [docs/runbooks/isolated-lab-setup.md](../docs/runbooks/iso
 
 ```sh
 # 秘密の生成: 値はファイルにだけ入り、画面には出ない。出るのは config に入れる token_sha256 のみ。既存ファイルは上書きしない。
-python scripts/asgctl.py secrets init --dir <保護されたフォルダ> --name docker90_search            # --kind key で共有鍵（HMAC等）
+python scripts/asgctl.py secrets init --dir <保護されたフォルダ> --name lab_worker            # --kind key で共有鍵（HMAC等）
 # 設定フラグメントのマージ: 既定は dry-run。衝突は拒否（上書きしない）。--write でバックアップ→検証→置換。
 python scripts/asgctl.py fragment merge --into <config.json> --from <fragment.json> --map controller=<実際の親ID> --token-sha256 <新規エージェント>=<hex>
 python scripts/asgctl.py fragment merge ... --write                                                  # 書き込み後に ASG の再起動が必要

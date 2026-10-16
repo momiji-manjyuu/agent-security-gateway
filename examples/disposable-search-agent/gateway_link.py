@@ -11,8 +11,8 @@ from urllib.parse import urlsplit
 from contract import (encode, exact_keys, limited_text, load_json, require,
                       validate_task)
 
-TASK_ROUTE = "docker90.web_research.task"
-ARTIFACT_ROUTE = "docker90.artifacts.submit"
+TASK_ROUTE = "lab.web_research.task"
+ARTIFACT_ROUTE = "lab.artifacts.submit"
 
 
 def secret(name):
