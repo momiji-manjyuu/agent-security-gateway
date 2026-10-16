@@ -22,7 +22,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -362,6 +362,113 @@ def canary_drill(config_path: Path) -> dict:
             "touched_real_state": False}
 
 
+# ----- incident evidence bundle -----------------------------------------------------------------------------
+
+def _parse_ts(value: str):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def verify_audit_chain(lines: list[str]) -> dict:
+    """Recompute every event hash and the prev_hash links (same canonical form the gateway writes)."""
+    import hashlib
+    prev = "0" * 64
+    for number, line in enumerate(lines, 1):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return {"ok": False, "checked": number - 1, "first_break": number, "reason": "invalid json"}
+        claimed = event.pop("event_hash", None)
+        if event.get("prev_hash") != prev:
+            return {"ok": False, "checked": number - 1, "first_break": number, "reason": "prev_hash does not link"}
+        canonical = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != claimed:
+            return {"ok": False, "checked": number - 1, "first_break": number, "reason": "event_hash mismatch"}
+        prev = claimed
+    return {"ok": True, "checked": len(lines), "tail_hash": prev}
+
+
+ARTIFACT_PUBLIC = ("artifact_id", "status", "content_sha256", "created_at", "producer_agent_id", "route_id", "artifact_type", "derived_from")
+
+
+def incident_bundle(config_path: Path, out_dir: Path, agent: str | None = None, minutes_before: int = 30) -> dict:
+    """Evidence for a canary trip: audit slice (with chain verification), trips, the agent's artifact metadata (never content),
+    revocation history, and a manifest of SHA-256 hashes. Read-only on ASG's own files; writes only the new bundle directory."""
+    import hashlib
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    if agent is not None and not NAME_RE.match(agent):
+        raise OpsError("bad agent id")
+    if out_dir.exists():
+        raise OpsError("the bundle directory already exists; refusing to overwrite")
+    audit_path = Path(os.path.expandvars(os.path.expanduser(str(cfg.get("audit_log", "")))))
+    if not audit_path.is_file():
+        raise OpsError("audit log not found")
+    lines = [line for line in audit_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    chain = verify_audit_chain(lines)
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    trips = [e for e in events if e.get("event") == "canary_trip" and (agent is None or e.get("agent_id") == agent)]
+    if not trips:
+        raise OpsError("no canary_trip events found for this selection")
+    starts = [t for t in (_parse_ts(e.get("timestamp", "")) for e in trips) if t]
+    start = min(starts) - timedelta(minutes=max(0, minutes_before))
+    agents = {agent} if agent else {e.get("agent_id") for e in trips if e.get("agent_id")}
+    selected = []
+    for e in events:
+        ts = _parse_ts(e.get("timestamp", ""))
+        if ts and ts >= start and (not agents or e.get("agent_id") in agents or e.get("event") == "canary_trip" or e.get("agent_id") is None):
+            selected.append(e)
+    run_ids = sorted({str(e["run_id"]) for e in selected if e.get("run_id")})
+
+    artifacts = []
+    store = Path(os.path.expandvars(os.path.expanduser(str((cfg.get("artifact_store") or {}).get("path", "")))))
+    manifests = sorted((store / "manifests").rglob("*.json")) if (store / "manifests").is_dir() else []
+    for manifest_path in manifests:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        created = _parse_ts(manifest.get("created_at", ""))
+        if manifest.get("producer_agent_id") in agents or (created and created >= start and not agents):
+            artifacts.append({k: manifest.get(k) for k in ARTIFACT_PUBLIC})
+
+    revocations: list[str] = []
+    try:
+        revocations = canary.revoked_path(cfg).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        pass
+
+    out_dir.mkdir(parents=True)
+    files = {
+        "events.jsonl": "\n".join(json.dumps(e, sort_keys=True, ensure_ascii=False) for e in selected) + "\n",
+        "trips.json": json.dumps(trips, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        "artifacts.json": json.dumps(artifacts, indent=2, sort_keys=True) + "\n",
+        "revocations.jsonl": "\n".join(revocations) + ("\n" if revocations else ""),
+        "chain_report.json": json.dumps({**chain, "audit_lines": len(lines)}, indent=2) + "\n",
+        "HANDLING.txt": ("Evidence bundle. Treat as sensitive: it can describe attack content by id and hash but holds no secret values.\n"
+                         "Artifact CONTENT is intentionally not included; read it only through the quarantine review routes, as a person.\n"
+                         "Do not open any link found in these files. Verify MANIFEST.json hashes before relying on the bundle.\n"
+                         "Releasing a revoked agent is a separate human action: asgctl canary release.\n"),
+    }
+    manifest = {"created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "window_start": start.isoformat(),
+                "agents": sorted(a for a in agents if a), "run_ids": run_ids, "chain_ok": chain["ok"],
+                "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(), "files": {}}
+    for name, text in files.items():
+        data = text.encode("utf-8")
+        write_private_new(out_dir / name, text)
+        manifest["files"][name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    manifest["bundle_sha256"] = hashlib.sha256(json.dumps(manifest["files"], sort_keys=True).encode("utf-8")).hexdigest()
+    write_private_new(out_dir / "MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return {"bundle": str(out_dir), "events": len(selected), "trips": len(trips), "artifacts": len(artifacts), "run_ids": run_ids,
+            "chain_ok": chain["ok"], "bundle_sha256": manifest["bundle_sha256"]}
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="asgctl")
     sub = ap.add_subparsers(dest="group", required=True)
@@ -396,8 +503,18 @@ def main(argv: list[str]) -> int:
             sp.add_argument("--agent", required=True)
             sp.add_argument("--note", default="")
 
+    inc = sub.add_parser("incident").add_subparsers(dest="action", required=True).add_parser("bundle")
+    inc.add_argument("--config", type=Path, required=True)
+    inc.add_argument("--out", type=Path, required=True, help="new directory for the bundle")
+    inc.add_argument("--agent")
+    inc.add_argument("--minutes-before", type=int, default=30)
+
     args = ap.parse_args(argv)
     try:
+        if args.group == "incident":
+            report = incident_bundle(args.config, args.out, args.agent, args.minutes_before)
+            emit(report)
+            return 0 if report["chain_ok"] else 2  # a broken audit chain is itself a finding
         if args.group == "canary":
             action = {"init": lambda: canary_init(args.config), "list": lambda: canary_list(args.config),
                       "drill": lambda: canary_drill(args.config),
