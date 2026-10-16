@@ -300,6 +300,84 @@ class PresetFilesTests(unittest.TestCase):
         for needle in ('never touch the open web', 'does **not** mean', 'long-term memory', 'stop and tell the user'):
             self.assertIn(needle, text)
 
+class HttpTransportTests(McpTestBase):
+    KEY = 'k' * 40
+
+    def start_http(self):
+        server = self.server()
+        httpd = asg_mcp.serve_http(server, '127.0.0.1:0', self.KEY)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (httpd.shutdown(), httpd.server_close()))
+        return httpd.server_address[1]
+
+    def post(self, port, body, headers=None, path='/mcp', method='POST'):
+        import urllib.request
+        import urllib.error
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=data, method=method,
+                                     headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {self.KEY}', **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            return exc.code, (json.loads(raw) if raw else None)
+
+    def test_requires_the_bearer_key_and_loopback_host_and_origin(self):
+        port = self.start_http()
+        ping = {'jsonrpc': '2.0', 'id': 1, 'method': 'ping'}
+        self.assertEqual(self.post(port, ping)[0], 200)
+        self.assertEqual(self.post(port, ping, {'Authorization': 'Bearer wrong'})[0], 401)
+        self.assertEqual(self.post(port, ping, {'Authorization': ''})[0], 401)
+        self.assertEqual(self.post(port, ping, {'Authorization': f'Basic {self.KEY}'})[0], 401)
+        self.assertEqual(self.post(port, ping, {'Host': 'evil.example'})[0], 403)  # DNS rebinding
+        self.assertEqual(self.post(port, ping, {'Origin': 'https://evil.example'})[0], 403)
+        self.assertEqual(self.post(port, ping, {'Origin': 'http://localhost:3000'})[0], 200)
+        self.assertEqual(self.post(port, ping, path='/other')[0], 404)
+        for method in ('GET', 'PUT', 'DELETE'):
+            self.assertEqual(self.post(port, b'', method=method)[0], 405, method)
+
+    def test_wrong_key_never_reaches_the_tools_or_asg(self):
+        port = self.start_http()
+        status, _ = self.post(port, {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'asg_inspect', 'arguments': {'text': 'x'}}},
+                              {'Authorization': 'Bearer nope'})
+        self.assertEqual(status, 401)
+        self.assertEqual(self.asg.requests, [])
+
+    def test_full_flow_notification_batch_and_limits(self):
+        self.asg.responses[('POST', '/inspect')] = (200, {'scan': {'blocked': False, 'findings': []}, 'action_guard': {'blocked': False}})
+        port = self.start_http()
+        status, body = self.post(port, {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}})
+        self.assertEqual((status, body['result']['serverInfo']['name']), (200, 'asg-mcp'))
+        self.assertEqual(self.post(port, {'jsonrpc': '2.0', 'method': 'notifications/initialized'}), (202, None))
+        status, body = self.post(port, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'asg_inspect', 'arguments': {'text': 'hello'}}})
+        self.assertEqual(json.loads(body['result']['content'][0]['text'])['blocked'], False)
+        status, body = self.post(port, [{'jsonrpc': '2.0', 'id': 3, 'method': 'ping'}, {'jsonrpc': '2.0', 'method': 'notifications/x'}])
+        self.assertEqual((status, [r['id'] for r in body]), (200, [3]))
+        self.assertEqual(self.post(port, b'{not json')[1]['error']['code'], -32700)
+        self.assertEqual(self.post(port, b'x' * (asg_mcp.MAX_HTTP_BODY + 1))[0], 413)
+        self.assertEqual(self.post(port, b'')[0], 400)
+
+    def test_cli_refuses_to_serve_without_a_strong_key_or_off_loopback(self):
+        cfg = Path(self.tmp.name) / 'c.json'
+        cfg.write_text(json.dumps({'base_url': self.asg.url, 'token_file': str(self.token_file)}), encoding='utf-8')
+        short = Path(self.tmp.name) / 'short.key'
+        short.write_text('short', encoding='utf-8')
+        for extra in ([], ['--http-key-file', str(short)], ['--http', '0.0.0.0:9', '--http-key-file', str(short)]):
+            proc = subprocess.run([sys.executable, str(ROOT / 'scripts' / 'asg_mcp.py'), '--config', str(cfg), '--http', '127.0.0.1:0'] + extra
+                                  if not extra or '--http' not in extra else
+                                  [sys.executable, str(ROOT / 'scripts' / 'asg_mcp.py'), '--config', str(cfg)] + extra,
+                                  capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(proc.returncode, 0, extra)
+        good = Path(self.tmp.name) / 'good.key'
+        good.write_text(self.KEY, encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            asg_mcp.serve_http(self.server(), '0.0.0.0:9', self.KEY)
+        with self.assertRaises(SystemExit):
+            asg_mcp.serve_http(self.server(), '192.0.2.1:9', self.KEY)
+        self.assertEqual(asg_mcp.read_key(good), self.KEY)
+
 
 if __name__ == '__main__':
     unittest.main()

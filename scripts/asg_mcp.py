@@ -393,11 +393,128 @@ def serve(server: McpServer, stdin=sys.stdin, stdout=sys.stdout) -> None:
             stdout.flush()
 
 
+
+# ----- HTTP transport (for agents that cannot spawn a local process, e.g. sandboxed or containerised harnesses) ---------
+
+MAX_HTTP_BODY = 1 << 20
+LOOPBACK_ORIGIN = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$")
+
+
+def read_key(path: Path) -> str:
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise SystemExit("asg-mcp: cannot read the HTTP key file") from None
+    if len(key) < 32 or re.search(r"\s", key):
+        raise SystemExit("asg-mcp: the HTTP key must be at least 32 characters without whitespace")
+    return key
+
+
+def make_http_handler(server: McpServer, key: str):
+    import hmac
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "asg-mcp"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args) -> None:  # never log request data
+            return
+
+        def _send(self, status: int, payload: bytes = b"", content_type: str = "application/json") -> None:
+            self.send_response(status)
+            if payload:
+                self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            if payload:
+                self.wfile.write(payload)
+
+        def _refuse(self, status: int, code: str) -> None:
+            self._send(status, json.dumps({"error": code}).encode())
+
+        def _authorised(self) -> bool:
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            if host not in LOOPBACK:  # DNS-rebinding defence
+                self._refuse(403, "bad_host")
+                return False
+            origin = self.headers.get("Origin")
+            if origin is not None and not LOOPBACK_ORIGIN.match(origin):
+                self._refuse(403, "bad_origin")
+                return False
+            supplied = (self.headers.get("Authorization") or "")
+            if not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:].strip().encode(), key.encode()):
+                self._refuse(401, "unauthorized")
+                return False
+            return True
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path.split("?")[0] != "/mcp":
+                return self._refuse(404, "not_found")
+            if not self._authorised():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._refuse(400, "bad_length")
+            if length <= 0 or length > MAX_HTTP_BODY:
+                if MAX_HTTP_BODY < length <= 2 * MAX_HTTP_BODY:  # drain a moderately oversized body so the client sees a clean 413
+                    remaining = length
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                self.close_connection = True
+                return self._refuse(413 if length > MAX_HTTP_BODY else 400, "bad_length")
+            try:
+                message = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return self._send(200, json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}).encode())
+            batch = message if isinstance(message, list) else [message]
+            replies = [r for r in (server.handle(m) for m in batch) if r is not None]
+            if not replies:
+                return self._send(202)
+            self._send(200, json.dumps(replies if isinstance(message, list) else replies[0], ensure_ascii=True).encode())
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._refuse(405, "method_not_allowed")
+
+        do_PUT = do_DELETE = do_PATCH = do_GET  # noqa: N815
+
+    return Handler
+
+
+def serve_http(server: McpServer, bind: str, key: str):
+    import http.server
+    host, _, port = bind.rpartition(":")
+    if host not in LOOPBACK or not port.isdigit():
+        raise SystemExit("asg-mcp: --http must be 127.0.0.1:<port> (or localhost / ::1)")
+    httpd = http.server.ThreadingHTTPServer((host, int(port)), make_http_handler(server, key))
+    return httpd
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="ASG MCP server (stdio)")
+    ap = argparse.ArgumentParser(description="ASG MCP server (stdio by default; --http for loopback HTTP)")
     ap.add_argument("--config", type=Path, required=True)
+    ap.add_argument("--http", metavar="127.0.0.1:PORT", help="serve MCP over loopback HTTP at /mcp instead of stdio")
+    ap.add_argument("--http-key-file", type=Path, help="file holding the bearer key clients must send (required with --http)")
     args = ap.parse_args(argv)
-    serve(McpServer(Config.load(args.config)))
+    server = McpServer(Config.load(args.config))
+    if args.http:
+        if not args.http_key_file:
+            raise SystemExit("asg-mcp: --http requires --http-key-file (the endpoint is never served without authentication)")
+        httpd = serve_http(server, args.http, read_key(args.http_key_file))
+        print(f"asg-mcp listening on http://{args.http}/mcp", file=sys.stderr, flush=True)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        return 0
+    serve(server)
     return 0
 
 
