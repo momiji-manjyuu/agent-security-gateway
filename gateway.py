@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import canary
 import proxy as security
 
 
@@ -52,7 +53,7 @@ DEFAULT_RUN_MAX_TTL_SECONDS = 604_800
 DEFAULT_ARTIFACT_STORE = RUNTIME_DIR / "artifacts"
 DEFAULT_ARTIFACT_RETENTION_DAYS = 90
 MAX_TIMEOUT_SECONDS = 600
-ROUTE_KINDS = {"inspect_only", "openai_chat_completions", "http_json", "command", "artifact_review"}
+ROUTE_KINDS = {"inspect_only", "openai_chat_completions", "http_json", "command", "artifact_review", "canary"}
 PUBLIC_ROUTE_FIELDS = ("description", "kind", "required_capability", "allowed_capabilities", "aliases")
 REPORT_POLICY_BOOL_FIELDS = {
     "forward_audit_receipt",
@@ -641,7 +642,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 if not route_max_ok or route_max <= 0:
                     errors.append(f"routes.{route_id}.artifact_policy.max_artifact_bytes must be a positive integer")
         backend = route.get("backend", {})
-        if kind != "inspect_only":
+        if kind == "canary":
+            if route.get("backend"):
+                errors.append(f"routes.{route_id}.backend must not be set on a canary route")
+            if not canary.enabled(cfg):
+                errors.append(f"routes.{route_id} is a canary route; enable the canary section")
+        elif kind != "inspect_only":
             if not isinstance(backend, dict):
                 errors.append(f"routes.{route_id}.backend must be an object")
             else:
@@ -731,6 +737,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 except ValueError:
                     errors.append(f"runs.{run_id}.expires_at must be an ISO-8601 datetime")
 
+    if canary.enabled(cfg):
+        try:
+            canary.hmac_key(cfg)
+        except canary.CanaryError as exc:
+            errors.append(f"canary: {exc}")
+        if not canary.registry_path(cfg).is_file():
+            errors.append("canary.registry_file must exist (create it with: asgctl canary init)")
+
     if errors:
         raise ValueError("invalid config: " + "; ".join(errors))
 
@@ -783,6 +797,24 @@ def client_allowed(client_ip: str, agent: dict[str, Any]) -> bool:
     return False
 
 
+def enforce_canary(cfg: dict[str, Any], node: Any, *, agent_id: str | None, client_ip: str, source: str) -> None:
+    """Fail closed on any registered canary in `node`. One-way response: revoke the caller (and optionally raise the kill switch)."""
+    if not canary.enabled(cfg):
+        return
+    try:
+        hits = canary.find(cfg, node)
+    except canary.CanaryError:
+        write_audit(cfg, {"event": "deny", "reason": "canary_unavailable", "source": source, "client_ip": client_ip})
+        raise GatewayError(503, "canary_unavailable", "canary detection is enabled but not usable") from None
+    if not hits:
+        return
+    ids = [hit["id"] for hit in hits]
+    actions = canary.apply_trip(cfg, agent_id, ids, source, expand_path(str(cfg["kill_switch_file"])))
+    write_audit(cfg, {"event": "canary_trip", "source": source, "agent_id": agent_id, "client_ip": client_ip,
+                      "canary_ids": ids, "canary_kinds": sorted({hit["kind"] for hit in hits}), "actions": actions})
+    raise GatewayError(403, "blocked_by_canary", "a registered canary appeared in this exchange")
+
+
 def verify_agent(headers: Any, cfg: dict[str, Any], client_ip: str) -> VerifiedAgent:
     auth = headers.get("Authorization", "")
     if not isinstance(auth, str) or not auth.startswith("Bearer "):
@@ -794,6 +826,8 @@ def verify_agent(headers: Any, cfg: dict[str, Any], client_ip: str) -> VerifiedA
             continue
         configured_hash = str(agent.get("token_sha256", ""))
         if configured_hash and hmac.compare_digest(configured_hash, token_hash):
+            if canary.is_revoked(cfg, str(agent_id)):
+                raise GatewayError(403, "agent_revoked", f"agent '{agent_id}' is revoked; a person must release it")
             if not client_allowed(client_ip, agent):
                 raise GatewayError(403, "client_ip_denied", f"client IP is not allowed for agent '{agent_id}'")
             return VerifiedAgent(str(agent_id), agent)
@@ -908,6 +942,11 @@ def resolve_route_decision(headers: Any, payload: dict[str, Any], cfg: dict[str,
 def enforce_route_policy(verified: VerifiedAgent, decision: RouteDecision, cfg: dict[str, Any]) -> None:
     agent = verified.agent
     route = decision.route
+    if route.get("kind") == "canary":  # a decoy route nobody legitimate ever calls
+        actions = canary.apply_trip(cfg, verified.agent_id, [f"route:{decision.route_id}"], "decoy_route", expand_path(str(cfg["kill_switch_file"])))
+        write_audit(cfg, {"event": "canary_trip", "source": "decoy_route", "agent_id": verified.agent_id, "client_ip": "-",
+                          "canary_ids": [f"route:{decision.route_id}"], "canary_kinds": ["route"], "actions": actions})
+        raise GatewayError(403, "blocked_by_canary", "a decoy route was called")
     capability = decision.capability
     allowed_capabilities = set(str(item) for item in agent.get("allowed_capabilities") or [])
     if capability not in allowed_capabilities:
@@ -2457,6 +2496,7 @@ def output_text_for_route(payload: dict[str, Any], route_kind: str) -> str:
 
 
 def enforce_output_guard(payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> security.ScanResult:
+    enforce_canary(cfg, payload, agent_id=None, client_ip="backend", source="backend_response")
     scan = security.output_guard_scan_for_upstream(payload, cfg, None)
     output_policy = decision.route.get("output_policy", {})
     if isinstance(output_policy, dict) and output_policy.get("require_json_object"):
@@ -4224,6 +4264,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             raise GatewayError(400, "invalid_json", "request body must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise GatewayError(400, "invalid_json", "request body must be a JSON object")
+        enforce_canary(cfg, payload, agent_id=verified.agent_id, client_ip=self.client_address[0], source="request")
         return payload
 
     def deny(

@@ -950,6 +950,41 @@ Environment variables use the `ASG_` prefix.
 
 Do not rely on the gateway alone. Backends should reject direct caller traffic with host firewall rules, private network segmentation, WireGuard, mTLS, or a reverse proxy boundary. Low-trust workers should submit through staging routes, not directly call privileged services.
 
+## Canaries (honeytokens)
+
+A canary is a fake secret planted where a real one could be (a decoy credentials file, a decoy wallet or bank
+reference, a fake API key). Nothing legitimate ever sends it through ASG, so its appearance in a request, a backend
+response, or an artifact means something touched the decoy and tried to move it. Detection is deterministic: only an
+HMAC of each decoy is stored (key from `canary.hmac_key_env`, at least 32 characters), candidate tokens are extracted from
+all strings, HMAC'd, and looked up. Audit events and responses carry the canary id, never the value.
+
+```json
+"canary": {
+  "enabled": true,
+  "registry_file": "~/.agent-security-gateway/canaries.jsonl",
+  "revoked_file": "~/.agent-security-gateway/revoked-agents.jsonl",
+  "hmac_key_env": "ASG_CANARY_HMAC_KEY",
+  "on_trip": {"revoke_agent": true, "kill_switch": false}
+},
+"routes": {"security.decoy.export": {"kind": "canary", "allowed_callers": ["*"], "required_capability": "inspect"}}
+```
+
+On a trip ASG returns `403 blocked_by_canary`, writes a `canary_trip` audit event, revokes the calling agent
+(`agent_revoked` afterwards), and, only if `on_trip.kill_switch` is true, raises the global kill switch. A route of kind
+`canary` is a decoy route: calling it trips regardless of the caller's permissions. The responses are one way: releasing an
+agent is a person's action (`asgctl canary release`), never an API. If detection is enabled but the key or registry is
+unusable, requests fail closed with `503 canary_unavailable`.
+
+```sh
+python scripts/asgctl.py canary init  --config ~/.agent-security-gateway/config.json
+python scripts/asgctl.py canary add   --config ... --id aws-home --kind cloud_key --out ./decoy-credentials   # decoy text goes to the file only
+python scripts/asgctl.py canary list  --config ...
+python scripts/asgctl.py canary drill --config ...     # proves detection works with a synthetic canary; touches no real state
+python scripts/asgctl.py canary release --config ... --agent <id> --note "reviewed"
+```
+
+Planting decoys on hosts (file auditing, network and exec tripwires) is described in `docs/design/setup-and-connectivity.md` section 9.
+
 ## Disposable web-research worker
 
 The [Docker worker example](examples/disposable-search-agent/README.md) combines a

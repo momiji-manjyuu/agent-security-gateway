@@ -28,6 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import canary  # noqa: E402
 import gateway  # noqa: E402
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{1,63}$")
@@ -265,6 +266,102 @@ def parse_pairs(items: list[str], what: str) -> dict[str, str]:
     return out
 
 
+# ----- canary (honeytoken) operations -----------------------------------------------------------------------
+
+DECOY_KINDS = {
+    "cloud_key": lambda: "AKIA" + "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") for _ in range(16)),
+    "api_key": lambda: "sk-" + "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(40)),
+    "session_token": lambda: secrets.token_hex(24),
+    "bank_ref": lambda: "BK-" + "".join(secrets.choice("0123456789ABCDEF") for _ in range(20)),
+}
+
+
+def canary_cfg(config_path: Path) -> dict:
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    if not canary.settings(cfg):
+        raise OpsError("the config has no 'canary' section")
+    return cfg
+
+
+def canary_init(config_path: Path) -> dict:
+    cfg = canary_cfg(config_path)
+    try:
+        canary.hmac_key(cfg)
+    except canary.CanaryError as exc:
+        raise OpsError(str(exc)) from None
+    path = canary.registry_path(cfg)
+    created = not path.exists()
+    if created:
+        write_private_new(path, "")
+    return {"registry": str(path), "created": created, "revoked_file": str(canary.revoked_path(cfg)),
+            "note": "set canary.enabled=true in the config and restart ASG to start detecting"}
+
+
+def canary_add(config_path: Path, canary_id: str, kind: str, out: Path) -> dict:
+    cfg = canary_cfg(config_path)
+    if kind not in DECOY_KINDS:
+        raise OpsError(f"unknown kind {kind!r}; choose one of {', '.join(sorted(DECOY_KINDS))}")
+    try:
+        key = canary.hmac_key(cfg)
+        value = DECOY_KINDS[kind]()
+        entry = canary.make_entry(key, value, canary_id, kind)
+    except canary.CanaryError as exc:
+        raise OpsError(str(exc)) from None
+    registry = canary.registry_path(cfg)
+    if not registry.exists():
+        raise OpsError("registry missing; run 'canary init' first")
+    if any(canary_id == item["id"] for item in canary.load_registry(cfg).values()):
+        raise OpsError(f"canary id {canary_id!r} already exists")
+    if out.exists():
+        raise OpsError("the decoy output file already exists; refusing to overwrite")
+    write_private_new(out, value + "\n")  # the decoy text goes to the file you will plant; it is never printed or stored in the registry
+    with open(registry, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    return {"id": canary_id, "kind": kind, "decoy_file": str(out), "registry": str(registry),
+            "note": "plant the file's content where a real secret could be; ASG already ignores a decoy until it is seen in traffic"}
+
+
+def canary_list(config_path: Path) -> dict:
+    cfg = canary_cfg(config_path)
+    entries = sorted(canary.load_registry(cfg).values(), key=lambda e: e["id"])
+    revoked = sorted(a for a, rec in canary._revocations(cfg).items() if rec.get("action") == "revoke")
+    return {"canaries": entries, "revoked_agents": revoked}
+
+
+def canary_release(config_path: Path, agent: str, note: str) -> dict:
+    if not NAME_RE.match(agent):
+        raise OpsError("bad agent id")
+    cfg = canary_cfg(config_path)
+    canary.release(cfg, agent, note)
+    return {"released": agent, "note": "a person released this agent; it is recorded in the append-only revocation file"}
+
+
+def canary_drill(config_path: Path) -> dict:
+    """Prove the detection path works without touching real state: a synthetic canary in a temp registry, in-process."""
+    cfg = canary_cfg(config_path)
+    try:
+        key = canary.hmac_key(cfg)
+    except canary.CanaryError as exc:
+        raise OpsError(str(exc)) from None
+    value = DECOY_KINDS["cloud_key"]()
+    with tempfile.TemporaryDirectory() as tmp:
+        reg = Path(tmp) / "canaries.jsonl"
+        reg.write_text(json.dumps(canary.make_entry(key, value, "drill-synthetic", "cloud_key")) + "\n", encoding="utf-8")
+        drill_cfg = {"canary": {"enabled": True, "registry_file": str(reg), "revoked_file": str(Path(tmp) / "rev.jsonl")}}
+        shapes = {"plain": value, "env_assignment": f"AWS_ACCESS_KEY_ID={value}", "url": f"https://x.invalid/?k={value}",
+                  "nested_json": {"a": [{"b": f"Bearer {value}"}]}}
+        results = {name: bool(canary.find(drill_cfg, shape)) for name, shape in shapes.items()}
+        clean = not canary.find(drill_cfg, "ordinary text without any decoy")
+        before = canary.is_revoked(drill_cfg, "drill-agent")
+        canary.revoke(drill_cfg, "drill-agent", "drill", ["drill-synthetic"])
+        revoked = canary.is_revoked(drill_cfg, "drill-agent")
+        canary.release(drill_cfg, "drill-agent", "drill")
+        released = not canary.is_revoked(drill_cfg, "drill-agent")
+    ok = all(results.values()) and clean and (not before) and revoked and released
+    return {"ok": ok, "detects": results, "no_false_positive_on_clean_text": clean, "revoke_then_release": revoked and released,
+            "touched_real_state": False}
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="asgctl")
     sub = ap.add_subparsers(dest="group", required=True)
@@ -287,8 +384,28 @@ def main(argv: list[str]) -> int:
     runs.add_argument("--token-file", type=Path, required=True)
     runs.add_argument("--body", type=Path, required=True, help="JSON file, e.g. run-registration.example.json")
 
+    can = sub.add_parser("canary").add_subparsers(dest="action", required=True)
+    for name in ("init", "add", "list", "release", "drill"):
+        sp = can.add_parser(name)
+        sp.add_argument("--config", type=Path, required=True, help="ASG config.json (reads only the 'canary' section)")
+        if name == "add":
+            sp.add_argument("--id", required=True)
+            sp.add_argument("--kind", required=True)
+            sp.add_argument("--out", type=Path, required=True, help="new file that receives the decoy text to plant")
+        if name == "release":
+            sp.add_argument("--agent", required=True)
+            sp.add_argument("--note", default="")
+
     args = ap.parse_args(argv)
     try:
+        if args.group == "canary":
+            action = {"init": lambda: canary_init(args.config), "list": lambda: canary_list(args.config),
+                      "drill": lambda: canary_drill(args.config),
+                      "add": lambda: canary_add(args.config, args.id, args.kind, args.out),
+                      "release": lambda: canary_release(args.config, args.agent, args.note)}[args.action]
+            report = action()
+            emit(report)
+            return 0 if report.get("ok", True) else 1
         if args.group == "secrets":
             emit(secrets_init(args.dir, args.name, args.kind))
         elif args.group == "fragment":
