@@ -98,26 +98,40 @@ def secrets_init(directory: Path, names: list[str], kind: str) -> dict:
 # ----- fragment merge ---------------------------------------------------------------------------------------
 
 def substitute_ids(fragment: dict, mapping: dict[str, str]) -> dict:
-    """Rename agent ids (e.g. the placeholder 'controller') everywhere an id can appear."""
+    """Rename placeholder ids (e.g. 'controller'). A value may list several ids (a,b,c) only where a LIST of caller ids
+    is renamed; an agent definition (which owns a token) can map to exactly one id."""
     if not mapping:
         return fragment
 
-    def rename(value):
-        if isinstance(value, str):
-            return mapping.get(value, value)
-        if isinstance(value, list):
-            return [rename(v) for v in value]
-        return value
+    def targets(value: str) -> list[str]:
+        return [part for part in mapping.get(value, value).split(",") if part]
+
+    def rename_list(values):
+        out: list = []
+        for value in values:
+            if isinstance(value, str):
+                for item in targets(value):
+                    if item not in out:
+                        out.append(item)
+            else:
+                out.append(value)
+        return out
 
     out = copy.deepcopy(fragment)
     if "agents" in out:
-        out["agents"] = {mapping.get(k, k): v for k, v in out["agents"].items()}
+        renamed = {}
+        for key, value in out["agents"].items():
+            ids = targets(key)
+            if len(ids) != 1:
+                raise OpsError(f"agent {key!r} cannot map to several ids: each agent owns its own token")
+            renamed[ids[0]] = value
+        out["agents"] = renamed
     for route in out.get("routes", {}).values():
         if "allowed_callers" in route:
-            route["allowed_callers"] = rename(route["allowed_callers"])
+            route["allowed_callers"] = rename_list(route["allowed_callers"])
     for run in out.get("runs", {}).values():
         if "allowed_callers" in run:
-            run["allowed_callers"] = rename(run["allowed_callers"])
+            run["allowed_callers"] = rename_list(run["allowed_callers"])
     return out
 
 
@@ -160,7 +174,17 @@ def merge_fragment(config: dict, fragment: dict, token_hashes: dict[str, str]) -
                         existing[field] = list(existing.get(field, [])) + add
                         changes.append({"op": "extend", "path": f"{path}.{field}", "added": add})
             elif target[name] != definition:
-                conflicts.append(f"{path}: already defined differently")
+                existing = target[name]
+                # A route that differs ONLY by caller ids may be widened by adding callers (never removed, never reordered away).
+                if (section == "routes" and isinstance(existing, dict) and isinstance(definition, dict)
+                        and {k: v for k, v in existing.items() if k != "allowed_callers"} == {k: v for k, v in definition.items() if k != "allowed_callers"}):
+                    have = list(existing.get("allowed_callers", []))
+                    add = [c for c in definition.get("allowed_callers", []) if c not in have]
+                    if add and "*" not in have:
+                        existing["allowed_callers"] = have + add
+                        changes.append({"op": "extend", "path": f"{path}.allowed_callers", "added": add})
+                else:
+                    conflicts.append(f"{path}: already defined differently")
     leftovers = find_placeholders(merged)
     conflicts.extend(f"{p}: unresolved placeholder" for p in leftovers)
     return merged, changes, conflicts
@@ -244,7 +268,9 @@ def runs_register(url: str, token_file: Path, body: dict, route: str = "security
             data = json.loads(resp.read(65536).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
-            code = json.loads(exc.read(4096).decode("utf-8")).get("error", "")
+            body = json.loads(exc.read(4096).decode("utf-8")).get("error", "")
+            code = body.get("code", "") if isinstance(body, dict) else body  # ASG: {"error": {"code": ...}}
+            code = code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_.-]{1,48}", code) else ""
         except (ValueError, OSError):
             code = ""
         raise OpsError(f"ASG refused the request: http {exc.code} {code}".strip()) from None

@@ -120,6 +120,31 @@ class FragmentMergeTests(unittest.TestCase):
         _, _, conflicts = self.merge(config, {'controller': 'win_controller_1'}, {'docker90_search': HASH_B})
         self.assertTrue(any(c.startswith('require_known_run_id') for c in conflicts))
 
+    def test_route_that_differs_only_by_callers_can_be_widened_but_never_narrowed(self):
+        route = {'kind': 'inspect_only', 'allowed_callers': ['a', 'b'], 'required_capability': 'x'}
+        frag = {'routes': {'r1': {**route, 'allowed_callers': ['b', 'c']}}}
+        merged, changes, conflicts = ops.merge_fragment({'routes': {'r1': route}}, frag, {})
+        self.assertEqual((conflicts, merged['routes']['r1']['allowed_callers']), ([], ['a', 'b', 'c']))
+        self.assertEqual(changes, [{'op': 'extend', 'path': 'routes.r1.allowed_callers', 'added': ['c']}])
+        # nothing removed when the fragment lists fewer callers
+        merged, changes, _ = ops.merge_fragment({'routes': {'r1': route}}, {'routes': {'r1': {**route, 'allowed_callers': ['a']}}}, {})
+        self.assertEqual((changes, merged['routes']['r1']['allowed_callers']), ([], ['a', 'b']))
+        # a wildcard route is left alone
+        star = {**route, 'allowed_callers': ['*']}
+        self.assertEqual(ops.merge_fragment({'routes': {'r1': star}}, frag, {})[1:], ([], []))
+        # any other difference is still a conflict
+        other = {'routes': {'r1': {**route, 'required_capability': 'y', 'allowed_callers': ['c']}}}
+        self.assertTrue(ops.merge_fragment({'routes': {'r1': route}}, other, {})[2])
+
+    def test_map_can_expand_caller_lists_but_not_agent_ids(self):
+        frag = {'agents': {'controller': {}}, 'routes': {'r': {'allowed_callers': ['controller', 'worker']}}}
+        out = ops.substitute_ids({'routes': frag['routes']}, {'controller': 'a,b'})
+        self.assertEqual(out['routes']['r']['allowed_callers'], ['a', 'b', 'worker'])
+        with self.assertRaises(ops.OpsError):
+            ops.substitute_ids(frag, {'controller': 'a,b'})
+        renamed = ops.substitute_ids(frag, {'controller': 'solo'})
+        self.assertIn('solo', renamed['agents'])
+
     def write_files(self, tmp):
         cfg = Path(tmp) / 'config.json'
         cfg.write_text(json.dumps(base_config(), indent=2), encoding='utf-8')
