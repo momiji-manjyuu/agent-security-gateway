@@ -26,6 +26,8 @@ def serve(body, status=200):
             self.end_headers()
             self.wfile.write(data)
 
+        do_POST = do_GET  # noqa: N815
+
         def log_message(self, *args):
             pass
 
@@ -156,6 +158,30 @@ class AsgctlTests(unittest.TestCase):
             report = json.loads(buf.getvalue())
             self.assertEqual(code, 1)
             self.assertEqual({c['id']: c['status'] for c in report['checks']}, {'py': 'ok', 'bad': 'fail'})
+
+    def test_http_refuses_accepts_only_401_or_403(self):
+        spec = lambda server: {'id': 'r', 'type': 'http_refuses', 'url': f'http://127.0.0.1:{server.server_address[1]}/v1/tasks'}
+        for status, expected in ((403, 'ok'), (401, 'ok'), (200, 'fail'), (500, 'fail'), (404, 'fail')):
+            server = serve({'error': 'x'}, status=status)
+            self.addCleanup(lambda s=server: (s.shutdown(), s.server_close()))
+            self.assertEqual(asgctl.check_http_refuses(spec(server))['status'], expected, status)
+        self.assertEqual(asgctl.check_http_refuses({'id': 'r', 'type': 'http_refuses', 'url': 'http://127.0.0.1:9/x'})['status'], 'fail')
+        self.assertEqual(asgctl.check_http_refuses({'id': 'r', 'type': 'http_refuses', 'url': 'http://192.0.2.1/x'})['status'], 'fail')
+
+    def test_docker_image_and_scheduled_task_checks(self):
+        spec = {'id': 'i', 'type': 'docker_image', 'repository': 'disposable-search-worker'}
+        with patch.object(asgctl.shutil, 'which', return_value='docker'):
+            with patch.object(asgctl, 'run', return_value=(0, 'postgres\ndisposable-search-worker\n')):
+                self.assertEqual(asgctl.check_docker_image(spec)['status'], 'ok')
+            with patch.object(asgctl, 'run', return_value=(0, 'postgres\n')):
+                self.assertEqual(asgctl.check_docker_image(spec)['status'], 'fail')
+        with patch.object(asgctl.shutil, 'which', return_value=None):
+            self.assertEqual(asgctl.check_docker_image(spec)['status'], 'fail')
+        task = {'id': 't', 'type': 'scheduled_task', 'name': 'X'}
+        with patch.object(asgctl, 'IS_WINDOWS', True):
+            for data, expected in (({'state': 'Running'}, 'ok'), ({'state': 'Disabled'}, 'fail'), (None, 'fail')):
+                with patch.object(asgctl, 'ps_json', return_value=(data, '')):
+                    self.assertEqual(asgctl.check_scheduled_task(task)['status'], expected)
 
     def test_script_has_no_write_side_effects(self):
         text = (ROOT / 'scripts' / 'asgctl.py').read_text(encoding='utf-8')

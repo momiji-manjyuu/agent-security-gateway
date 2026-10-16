@@ -7,6 +7,8 @@
     {"id": "ssh_client", "type": "command", "name": "ssh"},
     {"id": "asg_port_bind", "type": "listen", "port": 8788, "expect": "loopback",
      "hint": "Set \"bind\": \"127.0.0.1\" in the ASG config and restart; reach it from other hosts through an SSH tunnel."},
+    {"id": "runner_reverse_tunnel", "type": "listen", "port": 18790, "expect": "loopback", "optional": true,
+     "hint": "The isolated runner host opens this reverse tunnel (ssh -R 127.0.0.1:18790:127.0.0.1:8790). It must listen on loopback only."},
     {"id": "asg_config_env", "type": "env_vars", "names": ["ASG_CONFIG"], "required": false},
     {"id": "asg_secrets_env", "type": "env_vars", "names": ["ASG_AGENT_TOKEN"], "required": false}
   ],

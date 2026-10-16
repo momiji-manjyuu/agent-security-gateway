@@ -284,11 +284,47 @@ def check_guest_egress(c: dict, deep: bool = False) -> dict:
     return result(c["id"], "ok", detail)
 
 
+def check_scheduled_task(c: dict) -> dict:
+    if not IS_WINDOWS:
+        return result(c["id"], "skip", "not a Windows host")
+    name = c["name"].replace("'", "''")
+    data, err = ps_json(f"$t=Get-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue; if($t){{ [pscustomobject]@{{state=[string]$t.State}} }}")
+    if not data:
+        return result(c["id"], "fail", f"scheduled task '{c['name']}' not found", c.get("hint", ""))
+    ok = str(data["state"]) in ("Running", "Ready", "3", "4")
+    return result(c["id"], "ok" if ok else "fail", f"task {c['name']}: {data['state']}", c.get("hint", ""))
+
+
+def check_docker_image(c: dict) -> dict:
+    exe = shutil.which("docker")
+    if not exe:
+        return result(c["id"], "fail", "docker not found", c.get("hint", ""))
+    rc, out = run([exe, "images", "--format", "{{.Repository}}"], 30)
+    present = rc == 0 and c["repository"] in out.split()
+    return result(c["id"], "ok" if present else "fail", f"image {c['repository']} " + ("present" if present else "missing"), c.get("hint", ""))
+
+
+def check_http_refuses(c: dict) -> dict:
+    """An unauthenticated request to a loopback service must be refused (401/403), not served and not hanging."""
+    if not loopback_only(c["url"]):
+        return result(c["id"], "fail", "only loopback URLs are probed")
+    request = urllib.request.Request(c["url"], data=b"{}", method=c.get("method", "POST"), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as resp:
+            return result(c["id"], "fail", f"served an unauthenticated request (http {resp.status})", "The service must reject unsigned requests.")
+    except urllib.error.HTTPError as exc:
+        refused = exc.code in (401, 403)
+        return result(c["id"], "ok" if refused else "fail", f"http {exc.code}", "Expected 401 or 403 for an unauthenticated request.")
+    except OSError as exc:
+        return result(c["id"], "fail", f"{type(exc).__name__}: service not reachable")
+
+
 CHECKS = {
     "python_version": check_python_version, "os_info": check_os_info, "command": check_command, "listen": check_listen,
     "env_vars": check_env_vars, "hyperv_enabled": check_hyperv_enabled, "firewall_rule": check_firewall_rule,
     "hyperv_vm": check_hyperv_vm, "http_health": check_http_health, "http_json_ok": check_http_json_ok,
     "guest_selfcheck": check_guest_selfcheck, "guest_egress": check_guest_egress,
+    "scheduled_task": check_scheduled_task, "docker_image": check_docker_image, "http_refuses": check_http_refuses,
 }
 
 

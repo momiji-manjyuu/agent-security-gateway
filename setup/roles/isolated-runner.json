@@ -1,0 +1,27 @@
+{
+  "role": "isolated-runner",
+  "description": "Isolated host running the disposable research runner (Docker). Reaches ASG through a loopback tunnel; ASG reaches the runner through a reverse tunnel. The runner must refuse unsigned requests.",
+  "doctor": [
+    {"id": "os", "type": "os_info"},
+    {"id": "ssh_client", "type": "command", "name": "ssh"},
+    {"id": "docker_cli", "type": "command", "name": "docker"},
+    {"id": "worker_image", "type": "docker_image", "repository": "disposable-search-worker",
+     "hint": "Build it in the runner folder: docker compose build worker"},
+    {"id": "runner_port_bind", "type": "listen", "port": 8790, "expect": "loopback",
+     "hint": "The runner must listen on 127.0.0.1 only; ASG reaches it through the reverse tunnel."},
+    {"id": "asg_tunnel_bind", "type": "listen", "port": 18788, "expect": "loopback",
+     "hint": "Open the tunnel to the hub (presets/parent/tunnel shows the pattern; the key must be dedicated and restricted)."},
+    {"id": "runner_task", "type": "scheduled_task", "name": "DisposableSearch-Runner"}
+  ],
+  "verify": [
+    {"id": "asg_via_tunnel", "type": "http_health", "url": "http://127.0.0.1:18788/healthz", "app": "agent-security-gateway"},
+    {"id": "runner_refuses_unsigned", "type": "http_refuses", "url": "http://127.0.0.1:8790/v1/tasks", "method": "POST",
+     "description": "An unauthenticated POST must be refused (401/403), never served."}
+  ],
+  "steps": [
+    {"step": "Build the worker image", "needs": ["worker_image"]},
+    {"step": "Run the runner (loopback only) as a scheduled task", "needs": ["runner_port_bind", "runner_task"]},
+    {"step": "Keep the tunnel to the hub up", "needs": ["asg_tunnel_bind"]},
+    {"step": "On the hub: reverse-tunnel port 18790 must listen on loopback (role hub, check runner_reverse_tunnel)", "manual": true}
+  ]
+}
