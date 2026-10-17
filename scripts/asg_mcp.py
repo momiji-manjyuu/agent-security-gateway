@@ -156,7 +156,8 @@ class AsgClient:
         except urllib.error.HTTPError as exc:
             code = ""
             try:
-                code = token_or_none(json.loads(exc.read(4096).decode("utf-8")).get("error")) or ""
+                body = json.loads(exc.read(4096).decode("utf-8")).get("error")
+                code = token_or_none(body.get("code") if isinstance(body, dict) else body) or ""  # ASG: {"error": {"code": ...}}
             except (ValueError, OSError):
                 pass
             raise ToolError(f"asg_http_{exc.code}" + (f":{code}" if code else "")) from None
