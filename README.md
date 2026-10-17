@@ -981,7 +981,12 @@ python scripts/asgctl.py canary add   --config ... --id aws-home --kind cloud_ke
 python scripts/asgctl.py canary list  --config ...
 python scripts/asgctl.py canary drill --config ...     # proves detection works with a synthetic canary; touches no real state
 python scripts/asgctl.py canary release --config ... --agent <id> --note "reviewed"
+python scripts/asgctl.py incident bundle --config ... --agent <id> --out ./incident-001 --minutes-before 30
 ```
+
+`incident bundle` writes an evidence directory for a canary trip: the audit slice around it (with the hash chain
+re-verified; a broken chain exits 2), the trip events, the agent's artifact **metadata** (never content), the revocation
+history, and a `MANIFEST.json` of SHA-256 hashes. It writes only the new directory and refuses to overwrite.
 
 Planting decoys on hosts (file auditing, network and exec tripwires) is described in `docs/design/setup-and-connectivity.md` section 9.
 

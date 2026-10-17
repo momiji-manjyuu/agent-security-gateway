@@ -385,7 +385,7 @@ def render_human(report: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] in ("secrets", "fragment", "runs", "canary"):  # phase 2 operations live in asgctl_ops
+    if argv and argv[0] in ("secrets", "fragment", "runs", "canary", "incident"):  # phase 2 operations live in asgctl_ops
         import asgctl_ops
         return asgctl_ops.main(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
