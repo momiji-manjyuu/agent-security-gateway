@@ -869,6 +869,40 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "require_known_run_id must be a boolean"):
                 gateway.validate_config(cfg)
 
+    def make_minimal_config(self) -> dict:
+        # Smallest config that passes gateway.validate_config: one inspect_only route
+        # (inspect_only skips backend validation) and defaulted stores/timeouts.
+        return {
+            "bind": "127.0.0.1",
+            "port": 8788,
+            "max_body_bytes": 524_288,
+            "agents": {},
+            "routes": {
+                "inspect.echo": {
+                    "kind": "inspect_only",
+                    "required_capability": "inspect_echo",
+                    "allowed_callers": ["local_agent"],
+                },
+            },
+        }
+
+    def test_validate_config_rejects_wildcard_bind_without_allow_public_bind(self):
+        cfg = self.make_minimal_config()
+        cfg["bind"] = "0.0.0.0"
+        with self.assertRaisesRegex(ValueError, "bind uses a wildcard address"):
+            gateway.validate_config(cfg)
+
+    def test_validate_config_allows_loopback_bind(self):
+        cfg = self.make_minimal_config()
+        cfg["bind"] = "127.0.0.1"
+        gateway.validate_config(cfg)  # must not raise a bind error
+
+    def test_validate_config_allows_wildcard_bind_with_allow_public_bind(self):
+        cfg = self.make_minimal_config()
+        cfg["bind"] = "0.0.0.0"
+        cfg["allow_public_bind"] = True
+        gateway.validate_config(cfg)  # must not raise a bind error
+
     def test_init_runtime_config_generates_require_known_run_id_true(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = init_runtime_config.argparse.Namespace(
