@@ -1,11 +1,14 @@
 """Trusted fixed-target inference client. Never import this into the worker image."""
 import http.client
 import json
+import os
 
 from contract import exact_keys, limited_text, load_json, require
 
-MODEL_HOST = '192.168.1.70'
-MODEL_PORT = 4000
+# The fixed model endpoint is chosen by the OPERATOR on the trusted host (environment), never by a caller or the worker.
+# Unset or malformed means inference fails closed.
+MODEL_HOST = os.environ.get('MODEL_BROKER_HOST', '')
+MODEL_PORT = int(os.environ['MODEL_BROKER_PORT']) if os.environ.get('MODEL_BROKER_PORT', '').isdigit() else 0
 WORKER_MODEL = 'qwen3.8-flash-next'
 INSPECTOR_MODEL = 'deepseek-v4-flash'
 MAX_MODEL_BYTES = 131072
@@ -14,6 +17,7 @@ MAX_REQUEST_BYTES = 131072
 
 def complete(model, messages, max_tokens=2048, timeout=60):
     require(model in (WORKER_MODEL, INSPECTOR_MODEL))
+    require(MODEL_HOST and 0 < MODEL_PORT < 65536)  # fail closed when the operator has not set the endpoint
     body = {'model': model, 'messages': messages, 'temperature': 0,
             'max_tokens': max_tokens, 'stream': False}
     if model == WORKER_MODEL:

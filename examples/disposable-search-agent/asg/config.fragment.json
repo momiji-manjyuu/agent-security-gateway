@@ -7,18 +7,18 @@
       "trust_tier": "privileged_core",
       "allowed_client_cidrs": ["127.0.0.1/32"],
       "allowed_capabilities": ["delegate_web_research"],
-      "allowed_routes": ["docker90.web_research.task"]
+      "allowed_routes": ["lab.web_research.task"]
     },
-    "docker90_search": {
+    "lab_worker": {
       "token_sha256": "REPLACE_WITH_WORKER_TOKEN_SHA256",
       "trust_tier": "web_dmz",
       "allowed_client_cidrs": ["127.0.0.1/32"],
       "allowed_capabilities": ["submit_artifact"],
-      "allowed_routes": ["docker90.artifacts.submit"]
+      "allowed_routes": ["lab.artifacts.submit"]
     }
   },
   "routes": {
-    "docker90.web_research.task": {
+    "lab.web_research.task": {
       "kind": "http_json",
       "backend": {
         "mode": "http",
@@ -48,9 +48,9 @@
         "block_internal_paths": true
       }
     },
-    "docker90.artifacts.submit": {
+    "lab.artifacts.submit": {
       "kind": "inspect_only",
-      "allowed_callers": ["docker90_search"],
+      "allowed_callers": ["lab_worker"],
       "required_capability": "submit_artifact",
       "require_run_id": true,
       "input_policy": {

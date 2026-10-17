@@ -1,31 +1,31 @@
-# 192.168.1.80の設定担当者向け
+# ASGホストの設定担当者向け
 
 ## 追加するもの
 
-- 192.168.1.90のホストランナー宛て：`docker90.web_research.task`（`http_json`）。
-- 結果の隔離保管：`docker90.artifacts.submit`（`inspect_only`）。
-- 送信専用agent：`docker90_search`、能力は`submit_artifact`のみ。
+- 隔離ホストのホストランナー宛て：`lab.web_research.task`（`http_json`）。
+- 結果の隔離保管：`lab.artifacts.submit`（`inspect_only`）。
+- 送信専用agent：`lab_worker`、能力は`submit_artifact`のみ。
 - 親agentに`delegate_web_research`と依頼経路を追加。
 
 `config.fragment.json`はマージする差分です。既存config全体の置換には使わないでください。親の仮ID`controller`を実際のIDに置換し、既存callerの能力・経路は保持してください。
 
-境界修正版ASGでは、保管ルートの`artifact_policy.allowed_operations: ["submit"]`が必要です。この差分には追加済みです。.90へ以前コピーした設定にも同じ項目を反映してください。
+境界修正版ASGでは、保管ルートの`artifact_policy.allowed_operations: ["submit"]`が必要です。この差分には追加済みです。隔離ホストへ以前コピーした設定にも同じ項目を反映してください。
 
 ## 接続
 
-ASGの待受を`127.0.0.1:8788`と仮定。192.168.1.90から張るSSHの`-L`と`-R`により、ASGから見たランナーは`http://127.0.0.1:18790/v1/tasks`、ランナーから見たASGは`http://127.0.0.1:18788`になります。実ポートが異なる場合はトンネルを合わせます。
+ASGの待受を`127.0.0.1:8788`と仮定。隔離ホストから張るSSHの`-L`と`-R`により、ASGから見たランナーは`http://127.0.0.1:18790/v1/tasks`、ランナーから見たASGは`http://127.0.0.1:18788`になります。実ポートが異なる場合はトンネルを合わせます。
 
-トンネルでは`docker90_search`のASG接続元は`127.0.0.1`です。IPだけに依存せず、専用トークン・ルート・能力・runを必須にします。親が別の接続元を使う場合、親agentのCIDRは既存の実構成を維持します。
+トンネルでは`lab_worker`のASG接続元は`127.0.0.1`です。IPだけに依存せず、専用トークン・ルート・能力・runを必須にします。親が別の接続元を使う場合、親agentのCIDRは既存の実構成を維持します。
 
 ## 共有する秘密（チャットに貼らない）
 
-| 192.168.1.80 | 192.168.1.90 |
+| ASGホスト | 隔離ホスト |
 |---|---|
 | `ASG_SEARCH_BACKEND_KEY` | 同じ値を`SEARCH_BACKEND_TOKEN` |
 | 既存`backend_hmac_key_env`の鍵 | 同じ値を`ASG_BACKEND_HMAC_KEY` |
-| `docker90_search.token_sha256` | ハッシュ化前の値を`ASG_WORKER_TOKEN` |
+| `lab_worker.token_sha256` | ハッシュ化前の値を`ASG_WORKER_TOKEN` |
 
-既存のグローバル署名鍵を勝手に交換しないでください。ASG側の環境変数名が異なる場合、既存`backend_hmac_key_env`を維持し、その値を192.168.1.90へ設定します。3組の値は対応する組だけ共有し、子コンテナには一切渡しません。
+既存のグローバル署名鍵を勝手に交換しないでください。ASG側の環境変数名が異なる場合、既存`backend_hmac_key_env`を維持し、その値を隔離ホストへ設定します。3組の値は対応する組だけ共有し、子コンテナには一切渡しません。
 
 ## runの範囲
 
@@ -43,6 +43,6 @@ run登録経路がまだなければ、ASGリポジトリの登録経路例を�
 
 ## 起動確認
 
-実際の秘密を環境変数へ設定後、ASGの既存手順で`validate-config`を実行します。署名必須の経路は鍵が未設定なら失敗します。192.168.1.90のDockerとPythonが準備できたら、まず`task.example.json`のURL指定テストを実施してください。
+実際の秘密を環境変数へ設定後、ASGの既存手順で`validate-config`を実行します。署名必須の経路は鍵が未設定なら失敗します。隔離ホストのDockerとPythonが準備できたら、まず`task.example.json`のURL指定テストを実施してください。
 
 参照実装の基点：[agent-security-gateway / e9a251d](https://github.com/momiji-manjyuu/agent-security-gateway/tree/e9a251de9b8ac26112376e78f542d8110f14b7db)。同梱の境界修正を適用したASGで使用します。このひな形は実設定を自動変更しません。

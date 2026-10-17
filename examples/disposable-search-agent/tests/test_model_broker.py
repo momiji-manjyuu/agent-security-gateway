@@ -58,5 +58,20 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(any('TOKEN=' in arg or 'KEY=' in arg or 'volume' in arg for arg in command))
 
 
+class EndpointConfigTests(unittest.TestCase):
+    def test_complete_fails_closed_without_an_operator_set_endpoint(self):
+        for host, port in (('', 4000), ('model.internal', 0), ('', 0)):
+            with patch.object(model_broker, 'MODEL_HOST', host), patch.object(model_broker, 'MODEL_PORT', port):
+                with patch.object(model_broker.http.client, 'HTTPConnection') as connect:
+                    with self.assertRaises(Exception):
+                        model_broker.complete(model_broker.WORKER_MODEL, [{'role': 'user', 'content': 'x'}])
+                    connect.assert_not_called()
+
+    def test_endpoint_is_read_from_the_environment_only(self):
+        source = open(model_broker.__file__, encoding='utf-8').read()
+        self.assertIn("os.environ.get('MODEL_BROKER_HOST'", source)
+        self.assertNotRegex(source, r"MODEL_HOST\s*=\s*['\"][0-9]")
+
+
 if __name__ == '__main__':
     unittest.main()

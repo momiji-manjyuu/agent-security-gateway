@@ -1,21 +1,21 @@
 # 使い捨て検索子エージェント：Docker + Agent Security Gateway
 
-**192.168.1.90で子コンテナを作り、192.168.1.80のAgent Security Gateway（ASG）を通して依頼と結果を受け渡すひな形です。**
+**隔離ホストで子コンテナを作り、ASGホストのAgent Security Gateway（ASG）を通して依頼と結果を受け渡すひな形です。**
 
-ASGの検査に`deepseek-v4-flash`、子の推論に`qwen3.8-flash-next`を使う構成例です。モデル接続先の例は`192.168.1.70:4000`です。記載したLANアドレスとWindows配置先は参考値で、モデルの固定接続先はホスト側の`model_broker.py`で管理してください。依頼受付、公開Web取得、コンテナ実行、ASGへの隔離保管まで実装しています。
+ASGの検査に`deepseek-v4-flash`、子の推論に`qwen3.8-flash-next`を使う構成例です。モデルの接続先は、ホスト側の環境変数`MODEL_BROKER_HOST`と`MODEL_BROKER_PORT`で固定します（呼び出し側や子コンテナからは変更できません。未設定なら推論は失敗します）。記載したWindows配置先は参考値です。依頼受付、公開Web取得、コンテナ実行、ASGへの隔離保管まで実装しています。
 
 ## 構成
 
 ```mermaid
 flowchart LR
-    P[親エージェント] -->|構造化した単発依頼| G[ASG / 192.168.1.80]
-    G -->|署名済み POST /v1/tasks| R[信頼するランナー / 192.168.1.90]
+    P[親エージェント] -->|構造化した単発依頼| G[ASG]
+    G -->|署名済み POST /v1/tasks| R[信頼するランナー / 隔離ホスト]
     R --> F[固定処理の公開HTTPS取得]
     F -->|本文をプログラムのメモリへ| R
     R -->|標準入力 / 親の履歴なし| C[使い捨てLinuxコンテナ]
     C -->|未信頼のJSON| R
     C <-->|標準入出力 / 1回の推論要求| B[ホストの固定モデル仲介]
-    B --> M[Qwen / 192.168.1.70:4000]
+    B --> M[Qwen / モデルホスト]
     G --> D[ループバック仲介 → DeepSeek]
     R -->|POST /v1/artifacts| Q[ASG隔離保管]
     R -->|資料IDと状態のみ| G
@@ -52,16 +52,16 @@ ASGとの通信はランナーが担当します。子にはASGトークン、�
 - `model_broker.py`：ホスト専用。送信先・モデル・会話形式を固定した推論仲介。
 - `inspector_relay.py`：ASGホスト専用。DeepSeekへの固定接続をループバックで提供。
 - `contract.py`：入出力の許可フィールド・型・長さの検証。
-- `asg/`：192.168.1.80担当者向け設定差分と依頼例。
+- `asg/`：ASGホスト担当者向け設定差分と依頼例。
 - `PARENT_POLICY.md`：親の連携ルール。
 - `tests/`：境界テスト、ASG実装との互換テスト、実コンテナの検査。
 - `VALIDATION.md`：今回実施した検証と未確認項目。
 
-## 1. 192.168.1.90の前提を確認
+## 1. 隔離ホストの前提を確認
 
 必要なもの：Python 3.12以上、Docker CLI、稼働中のDocker Linuxエンジン、OpenSSHクライアント。追加のPythonパッケージは不要です。
 
-今回のSSH先はWindowsホストです。`user@192.168.1.90`で接続します。Docker Linuxエンジンを起動し、ホストランナー用のPython 3.13.15を専用フォルダーへ配置しました。WSLのUbuntuは26.04.1 LTSです。子イメージは`python:3.12-slim-bookworm`を使います。
+今回のSSH先はWindowsホストです。`<ユーザー>@<隔離ホストのアドレス>`で接続します。Docker Linuxエンジンを起動し、ホストランナー用のPython 3.13.15を専用フォルダーへ配置しました。WSLのUbuntuは26.04.1 LTSです。子イメージは`python:3.12-slim-bookworm`を使います。
 
 Windowsでの配置例は`C:\Users\User\Documents\disposable-search-agent`、Pythonは`C:\Users\User\Documents\disposable-search-runtime\python.exe`です。自動起動は各ホストで設定します。このリポジトリをコピーするだけでは、OSの起動タスクや認証情報は設定されません。
 
@@ -80,20 +80,20 @@ python tests/smoke_docker.py
 
 `docker compose up`で子を常駐させる必要はありません。本番ランナーは依頼ごとに`docker run --rm`で同じ制限を設定します。イメージは信頼側だけでビルドし、親の設定・秘密ファイルはビルドコンテキストに含めません。`.dockerignore`は許可した3ファイルだけを含めます。
 
-## 2. 192.168.1.80との通信
+## 2. ASGホストとの通信
 
 既定はSSHトンネルです。ホストのHTTPポートをLANに公開する必要はありません。
 
-192.168.1.90上で、以下を別のターミナルから実行します。`ASG_SSH_USER`は192.168.1.80で使用する実際のSSHユーザー名に置き換えます。192.168.1.80のSSH設定でTCP転送が許可されている必要があります。
+隔離ホスト上で、以下を別のターミナルから実行します。`ASG_SSH_USER`はASGホストで使用する実際のSSHユーザー名に置き換えます。ASGホストのSSH設定でTCP転送が許可されている必要があります。
 
 ```powershell
-ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:18788:127.0.0.1:8788 -R 127.0.0.1:18790:127.0.0.1:8790 ASG_SSH_USER@192.168.1.80
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:18788:127.0.0.1:8788 -R 127.0.0.1:18790:127.0.0.1:8790 ASG_SSH_USER@<ASGホストのアドレス>
 ```
 
 | 接続 | 用途 |
 |---|---|
-| 192.168.1.90側 `127.0.0.1:18788` → 192.168.1.80側 `127.0.0.1:8788` | ランナーからASGへartifactを送る |
-| 192.168.1.80側 `127.0.0.1:18790` → 192.168.1.90側 `127.0.0.1:8790` | ASGからランナーへ依頼を送る |
+| 隔離ホスト側 `127.0.0.1:18788` → ASGホスト側 `127.0.0.1:8788` | ランナーからASGへartifactを送る |
+| ASGホスト側 `127.0.0.1:18790` → 隔離ホスト側 `127.0.0.1:8790` | ASGからランナーへ依頼を送る |
 
 今回のASG実ポートは8788です。実環境では専用鍵と固定済みホスト鍵を使い、シェル実行を禁止、転送先を`127.0.0.1:8788`、逆転送の待受を`127.0.0.1:18790`へ制限しています。専用鍵の登録はユーザーの明示承認を得て実施しました。
 
@@ -105,15 +105,15 @@ ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCount
 
 必要な認証情報は次の3種類です。実値はこの配布物に含みません。
 
-| 用途 | 192.168.1.80 | 192.168.1.90 |
+| 用途 | ASGホスト | 隔離ホスト |
 |---|---|---|
 | ASGからランナーへの認証 | 環境変数 `ASG_SEARCH_BACKEND_KEY` | 同じ値を `SEARCH_BACKEND_TOKEN` |
 | ASG署名の検証 | `backend_hmac_key_env`が参照する既存鍵 | 同じ値を `ASG_BACKEND_HMAC_KEY` |
-| ランナーからASGへの送信 | `agents.docker90_search.token_sha256`にSHA-256 | 元トークンを `ASG_WORKER_TOKEN` |
+| ランナーからASGへの送信 | `agents.lab_worker.token_sha256`にSHA-256 | 元トークンを `ASG_WORKER_TOKEN` |
 
 キーはそれぞれ32文字以上の空白を含まないASCII文字列を使用します。共有する組を除き別々の秘密値にしてください。子コンテナへ渡さないでください。親用トークンを子用へ流用しないでください。
 
-これらをOS側の環境変数へ安全に設定したうえで、192.168.1.90上で起動します。このひな形は`.env`を自動読込しません。
+これらをOS側の環境変数へ安全に設定したうえで、隔離ホスト上で起動します。このひな形は`.env`を自動読込しません。
 
 ```powershell
 $env:ASG_BASE_URL = 'http://127.0.0.1:18788'
@@ -131,7 +131,7 @@ python runner.py serve
 
 ```text
 Authorization: Bearer <親のASGトークン>
-X-ASG-Route: docker90.web_research.task
+X-ASG-Route: lab.web_research.task
 X-Agent-Capability: delegate_web_research
 Content-Type: application/json
 ```
@@ -182,7 +182,7 @@ ASGホストへ`contract.py`、`model_broker.py`、`inspector_relay.py`を同じ
 5. 自律検索を追加する場合も、子は限定された検索要求を出すだけにし、信頼側が回数・取得先・入力長を検証する。
 6. 自由文の結果はASGに隔離し、親への受領情報のフィールドを増やさない。
 
-GPU・モデル重みは`192.168.1.70`側のサービスが担当します。子コンテナへのGPU権限や重みのマウントは不要です。
+GPU・モデル重みは`モデルホスト`側のサービスが担当します。子コンテナへのGPU権限や重みのマウントは不要です。
 
 ## 7. 運用上の境界
 
@@ -197,7 +197,7 @@ docker ps -a --filter label=local.disposable-search=true
 docker rm -f <確認したdisposable-search-から始まるコンテナ名>
 ```
 
-ASGの隔離ストアと監査ログは保持されます。使い捨てなのは子の実行環境です。保持期間・GCは192.168.1.80側で設定してください。親の作業フォルダーに資料をダウンロードし、自動読込やインデックス登録する運用は避けてください。
+ASGの隔離ストアと監査ログは保持されます。使い捨てなのは子の実行環境です。保持期間・GCはASGホスト側で設定してください。親の作業フォルダーに資料をダウンロードし、自動読込やインデックス登録する運用は避けてください。
 
 コンテナのベースイメージは保守しやすいタグ指定です。本番の再現性が必要な場合、確認した`python:3.12-slim-bookworm`のdigestへ固定し、更新時に実コンテナ検査を再実行してください。
 
@@ -209,7 +209,7 @@ python tests/check_asg_compatibility.py <agent-security-gatewayのローカルcl
 python tests/smoke_docker.py
 ```
 
-互換テストはASGを一時ディレクトリとループバックで起動します。192.168.1.80、実際のAPIキー、外部検索APIは使いません。ASGの実コードによる署名・経路・隔離保管・出力ガードを検査し、Web取得とDocker実行だけを代替します。
+互換テストはASGを一時ディレクトリとループバックで起動します。ASGホスト、実際のAPIキー、外部検索APIは使いません。ASGの実コードによる署名・経路・隔離保管・出力ガードを検査し、Web取得とDocker実行だけを代替します。
 
 ## 参照
 
