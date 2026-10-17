@@ -892,6 +892,12 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bind uses a wildcard address"):
             gateway.validate_config(cfg)
 
+    def test_validate_config_rejects_ipv6_wildcard_bind_without_allow_public_bind(self):
+        cfg = self.make_minimal_config()
+        cfg["bind"] = "::"
+        with self.assertRaisesRegex(ValueError, "bind uses a wildcard address"):
+            gateway.validate_config(cfg)
+
     def test_validate_config_allows_loopback_bind(self):
         cfg = self.make_minimal_config()
         cfg["bind"] = "127.0.0.1"
