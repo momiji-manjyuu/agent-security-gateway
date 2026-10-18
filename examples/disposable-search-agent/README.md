@@ -2,7 +2,7 @@
 
 **隔離ホストで子コンテナを作り、ASGホストのAgent Security Gateway（ASG）を通して依頼と結果を受け渡すひな形です。**
 
-ASGの検査に`deepseek-v4-flash`、子の推論に`qwen3.8-flash-next`を使う構成例です。モデルの接続先は、ホスト側の環境変数`MODEL_BROKER_HOST`と`MODEL_BROKER_PORT`で固定します（呼び出し側や子コンテナからは変更できません。未設定なら推論は失敗します）。記載したWindows配置先は参考値です。依頼受付、公開Web取得、コンテナ実行、ASGへの隔離保管まで実装しています。
+ASGの検査に`<INSPECTOR_MODEL>`、子の推論に`<WORKER_MODEL>`を使う構成例です（モデル名は導入環境に合わせて運用者が選びます）。モデルの接続先は、信頼ホスト側の環境変数`MODEL_BROKER_HOST` / `MODEL_BROKER_PORT`で、モデル名は同じく信頼ホスト側の `MODEL_BROKER_INSPECTOR_MODEL` / `MODEL_BROKER_WORKER_MODEL` で選びます（呼び出し側や子コンテナからは変更できません。未設定・不正なら推論は失敗側に倒れます）。ASG（hub）側 `llm_inspector.model` とリレー側で許可する inspector モデル名は一致させてください。一致しないと検査が error になり、`fail_closed=true` の場合は委任が入力ガードで止まります。記載したWindows配置先は参考値です。依頼受付、公開Web取得、コンテナ実行、ASGへの隔離保管まで実装しています。
 
 ## 構成
 
@@ -15,8 +15,8 @@ flowchart LR
     R -->|標準入力 / 親の履歴なし| C[使い捨てLinuxコンテナ]
     C -->|未信頼のJSON| R
     C <-->|標準入出力 / 1回の推論要求| B[ホストの固定モデル仲介]
-    B --> M[Qwen / モデルホスト]
-    G --> D[ループバック仲介 → DeepSeek]
+    B --> M[<WORKER_MODEL> / モデルホスト]
+    G --> D[ループバック仲介 → <INSPECTOR_MODEL>]
     R -->|POST /v1/artifacts| Q[ASG隔離保管]
     R -->|資料IDと状態のみ| G
     G -->|本文なし| P
@@ -48,9 +48,9 @@ ASGとの通信はランナーが担当します。子にはASGトークン、�
 - `runner.py` / `runtime.py`：署名済み依頼の受付、使い捨て実行、期限・出力上限。
 - `gateway_link.py`：ASGのHMAC検証とartifact送信。ASG応答の自由文を除外。
 - `fetcher.py`：公開ページ取得。必要に応じてBrave Search APIでURL候補を取得。
-- `worker.py`：HTML抽出とQwen推論要求、結果の形式検証。参照アダプターも付属。
+- `worker.py`：HTML抽出とモデル推論要求、結果の形式検証。参照アダプターも付属。
 - `model_broker.py`：ホスト専用。送信先・モデル・会話形式を固定した推論仲介。
-- `inspector_relay.py`：ASGホスト専用。DeepSeekへの固定接続をループバックで提供。
+- `inspector_relay.py`：ASGホスト専用。`<INSPECTOR_MODEL>` への固定接続をループバックで提供。
 - `contract.py`：入出力の許可フィールド・型・長さの検証。
 - `asg/`：ASGホスト担当者向け設定差分と依頼例。
 - `PARENT_POLICY.md`：親の連携ルール。
@@ -76,7 +76,7 @@ python runner.py demo
 python tests/smoke_docker.py
 ```
 
-環境変数`WORKER_ADAPTER`未指定の`demo`はネットワークもASGも使いません。`WORKER_ADAPTER=qwen`を設定するとホスト経由で指定モデルへ接続します。意図的に命令文を含めた架空の資料を子へ渡し、親への出力に本文が入らないことを確認します。
+環境変数`WORKER_ADAPTER`未指定の`demo`はネットワークもASGも使いません。`WORKER_ADAPTER=qwen`（アダプター選択子の名前であり、モデル名ではありません）を設定するとホスト経由で `<WORKER_MODEL>` へ接続します。意図的に命令文を含めた架空の資料を子へ渡し、親への出力に本文が入らないことを確認します。
 
 `docker compose up`で子を常駐させる必要はありません。本番ランナーは依頼ごとに`docker run --rm`で同じ制限を設定します。イメージは信頼側だけでビルドし、親の設定・秘密ファイルはビルドコンテキストに含めません。`.dockerignore`は許可した3ファイルだけを含めます。
 
@@ -165,11 +165,11 @@ Content-Type: application/json
 
 ## 6. 接続済みのLLM
 
-本番ランナーは`WORKER_ADAPTER=qwen`で起動します。子が抽出した1ページ最大4,000文字を、標準入出力経由でホストの`model_broker.py`に渡します。ホストは質問・資料ID・入力形式・長さを検証し、固定したQwenモデルへ1回だけ推論を依頼します。結果を子とホストの両方で検証し、自由文はASGへ保存します。
+本番ランナーは`WORKER_ADAPTER=qwen`（アダプター選択子）で起動します。子が抽出した1ページ最大4,000文字を、標準入出力経由でホストの`model_broker.py`に渡します。ホストは質問・資料ID・入力形式・長さを検証し、固定した `<WORKER_MODEL>` へ1回だけ推論を依頼します。結果を子とホストの両方で検証し、自由文はASGへ保存します。
 
 子にはネットワークを追加していません。送信先URL、モデル、ツール、シェルコマンドを子が選ぶことはできません。各依頼は固定systemメッセージとその依頼の資料だけを送り、過去の会話を送信しません。モデルサーバー自身の記録・保持設定は、このランナーの制御範囲外です。
 
-ASGは`127.0.0.1:14000/v1`のホスト内仲介を通して、同じモデルサーバーのDeepSeekを呼び出します。この例のモデルサーバーは認証なしのLANサービスです。検査は`fail_closed=true`で、モデル障害時は転送を拒否します。既存の決定的な検査を先に実行し、LLMに既存の拒否を解除させません。
+ASGは`127.0.0.1:14000/v1`のホスト内仲介を通して、モデルサーバーの `<INSPECTOR_MODEL>` を呼び出します。モデルサーバーの認証要否は導入環境によります（認証情報が必要な場合は信頼ホスト側で扱い、子には渡しません）。検査は`fail_closed=true`で、モデル障害時は転送を拒否します。既存の決定的な検査を先に実行し、LLMに既存の拒否を解除させません。
 
 ASGホストへ`contract.py`、`model_broker.py`、`inspector_relay.py`を同じディレクトリに配置し、そこで`python inspector_relay.py`を起動します。`asg/inspector.fragment.json`の`llm_inspector`をASG設定へマージし、検査仲介の起動を確認してからASGを再起動してください。モデルサーバーへの認証が必要な場合はホスト側仲介で実装し、子にキーを渡さないでください。
 

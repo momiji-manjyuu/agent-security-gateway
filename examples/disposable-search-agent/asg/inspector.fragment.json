@@ -2,7 +2,7 @@
   "llm_inspector": {
     "enabled": true,
     "base_url": "http://127.0.0.1:14000/v1",
-    "model": "deepseek-v4-flash",
+    "model": "REPLACE_WITH_INSPECTOR_MODEL",
     "api_key_env": "",
     "require_api_key": false,
     "max_chars": 3000,

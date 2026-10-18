@@ -5,17 +5,20 @@ import os
 
 from contract import exact_keys, limited_text, load_json, require
 
-# The fixed model endpoint is chosen by the OPERATOR on the trusted host (environment), never by a caller or the worker.
-# Unset or malformed means inference fails closed.
-MODEL_HOST = os.environ.get('MODEL_BROKER_HOST', '')
+# The fixed model endpoint and model names are chosen by the OPERATOR on the
+# trusted host (environment), never by a caller or the worker.  Unset, blank or
+# malformed means inference fails closed.  The hub-side inspector model name
+# must match INSPECTOR_MODEL here, or the relay rejects the inspection request.
+MODEL_HOST = os.environ.get('MODEL_BROKER_HOST', '').strip()
 MODEL_PORT = int(os.environ['MODEL_BROKER_PORT']) if os.environ.get('MODEL_BROKER_PORT', '').isdigit() else 0
-WORKER_MODEL = 'qwen3.8-flash-next'
-INSPECTOR_MODEL = 'deepseek-v4-flash'
+WORKER_MODEL = os.environ.get('MODEL_BROKER_WORKER_MODEL', '').strip()
+INSPECTOR_MODEL = os.environ.get('MODEL_BROKER_INSPECTOR_MODEL', '').strip()
 MAX_MODEL_BYTES = 131072
 MAX_REQUEST_BYTES = 131072
 
 
 def complete(model, messages, max_tokens=2048, timeout=60):
+    require(bool(WORKER_MODEL) and bool(INSPECTOR_MODEL))
     require(model in (WORKER_MODEL, INSPECTOR_MODEL))
     require(MODEL_HOST and 0 < MODEL_PORT < 65536)  # fail closed when the operator has not set the endpoint
     body = {'model': model, 'messages': messages, 'temperature': 0,

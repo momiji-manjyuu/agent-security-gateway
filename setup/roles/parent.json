@@ -15,6 +15,9 @@
   "steps": [
     {"step": "Install Python 3.10+", "needs": ["python"]},
     {"step": "Open the SSH tunnel to the hub (loopback only)", "needs": ["tunnel_listen"]},
-    {"step": "Register asg-mcp and the asg-parent skill with the parent agent harness (presets/parent/mcp/README.md)", "manual": true}
+    {"step": "Register asg-mcp and the asg-parent skill with the parent agent harness (presets/parent/mcp/README.md)", "manual": true},
+    {"step": "Back up the asg-mcp config on the parent host before switching to generic names (lab.web_research.task / lab.artifacts.submit / lab_worker)", "manual": true},
+    {"step": "After the switch, validate JSON (python -m json.tool), confirm MCP initialize and tools/list, and confirm asg_inspect answers", "manual": true},
+    {"step": "To roll back, restore the backed-up asg-mcp config, restart the MCP server, and confirm hub healthz through the tunnel", "manual": true}
   ]
 }

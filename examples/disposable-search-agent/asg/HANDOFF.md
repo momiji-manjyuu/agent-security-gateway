@@ -46,3 +46,18 @@ run登録経路がまだなければ、ASGリポジトリの登録経路例を�
 実際の秘密を環境変数へ設定後、ASGの既存手順で`validate-config`を実行します。署名必須の経路は鍵が未設定なら失敗します。隔離ホストのDockerとPythonが準備できたら、まず`task.example.json`のURL指定テストを実施してください。
 
 参照実装の基点：[agent-security-gateway / e9a251d](https://github.com/momiji-manjyuu/agent-security-gateway/tree/e9a251de9b8ac26112376e78f542d8110f14b7db)。同梱の境界修正を適用したASGで使用します。このひな形は実設定を自動変更しません。
+
+## 導入時の一般化した注意（詳細は setup/PLAYBOOK.md）
+
+- `lab_worker` には他の agent と同一ではない専用トークンを持たせる。同一トークンの
+  ハッシュを複数 agent が共有すると、hub 側で意図しない agent として解決され、
+  route の許可や run の範囲チェックで拒否されることがある。秘密は各ホスト上で生成し、
+  hub へはハッシュだけを登録する（実値・実ハッシュはここにも書かない）。
+- 隔離ホストの runner では `ASG_ALLOWED_CALLERS` に実際の委任元 agent を含める。
+  委任元と許可リストがずれると、正しく署名された依頼でも署名検証で拒否される。
+- hub 側 `llm_inspector.model`（このフォルダの `inspector.fragment.json` では
+  `REPLACE_WITH_INSPECTOR_MODEL` プレースホルダ）は、リレー側で許可する inspector
+  モデル名と一致させる。一致しないと検査が error になり、`fail_closed=true` の
+  場合は委任が入力ガードで止まる。
+- 設定・配置ファイルを変更する前に各ホストでバックアップを取り、切り戻すときは
+  バックアップから復元して再起動し、`healthz` で確認する。

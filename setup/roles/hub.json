@@ -19,6 +19,9 @@
   "steps": [
     {"step": "Run ASG bound to 127.0.0.1", "needs": ["asg_port_bind"]},
     {"step": "Create dedicated SSH keys for tunnels (restricted forwards, no shell)", "manual": true},
-    {"step": "Validate config: python gateway.py --config <config> validate-config", "manual": true}
+    {"step": "Validate config: python gateway.py --config <config> validate-config", "manual": true},
+    {"step": "Keep the inspector model name in the hub llm_inspector config identical to the relay operator-selected <INSPECTOR_MODEL>; a mismatch makes inspection error and, with fail_closed, stops delegation at the input guard", "manual": true},
+    {"step": "Register a dedicated token hash per agent (lab_worker must not share a token hash with any other agent); generate secrets on each host and register only token_sha256", "manual": true},
+    {"step": "Back up hub config on the hub host before changes; to roll back, restore the backup, restart, and confirm /healthz and /readyz", "manual": true}
   ]
 }
