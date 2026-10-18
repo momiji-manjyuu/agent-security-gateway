@@ -22,6 +22,9 @@
     {"step": "Build the worker image", "needs": ["worker_image"]},
     {"step": "Run the runner (loopback only) as a scheduled task", "needs": ["runner_port_bind", "runner_task"]},
     {"step": "Keep the tunnel to the hub up", "needs": ["asg_tunnel_bind"]},
-    {"step": "On the hub: reverse-tunnel port 18790 must listen on loopback (role hub, check runner_reverse_tunnel)", "manual": true}
+    {"step": "On the hub: reverse-tunnel port 18790 must listen on loopback (role hub, check runner_reverse_tunnel)", "manual": true},
+    {"step": "Back up deployed runner files on the isolated host before updating; to roll back, restore the backup, restart, and confirm healthz", "manual": true},
+    {"step": "Set ASG_ALLOWED_CALLERS to include the actual delegating agent id; a mismatch is rejected at signature verification even for correctly signed requests", "manual": true},
+    {"step": "Set MODEL_BROKER_HOST/MODEL_BROKER_PORT and MODEL_BROKER_WORKER_MODEL/MODEL_BROKER_INSPECTOR_MODEL on the trusted host only; unset or invalid values must fail closed", "manual": true}
   ]
 }

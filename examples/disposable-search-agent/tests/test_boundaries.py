@@ -31,14 +31,19 @@ def packet():
     return value
 
 
-def headers(raw, timestamp=None):
+# Generic delegating-agent name for tests only; deployments must put the
+# actual delegating agent id in ASG_ALLOWED_CALLERS (see setup/PLAYBOOK.md).
+DELEGATING_AGENT = "delegating-agent"
+
+
+def headers(raw, timestamp=None, agent=DELEGATING_AGENT):
     data = contract.load_json(raw)
     stamp = timestamp or dt.datetime.now(dt.timezone.utc).isoformat()
     sha = hashlib.sha256(raw).hexdigest()
-    canonical = "\n".join(["POST", "/v1/tasks", sha, "controller", link.TASK_ROUTE,
+    canonical = "\n".join(["POST", "/v1/tasks", sha, agent, link.TASK_ROUTE,
                             data["run_id"], data["task_id"], stamp])
     return {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json",
-            "X-ASG-Agent-Id": "controller", "X-ASG-Route-Id": link.TASK_ROUTE,
+            "X-ASG-Agent-Id": agent, "X-ASG-Route-Id": link.TASK_ROUTE,
             "X-ASG-Run-Id": data["run_id"], "X-ASG-Task-Id": data["task_id"],
             "X-ASG-Timestamp": stamp, "X-ASG-Request-SHA256": sha,
             "X-ASG-Signature": "sha256=" + hmac.new(HMAC_KEY.encode(), canonical.encode(), hashlib.sha256).hexdigest()}
@@ -120,20 +125,25 @@ class Boundaries(unittest.TestCase):
     def test_valid_and_tampered_hmac(self):
         raw = contract.encode(packet())
         signed = headers(raw)
-        self.assertEqual(link.verify_backend(signed, raw, TOKEN, HMAC_KEY, ["controller"]),
+        self.assertEqual(link.verify_backend(signed, raw, TOKEN, HMAC_KEY, [DELEGATING_AGENT]),
                          ("run-test", "research-001"))
+        # A caller absent from the runner allow-list is rejected even with a
+        # valid signature for that (other) agent id.
+        with self.assertRaises(contract.BoundaryError):
+            link.verify_backend(headers(raw, agent="other-agent"), raw, TOKEN, HMAC_KEY,
+                                [DELEGATING_AGENT])
         for name in ["Authorization", "X-ASG-Agent-Id", "X-ASG-Route-Id", "X-ASG-Task-Id", "X-ASG-Signature"]:
             bad = {**signed, name: "tampered"}
             with self.subTest(name=name), self.assertRaises((ValueError, contract.BoundaryError)):
-                link.verify_backend(bad, raw, TOKEN, HMAC_KEY, ["controller"])
+                link.verify_backend(bad, raw, TOKEN, HMAC_KEY, [DELEGATING_AGENT])
         with self.assertRaises(contract.BoundaryError):
-            link.verify_backend(signed, raw + b" ", TOKEN, HMAC_KEY, ["controller"])
+            link.verify_backend(signed, raw + b" ", TOKEN, HMAC_KEY, [DELEGATING_AGENT])
 
     def test_expired_signature_is_rejected(self):
         raw = contract.encode(packet())
         with self.assertRaises(contract.BoundaryError):
             link.verify_backend(headers(raw, "2020-01-01T00:00:00+00:00"), raw,
-                                TOKEN, HMAC_KEY, ["controller"])
+                                TOKEN, HMAC_KEY, [DELEGATING_AGENT])
 
     def test_artifact_manifest_is_not_forwarded(self):
         reply = {"artifact_ref": {"artifact_id": "art_" + "a" * 32,
@@ -156,7 +166,7 @@ class BackendHTTP(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             server = runner.RunnerServer(("127.0.0.1", 0), runner.Handler)
             server.backend_token, server.hmac_key = TOKEN, HMAC_KEY
-            server.allowed_callers = ["controller"]
+            server.allowed_callers = [DELEGATING_AGENT]
             server.db_path = Path(temp) / "jobs.db"
             with runner.database(server.db_path) as db:
                 db.execute("CREATE TABLE jobs (job_key TEXT PRIMARY KEY, body_hash TEXT NOT NULL, response BLOB)")
@@ -174,7 +184,11 @@ class BackendHTTP(unittest.TestCase):
                     conn.close()
             try:
                 with patch("runner.perform", return_value={"version": 1, "status": "stored"}) as action:
+                    # Unsigned and bad-auth requests are refused before any work.
+                    self.assertEqual(post(raw, {"Content-Type": "application/json"})[0], 403)
                     self.assertEqual(post(raw, {**headers(raw), "Authorization": "bad"})[0], 403)
+                    # A correctly signed caller not in ASG_ALLOWED_CALLERS is refused.
+                    self.assertEqual(post(raw, headers(raw, agent="other-agent"))[0], 403)
                     self.assertEqual(action.call_count, 0)
                     self.assertEqual(post(raw, headers(raw))[0], 200)
                     self.assertEqual(post(raw, headers(raw))[0], 200)
