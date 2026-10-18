@@ -924,11 +924,29 @@ def response_format_schema_lint_errors(value: Any, prefix: str) -> list[str]:
     return errors
 
 
+LOOPBACK_BIND_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def is_loopback_bind(bind: Any) -> bool:
+    """True only for a literal loopback bind (never a wildcard or LAN address)."""
+    if not isinstance(bind, str):
+        return False
+    host = bind.strip().lower()
+    if host in LOOPBACK_BIND_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def validate_config(cfg: dict[str, Any]) -> None:
     errors: list[str] = []
     bind = str(cfg.get("bind", ""))
-    if bind in {"0.0.0.0", "::"} and not bool(cfg.get("allow_public_bind", False)):
-        errors.append("bind uses a wildcard address; set allow_public_bind=true only if a TLS/VPN boundary is in front")
+    if not bind:
+        errors.append("bind must be a non-empty string")
+    elif not is_loopback_bind(bind):
+        errors.append("bind must be a loopback address (127.0.0.1); non-loopback binds are refused")
 
     raw_target = cfg.get("target", {})
     target = raw_target if isinstance(raw_target, dict) else {}

@@ -820,6 +820,7 @@ WantedBy=timers.target
 
 ```bash
 python3 scripts/init_runtime_config.py --bind 127.0.0.1 --port 8788
+# The hub binds loopback only: a non-loopback `bind` (including 0.0.0.0) is refused at startup. Reach it from other hosts through an SSH tunnel.
 export ASG_CONFIG="$HOME/.agent-security-gateway/config.json"
 export ASG_AGENT_TOKEN="$(cat ~/.agent-security-gateway/tokens/mac_gpt55.token)"
 scripts/start.sh

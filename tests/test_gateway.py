@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 import sys
 
@@ -889,25 +890,53 @@ class GatewayTests(unittest.TestCase):
     def test_validate_config_rejects_wildcard_bind_without_allow_public_bind(self):
         cfg = self.make_minimal_config()
         cfg["bind"] = "0.0.0.0"
-        with self.assertRaisesRegex(ValueError, "bind uses a wildcard address"):
+        with self.assertRaisesRegex(ValueError, "loopback"):
             gateway.validate_config(cfg)
 
     def test_validate_config_rejects_ipv6_wildcard_bind_without_allow_public_bind(self):
         cfg = self.make_minimal_config()
         cfg["bind"] = "::"
-        with self.assertRaisesRegex(ValueError, "bind uses a wildcard address"):
+        with self.assertRaisesRegex(ValueError, "loopback"):
             gateway.validate_config(cfg)
 
     def test_validate_config_allows_loopback_bind(self):
-        cfg = self.make_minimal_config()
-        cfg["bind"] = "127.0.0.1"
-        gateway.validate_config(cfg)  # must not raise a bind error
+        for bind in ("127.0.0.1", "::1", "localhost"):
+            cfg = self.make_minimal_config()
+            cfg["bind"] = bind
+            with self.subTest(bind=bind):
+                gateway.validate_config(cfg)  # must not raise a bind error
 
-    def test_validate_config_allows_wildcard_bind_with_allow_public_bind(self):
-        cfg = self.make_minimal_config()
-        cfg["bind"] = "0.0.0.0"
-        cfg["allow_public_bind"] = True
-        gateway.validate_config(cfg)  # must not raise a bind error
+    def test_default_bind_is_loopback(self):
+        self.assertEqual(gateway.DEFAULT_CONFIG["bind"], "127.0.0.1")
+        self.assertTrue(gateway.is_loopback_bind(gateway.DEFAULT_CONFIG["bind"]))
+
+    def test_validate_config_rejects_non_loopback_bind_even_with_allow_public_bind(self):
+        # Hub policy is loopback-only: allow_public_bind is not an override,
+        # and a plain LAN address is refused just like a wildcard.
+        for bind in ("0.0.0.0", "::", "192.0.2.10", "203.0.113.10", "example.com", ""):
+            cfg = self.make_minimal_config()
+            cfg["bind"] = bind
+            cfg["allow_public_bind"] = True
+            with self.subTest(bind=bind), self.assertRaisesRegex(ValueError, "bind"):
+                gateway.validate_config(cfg)
+
+    def test_serve_refuses_non_loopback_before_listening(self):
+        # serve() must fail via load_config/validate_config before any socket is bound.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_minimal_config()
+            cfg["bind"] = "0.0.0.0"
+            cfg["allow_public_bind"] = True
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps(cfg), encoding="utf-8")
+            with patch.object(gateway, "ThreadingHTTPServer") as server:
+                with self.assertRaisesRegex(ValueError, "loopback"):
+                    gateway.serve(config_path)
+            server.assert_not_called()
+
+    def test_proxy_validate_config_rejects_non_loopback_bind(self):
+        cfg = {"bind": "0.0.0.0", "allow_public_bind": True, "target": {"mode": "http"}}
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            security.validate_config(cfg)
 
     def test_init_runtime_config_generates_require_known_run_id_true(self):
         with tempfile.TemporaryDirectory() as tmp:
