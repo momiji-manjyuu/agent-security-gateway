@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Hub (`gateway.py`, and the legacy `proxy.py` serve path) is now loopback-only: `bind` must be `127.0.0.1`/`::1`/`localhost` (default `127.0.0.1`), any non-loopback or wildcard bind is refused at config validation before listening, and `allow_public_bind` no longer overrides this. Reach the hub from other hosts through SSH tunnels.
+
 - Hardened complete-payload inspection, receipt-only forwarding, output metadata scanning, artifact operation/run authorization, media types, request deadlines, and rate limits. Removed the defensive-secret-instruction bypass; see `MIGRATION.md`.
 - Added 30 security-boundary regression tests and a disposable Docker research-worker example with fixed Qwen/DeepSeek model brokers, signed ASG integration, and CI coverage.
 

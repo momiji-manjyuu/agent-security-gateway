@@ -483,13 +483,32 @@ def parse_int(value: Any, *, default: int) -> tuple[int, bool]:
         return default, False
 
 
+LOOPBACK_BIND_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def is_loopback_bind(bind: Any) -> bool:
+    """True only for a literal loopback bind (never a wildcard or LAN address)."""
+    if not isinstance(bind, str):
+        return False
+    host = bind.strip().lower()
+    if host in LOOPBACK_BIND_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def validate_config(cfg: dict[str, Any]) -> None:
     errors: list[str] = []
     bind = str(cfg.get("bind", ""))
     if not bind:
         errors.append("bind must be a non-empty string")
-    if bind in {"0.0.0.0", "::"} and not bool(cfg.get("allow_public_bind", False)):
-        errors.append("bind uses a wildcard address; set allow_public_bind=true only behind a TLS/VPN boundary")
+    elif not is_loopback_bind(bind):
+        # Hub is loopback-only (docs/design/setup-and-connectivity.md): other
+        # hosts reach it through SSH tunnels. allow_public_bind no longer
+        # overrides this; fail closed before serve() ever listens.
+        errors.append("bind must be a loopback address (127.0.0.1); non-loopback binds are refused")
     port, port_ok = parse_int(cfg.get("port"), default=8788)
     if not port_ok or not 1 <= port <= 65_535:
         errors.append("port must be between 1 and 65535")

@@ -13,7 +13,9 @@
   "properties": {
     "bind": {
       "type": "string",
-      "default": "127.0.0.1"
+      "enum": ["127.0.0.1", "::1", "localhost"],
+      "default": "127.0.0.1",
+      "description": "Hub listen address. Loopback only; non-loopback binds are refused at startup."
     },
     "port": {
       "type": "integer",
