@@ -13,7 +13,7 @@ TAP=${TAP_DEV:-asgtap-t}; MAC=${GUEST_MAC:-06:00:0a:5a:00:02}
 VCPU=${VCPU_COUNT:-2}; MEM=${MEM_MIB:-6144}; VPORT=$((5900+${VNC_DISPLAY:-1})); TMO=${BOOT_TIMEOUT_S:-180}
 ID=test-$(date +%s); RUN=/run/asg/$ID; LOGD=${ASG_LOG_COPY_DIR:-$ASG_ROOT/logs}; install -d "$LOGD"
 SER=$LOGD/serial-$ID.log; FCLOG=$RUN/fc.log
-( cd "$G" && sha256sum -c MANIFEST.sha256 )
+"$(dirname "$(readlink -f "$0")")/verify-manifest.sh" "$G"   # ハッシュ + 署名 (ASG_REQUIRE_SIGNED=1 で未署名拒否)
 setpriv --reuid "$ORCH" --regid "$GRP" --init-groups test -r /dev/kvm -a -w /dev/kvm || { echo "$ORCH cannot open /dev/kvm"; exit 1; }
 install -d -o "$ORCH" -g "$GRP" "$RUN"
 ip link set "$BR" up

@@ -20,6 +20,7 @@ xz -cd "linux-$V.tar.xz" | gpg --batch --status-fd 1 --verify "linux-$V.tar.sign
 rm -rf "$K/build/linux-$V"; mkdir -p "$K/build" "$OUT"; tar xJf "linux-$V.tar.xz" -C "$K/build"
 cd "$K/build/linux-$V"; cp "$SRC/$CFG" .config
 export KBUILD_BUILD_USER=asg KBUILD_BUILD_HOST=asg-build SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1792540800}
-export KBUILD_BUILD_TIMESTAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%d %H:%M:%S UTC')"
+KBUILD_BUILD_TIMESTAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%d %H:%M:%S UTC')"
+export KBUILD_BUILD_TIMESTAMP
 make olddefconfig; make -j"$(nproc)" vmlinux
 cp vmlinux .config "$OUT/"; cd "$OUT"; sha256sum vmlinux .config | tee SHA256SUMS; echo KERNEL_BUILD_DONE

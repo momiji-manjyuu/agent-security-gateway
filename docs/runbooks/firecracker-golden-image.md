@@ -27,27 +27,40 @@
 
 ## 前提 (ホスト側, root)
 
-1. パッケージ: `debootstrap squashfs-tools acl jq nftables` とカーネルビルド依存 (`build-essential flex bison bc libelf-dev libssl-dev`)。
-2. ユーザー/グループ: `asg` グループ、`asg-orch` (system, nologin, `kvm` 所属)。ログインユーザーは kvm に入れない。
-3. ディレクトリ: `/srv/asg/{bin,golden,kernel,logs}`、`/run/asg` は tmpfs (`mode=0750,uid=asg-orch,gid=asg`)。
-4. Firecracker: 公式リリースを `sha256sum -c SHA256SUMS` で検証後 `/srv/asg/bin/` に配置し、`PINNED.sha256` を記録。
-5. ブリッジ (systemd-networkd):
-   ```ini
-   # /etc/systemd/network/50-asgbr0.netdev
-   [NetDev]
-   Name=asgbr0
-   Kind=bridge
-   # /etc/systemd/network/50-asgbr0.network
-   [Match]
-   Name=asgbr0
-   [Network]
-   Address=10.90.0.1/24
-   ConfigureWithoutCarrier=yes
-   LinkLocalAddressing=no
-   IPv6AcceptRA=no
-   ```
-   NAT/転送とファイアウォール (LAN へのルーティング禁止、VNC はホストからのみ) は nftables で別途設定。
-6. `/dev/kvm` 権限: `sudo ./host-kvm-perms.sh` (下記トラブルシュート参照)。
+ホスト準備は 3 本のスクリプトで行います (いずれも冪等。実行前に内容と `golden.env` を必ずレビュー)。
+
+```bash
+sudo ./host-setup.sh       # パッケージ, asg グループ/asg-orch (kvm), /srv/asg ツリー, /run/asg tmpfs, ブリッジ, IPv6 無効化, DNS 固定, cups/avahi 停止, sysctl, (任意) sshd
+sudo ./host-kvm-perms.sh   # /dev/kvm を kvm:0660・ACL なしに固定
+sudo ./host-network.sh     # nftables `inet asg` + asg-nft.service
+```
+
+Firecracker は公式リリースを `sha256sum -c SHA256SUMS` で検証後 `/srv/asg/bin/` に配置し、`PINNED.sha256` を記録してください。
+
+### host-setup.sh の注意
+
+- `HOST_DNS` を設定すること。リゾルバがルーター広告 (IPv6) 由来のみの環境では、IPv6 無効化で名前解決が壊れます。
+- sshd は **`SSHD_ALLOW_USERS` を明示した場合のみ** 変更します (既定値なし = 変更しない)。`sshd -t` に失敗したら元に戻します。適用後、既存セッションを閉じる前に新しい接続でログインできることを確認してください。
+- ログインユーザーは kvm グループに入れません。VM は `asg-orch` だけが起動します。
+
+### ネットワーク隔離 (host-network.sh)
+
+Ubuntu 標準の `nftables.service` とは独立した `asg-nft.service` が `/etc/nftables.d/asg.nft` (生成物) を読み込みます。
+ufw と共存します (優先度 -10 の別テーブル。ここでの drop は最終)。設定値:
+`WAN_IF`, `BRIDGE`, `WORKER_CIDR`, `LAN_CIDR`, `LAN_BCAST`, `LAN_GW`, `ASG_IP`, `ASG_PORT` (既定 8788)。
+例の値は文書用アドレス (192.0.2.0/24) なので **必ず自環境の値に置き換えてください**。
+
+| 通信 | 扱い |
+|---|---|
+| ワーカー → インターネット (IPv4) | NAT (masquerade) で許可 |
+| ワーカー → `ASG_IP:ASG_PORT` (tcp) | 許可 (LAN 唯一の例外) |
+| ワーカー → LAN / RFC1918 / 100.64/10 / 169.254/16 / ループバック / マルチキャスト等 | 遮断 |
+| ワーカー IPv6 | 全遮断 |
+| ワーカー → ホスト自身 (新規) | 遮断 (ゲスト DNS は公開リゾルバを使う) |
+| ホスト → LAN (新規) | `ASG_IP` と `LAN_GW` の DNS(53)/DHCP(67) のみ |
+| ホスト IPv6 | `lo` 以外遮断 (sysctl でも無効化) |
+
+ufw が有効な場合 (routed=deny) は `ufw route allow in on $BRIDGE out on $WAN_IF` を追加します (フィルタは `inet asg` 側)。
 
 ## 手順
 
@@ -68,6 +81,21 @@ sudo ./boot-test.sh v1
 sudo HOLD=1 ./boot-test.sh v1      # 600 秒保持して VNC 目視確認 (ssh -L 5901:10.90.0.2:5901 <host>)
 ```
 
+### MANIFEST の署名と検証
+
+秘密鍵は **ワーカーホストに置かず**、管理用の親ホスト (署名ホスト) に保管します。鍵はスクリプトでは生成しません。
+署名ホストで一度だけ手動作成してください (例: `ssh-keygen -t ed25519 -f ~/.ssh/asg-golden-sign` / `minisign -G`)。
+
+1. ワーカーホスト: `sha256sum /srv/asg/golden/vN/MANIFEST.sha256` を控え、MANIFEST を署名ホストへコピー。
+2. 署名ホスト: `SIGN_KEY=<秘密鍵パス> ./sign-manifest.sh MANIFEST.sha256` (ハッシュ一致を確認) → `MANIFEST.sha256.sig`。
+3. ワーカーホスト: 公開鍵を `VERIFY_PUBKEY` に配置。
+   - `SIGN_METHOD=ssh`: allowed_signers 形式 `asg-golden ssh-ed25519 AAAA...` (principal = `SIGN_IDENTITY`)
+   - `SIGN_METHOD=minisign`: minisign 公開鍵ファイル
+4. ワーカーホスト: `sudo ./verify-manifest.sh --install MANIFEST.sha256.sig /srv/asg/golden/vN` (検証に通った場合のみ配置)。
+
+`boot-test.sh` などの利用側は `verify-manifest.sh` を呼び、ハッシュ (`--strict`) と署名を検証します。
+不正な署名は常に拒否、`ASG_REQUIRE_SIGNED=1` では未署名・公開鍵なしも拒否します (運用では 1 を推奨)。
+
 成果物 (`/srv/asg/golden/vN/`): `rootfs.squashfs`, `vmlinux`, `kernel.config`, `packages.txt`, `BUILDINFO`, `MANIFEST.sha256`。
 完成後は `chmod -R a-w` され、`current` が原子的に切り替わります。ロールバックは `current` を旧バージョンに戻すだけです。
 
@@ -77,7 +105,7 @@ sudo HOLD=1 ./boot-test.sh v1      # 600 秒保持して VNC 目視確認 (ssh -
 - ビルド時に machine-id / random-seed / ssh_host_* / apt リスト / ログを削除し、簡易シークレットスキャンを実行 (gitleaks があれば併用)。
 - **harness をイメージに入れる場合 (`HARNESS_DIR`)、gitleaks が通らない限りビルドは中止される。**
 - 完成済みバージョンは上書きしない。新しい `vN` を作る。
-- MANIFEST の署名は今後の TODO (別ホストの鍵で `MANIFEST.sha256.sig` を作成)。
+- MANIFEST は別ホストの鍵で署名し、`ASG_REQUIRE_SIGNED=1` で未署名イメージを起動させない。秘密鍵・公開鍵とも repo にコミットしない。
 
 ## トラブルシュート
 
@@ -92,3 +120,6 @@ sudo HOLD=1 ./boot-test.sh v1      # 600 秒保持して VNC 目視確認 (ssh -
 | ブリッジが DOWN でゲストに届かない | TAP 未接続時に networkd が設定しない | `.network` に `ConfigureWithoutCarrier=yes`、boot-test で `ip link set asgbr0 up` |
 | `removing INCOMPLETE` / `still mounted` | 前回ビルドの残骸 | スクリプトが自動で umount・削除。`still mounted` の場合は手動で `findmnt -R /var/tmp/asg-golden.*` を確認 |
 | Windows から転送したスクリプトが動かない | CRLF 改行 | `sed -i 's/\r$//' *.sh` 後 `bash -n` で確認 |
+| IPv6 無効化後に名前解決できない | リゾルバがルーター広告 (IPv6) 由来のみ | `HOST_DNS` で IPv4 リゾルバを固定 (host-setup.sh) |
+| ワーカーから外に出られない | ufw routed=deny / ip_forward=0 / `WAN_IF` 誤り | `ufw route allow`、`sysctl net.ipv4.ip_forward`、`nft list table inet asg` のカウンタを確認 |
+| `SIGNATURE_INVALID` / `UNSIGNED ... refused` | 署名不一致、公開鍵未配置、principal/namespace 不一致 | `VERIFY_PUBKEY`, `SIGN_IDENTITY`, `SIGN_NAMESPACE` を確認し、正しい MANIFEST に再署名 |
