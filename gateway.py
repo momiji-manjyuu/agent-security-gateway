@@ -4423,8 +4423,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     event["input_guard_would_review"] = bool(inbound.scan.requires_review)
                     write_audit(cfg, {"event": "quarantined_read_pass", "reason": "quarantined_read", **event})
             if inbound.scan.risk_score > 0:
-                outcome = ("test_mode_pass" if test_mode_active else "quarantined_pass" if quarantine_ok else "blocked") if (
-                    inbound.scan.blocked or inbound.scan.requires_review) else "allowed"
+                review_blocks = inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get(
+                    "block_on_review", cfg.get("review_policy", {}).get("block_forward", False)))
+                if inbound.scan.blocked or review_blocks:
+                    outcome = "test_mode_pass" if test_mode_active else "quarantined_pass" if quarantine_ok else "blocked"
+                else:
+                    outcome = "allowed_review" if inbound.scan.requires_review else "allowed"
                 record_run_warning(cfg, decision, "input_guard", outcome, inbound.scan.findings, inbound.scan.risk_score,
                                    inbound.scan.normalized_text)
             if inbound.scan.blocked and not input_guard_log_only:
