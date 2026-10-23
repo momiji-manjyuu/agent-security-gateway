@@ -27,3 +27,9 @@ Rollback (elevated): `Rollback-AsgServiceAccounts.ps1` (re-imports the SYSTEM ta
   - Config/state would be synced from .80 nightly. The HMAC keys and tokens would be copied out-of-band by the operator.
   - The tunnel task would be disabled; to fail over, enable it there.
   - This needs the user's decision: it puts secrets on a second host and needs a machine.
+
+## SSH hardening (Rev20)
+- `Set-AsgSshDenyUsers.ps1` adds `DenyUsers asgsvc asgtun <host>\asgsvc <host>\asgtun` before the first `Match` block. Backup: `sshd_config.bak-r20`.
+- It runs `sshd -t` before restarting. It rolls back unless a fresh admin SSH login creates the marker file within 180 s.
+- Denied accounts get "Connection reset"; unknown users get "Permission denied". The outbound tunnel is unaffected.
+- Rollback: copy `sshd_config.bak-r20` back and run `Restart-Service sshd`.
