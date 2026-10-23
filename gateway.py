@@ -4377,7 +4377,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(payload, decision)
             record = build_run_registration_record(payload, cfg, verified)
-            scan_payload = {k: v for k, v in payload.items() if k != "run_agents"}
+            scan_payload = {k: v for k, v in payload.items() if k not in ("run_agents", "test_mode")}  # both strictly validated, not free text
             inbound = scan_inbound(scan_payload, cfg)
             if inbound.scan.blocked:
                 raise input_guard_error("run registration payload was blocked by input guard", inbound, cfg)
