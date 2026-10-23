@@ -122,5 +122,17 @@
     "enabled": true,
     "timeout_seconds": 50,
     "_note": "endpoint/model default to llm_inspector; may only lower downgradable pattern findings"
+  },
+  "test_modes": {
+    "input_guard_log_only": {
+      "enabled": false,
+      "routes": [
+        "fc.llm.chat"
+      ],
+      "allowed_registrars": [
+        "parent_mcp"
+      ],
+      "max_ttl_seconds": 3600
+    }
   }
 }

@@ -65,7 +65,7 @@ def asg(method, path, *, route, capability, body=None, run_id=None, raw=False, t
         raise SpawnError(f"asg_http_{e.code}:{code}") from None
 
 
-def register(run_id=None, ttl=2700, revoke=False, worker_hash=None):
+def register(run_id=None, ttl=2700, revoke=False, worker_hash=None, test_mode=None):
     body = {"route_id": "security.runs.register", "capability": "register_run", "taint": ["trusted_instruction"],
             "ttl_seconds": 1 if revoke else ttl}
     if revoke:
@@ -77,12 +77,15 @@ def register(run_id=None, ttl=2700, revoke=False, worker_hash=None):
                     allowed_callers=["parent_mcp", "fc_worker"], reason="spawn_worker firecracker disposable worker")
         if run_id:
             body["run_id"] = run_id
+        if test_mode:  # TEST-ONLY (Rev17): operator scripts only - never reachable from the MCP tool (see mcp())
+            body["test_mode"] = test_mode
+            body["reason"] = "spawn_worker TEST MODE " + test_mode + " (operator-approved live prompt-injection test)"
         if worker_hash:  # per-run worker identity: ASG stores only this SHA-256, valid only for this run_id until it expires/revokes
             body["run_agents"] = {"fc_worker": worker_hash}
     return asg("POST", "/v1/runs", route="security.runs.register", capability="register_run", body=body)
 
 
-def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=2400, decoy_file=None):
+def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=2400, decoy_file=None, test_mode=None):
     if not isinstance(task, str) or not task.strip() or len(task) > 4000:
         raise SpawnError("invalid_task")
     if decoy_file:  # canary drill only: plant a registered decoy credential in the worker's task context
@@ -102,11 +105,11 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
     run_id = "fcw-" + time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
     task_id = "task-" + uuid.uuid4().hex[:12]
     cred = secrets.token_urlsafe(32)  # per-run worker token: never written to disk here; ASG keeps only its hash
-    reg = register(run_id, worker_hash=hashlib.sha256(cred.encode("utf-8")).hexdigest())
+    reg = register(run_id, worker_hash=hashlib.sha256(cred.encode("utf-8")).hexdigest(), test_mode=test_mode)
     if reg.get("run_id") != run_id:
         raise SpawnError("run_registration_mismatch")
     t_reg = time.time()
-    out = {"run_id": run_id, "task_id": task_id, "task": task.strip()[:200].split("[operator context")[0], "urls": urls, "allowed_hosts": hosts,
+    out = {"run_id": run_id, "task_id": task_id, **({"test_mode": test_mode} if test_mode else {}), "task": task.strip()[:200].split("[operator context")[0], "urls": urls, "allowed_hosts": hosts,
            "run_expires_at": reg.get("expires_at")}
     try:
         # guard: the parent's provider key (dsh apiKeyEnv) must never reach the worker
@@ -189,7 +192,11 @@ def mcp():
             res = {"tools": [TOOL]}
         elif method == "tools/call" and msg.get("params", {}).get("name") == "spawn_worker":
             try:
-                r = spawn_worker(**(msg["params"].get("arguments") or {}))
+                args = msg["params"].get("arguments") or {}
+                # only the published schema fields: decoy_file / test_mode / timeout / limits are operator-only
+                if not isinstance(args, dict) or set(args) - set(TOOL["inputSchema"]["properties"]):
+                    raise SpawnError("unknown_arguments")
+                r = spawn_worker(**args)
                 res = {"content": [{"type": "text", "text": json.dumps(r, ensure_ascii=True)}], "isError": False}
             except (SpawnError, TypeError, subprocess.TimeoutExpired) as e:
                 res = {"content": [{"type": "text", "text": json.dumps({"error": str(e)[:200]})}], "isError": True}

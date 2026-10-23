@@ -74,3 +74,17 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_s
   - 目安: GLM-5.3-Flash で約 50 トークン/秒、32k トークンで約 11 分。llm-fleet 側は request/attempt timeout 1800 秒、コンテキスト長 500k 以上なので余裕がある。
   - 手順数とモデル呼び出し回数の上限は変えていない。
 
+### テスト専用: 入力ガードの記録のみモード (Rev17)
+
+目的: 実際のプロンプトインジェクションを読ませたとき、モデル自身がそれに従うかを測るためのライブテスト。
+
+- **既定は無効。** `test_modes.input_guard_log_only.enabled` を `true` にしたときだけ使える。テスト後は必ず `false` に戻す。
+- **有効化の条件。** 次をすべて満たすランだけが対象になる。
+  - ランを登録するときに `test_mode: "input_guard_log_only"` と、空でない `reason` を付けている。
+  - 登録者が `allowed_registrars` (例: `parent_mcp`) に含まれる。
+  - ランの寿命が `max_ttl_seconds` 以下。
+- **動作。** 対象ラン・対象経路 (`routes`、例: `fc.llm.chat`) では、入力ガードが本来なら遮断・要レビューにする内容でもモデルへ転送する。その際、`test_mode_input_guard_bypass` 監査イベントに検出内容 (カテゴリ・リスク・スキャン結果) を記録し、そのリクエストの以降の監査イベントにも `test_mode` を付ける。本文は記録しない。
+- **これまで通り有効なもの。** 出力ガード、カナリア (リクエスト側・応答側)、アクションガード、ランの範囲、ランごとのワーカー ID、ホストの許可リスト。
+- **途中で無効にする方法。** 設定で `enabled` を `false` にするか、ランを `test_mode` なしで登録し直す (失効させる)。どちらでも直ちに効く。
+- **spawn_worker 側。** `test_mode` / `decoy_file` / `timeout` / `limits` は運用者のスクリプト専用の引数。MCP ツールは公開スキーマの項目 (task, urls, allowed_hosts, probe_lan) 以外を `unknown_arguments` で拒否する。
+
