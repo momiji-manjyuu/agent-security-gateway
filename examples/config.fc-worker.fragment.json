@@ -1,0 +1,113 @@
+{
+  "_comment": "Fragment to merge into config.json for Firecracker disposable workers. Replace token_sha256 values (python gateway.py hash-token <token>). Backend URL is your parent model's OpenAI-compatible endpoint.",
+  "agents": {
+    "fc_worker": {
+      "token_sha256": "<sha256-of-fc_worker-token>",
+      "trust_tier": "web_dmz",
+      "allowed_client_cidrs": [
+        "127.0.0.1/32"
+      ],
+      "allowed_capabilities": [
+        "submit_artifact",
+        "worker_llm"
+      ],
+      "allowed_routes": [
+        "fc.artifacts.submit",
+        "fc.llm.chat"
+      ]
+    },
+    "parent_mcp": {
+      "_note": "add to the existing parent agent",
+      "allowed_capabilities": [
+        "inspect",
+        "register_run",
+        "download_artifact"
+      ],
+      "allowed_routes": [
+        "security.inspect_only",
+        "security.runs.register",
+        "security.artifacts.download"
+      ]
+    }
+  },
+  "routes": {
+    "fc.artifacts.submit": {
+      "kind": "inspect_only",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "submit_artifact",
+      "require_run_id": true,
+      "description": "Disposable Firecracker worker result submission into ASG quarantine; run-scoped.",
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "sandbox_output"
+        ],
+        "allow_missing_taint": false,
+        "require_message_type": "artifact"
+      },
+      "artifact_policy": {
+        "allowed_operations": [
+          "submit"
+        ],
+        "max_artifact_bytes": 65536
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "fc.llm.chat": {
+      "kind": "openai_chat_completions",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "worker_llm",
+      "require_run_id": true,
+      "description": "Worker -> same model as the parent agent. ASG injects the backend credential; the worker holds none.",
+      "backend": {
+        "mode": "http",
+        "base_url": "http://llm-backend.example:9200/v1",
+        "path": "/chat/completions",
+        "model_rewrite": "main",
+        "api_key_env": "ASG_WORKER_LLM_API_KEY",
+        "max_tokens": 1200,
+        "timeout_seconds": 240
+      },
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "sandbox_output",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "max_messages": 12,
+        "block_on_review": false
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true
+      }
+    },
+    "security.decoy.export": {
+      "kind": "canary",
+      "allowed_callers": [
+        "*"
+      ],
+      "required_capability": "inspect",
+      "description": "Decoy route: any call revokes the calling agent (requires the canary section)."
+    }
+  },
+  "canary": {
+    "enabled": true,
+    "hmac_key_env": "ASG_CANARY_HMAC_KEY",
+    "registry_file": "~/.agent-security-gateway/canaries.jsonl",
+    "on_trip": {
+      "revoke_agent": true,
+      "kill_switch": false
+    }
+  }
+}

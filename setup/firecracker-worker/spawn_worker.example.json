@@ -1,0 +1,9 @@
+{
+  "asg_url": "http://127.0.0.1:8788",
+  "ssh_target": "user@worker-host.example",
+  "parent_token_file": "~/.asg/parent_mcp.token",
+  "worker_token_file": "~/.asg/fc_worker.token",
+  "provider_key_env": "PARENT_LLM_API_KEY",
+  "default_hosts": ["example.com", "en.wikipedia.org"],
+  "probe_targets": [["192.0.2.10", 22], ["192.0.2.10", 443], ["192.0.2.1", 80]]
+}
