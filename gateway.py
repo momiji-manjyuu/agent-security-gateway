@@ -822,6 +822,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
                     if not ok or value <= 0:
                         errors.append(f"llm_snippet_check.{key} must be a positive integer")
 
+    validate_test_modes(cfg, errors)
     if errors:
         raise ValueError("invalid config: " + "; ".join(errors))
 
@@ -3662,6 +3663,90 @@ def run_registration_expires_at(payload: dict[str, Any], cfg: dict[str, Any], no
     return expires_at.isoformat(timespec="seconds")
 
 
+# TEST-ONLY mode (Rev17): for an explicitly opted-in, short-lived run, the pre-model input guard on the listed
+# routes is log-only (findings are audited, content is still forwarded) so a live test can measure whether the
+# model itself obeys injected instructions. Everything else (output guard, canary, action guard, run scope,
+# per-run identity) stays enforced. Disabled unless config test_modes.input_guard_log_only.enabled is true.
+TEST_MODE_INPUT_GUARD_LOG_ONLY = "input_guard_log_only"
+TEST_MODE_DEFAULT_MAX_TTL = 3600
+
+
+def test_mode_settings(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    modes = cfg.get("test_modes")
+    settings = modes.get(TEST_MODE_INPUT_GUARD_LOG_ONLY) if isinstance(modes, dict) else None
+    if not isinstance(settings, dict) or settings.get("enabled") is not True:
+        return None
+    return settings
+
+
+def validate_test_modes(cfg: dict[str, Any], errors: list[str]) -> None:
+    modes = cfg.get("test_modes")
+    if modes is None:
+        return
+    if not isinstance(modes, dict) or set(modes) - {TEST_MODE_INPUT_GUARD_LOG_ONLY}:
+        errors.append(f"test_modes may only contain '{TEST_MODE_INPUT_GUARD_LOG_ONLY}'")
+        return
+    settings = modes.get(TEST_MODE_INPUT_GUARD_LOG_ONLY)
+    if settings is None:
+        return
+    if not isinstance(settings, dict):
+        errors.append("test_modes.input_guard_log_only must be an object")
+        return
+    if not isinstance(settings.get("enabled", False), bool):
+        errors.append("test_modes.input_guard_log_only.enabled must be a boolean")
+    routes = settings.get("routes")
+    if not isinstance(routes, list) or not routes or any(not isinstance(r, str) or r not in (cfg.get("routes") or {}) for r in routes):
+        errors.append("test_modes.input_guard_log_only.routes must be a non-empty list of configured routes")
+    registrars = settings.get("allowed_registrars")
+    if not isinstance(registrars, list) or not registrars or any(not isinstance(a, str) or a not in (cfg.get("agents") or {}) for a in registrars):
+        errors.append("test_modes.input_guard_log_only.allowed_registrars must be a non-empty list of configured agents")
+    ttl = settings.get("max_ttl_seconds", TEST_MODE_DEFAULT_MAX_TTL)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 60 <= ttl <= 86400:
+        errors.append("test_modes.input_guard_log_only.max_ttl_seconds must be between 60 and 86400")
+
+
+def run_test_mode_fields(payload: dict[str, Any], cfg: dict[str, Any], verified: VerifiedAgent, allowed_routes: list[str],
+                         reason: str, expires_at: str, now: dt.datetime) -> dict[str, Any]:
+    requested = payload.get("test_mode")
+    if requested is None:
+        return {}
+    if requested != TEST_MODE_INPUT_GUARD_LOG_ONLY:
+        raise GatewayError(400, "invalid_json", f"test_mode must be '{TEST_MODE_INPUT_GUARD_LOG_ONLY}'")
+    settings = test_mode_settings(cfg)
+    if settings is None:
+        raise GatewayError(403, "test_mode_disabled", "test_mode is not enabled in this gateway's config")
+    if verified.agent_id not in set(settings.get("allowed_registrars") or []):
+        raise GatewayError(403, "test_mode_denied", f"agent '{verified.agent_id}' may not register test-mode runs")
+    if not reason.strip():
+        raise GatewayError(400, "invalid_json", "test_mode requires a non-empty reason")
+    max_ttl = int(settings.get("max_ttl_seconds", TEST_MODE_DEFAULT_MAX_TTL))
+    if (parse_datetime(expires_at) - now).total_seconds() > max_ttl:
+        raise GatewayError(400, "invalid_json", f"test_mode runs may last at most {max_ttl} seconds")
+    routes = sorted(set(allowed_routes) & set(settings.get("routes") or []))
+    if not routes:
+        raise GatewayError(400, "invalid_json", "test_mode run must allow at least one test-mode route")
+    return {"test_mode": TEST_MODE_INPUT_GUARD_LOG_ONLY, "test_mode_routes": routes}
+
+
+def active_input_guard_test_mode(cfg: dict[str, Any], decision: RouteDecision) -> bool:
+    """True only if the gateway config still enables the mode, the route is listed there, and the (latest,
+    unexpired) record of this run opted in for this route and was created by an allowed registrar."""
+    settings = test_mode_settings(cfg)
+    if settings is None or not decision.run_id or decision.route_id not in set(settings.get("routes") or []):
+        return False
+    record, _source = resolve_run_scope_record(cfg, decision.run_id)
+    if not isinstance(record, dict) or record.get("test_mode") != TEST_MODE_INPUT_GUARD_LOG_ONLY:
+        return False
+    if decision.route_id not in set(record.get("test_mode_routes") or []):
+        return False
+    if record.get("created_by") not in set(settings.get("allowed_registrars") or []):
+        return False
+    try:
+        return parse_datetime(str(record.get("expires_at"))) > dt.datetime.now(dt.timezone.utc)
+    except (TypeError, ValueError):
+        return False
+
+
 def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], verified: VerifiedAgent) -> dict[str, Any]:
     raw_run_id = payload.get("run_id")
     if raw_run_id is None:
@@ -3695,6 +3780,7 @@ def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], 
     }
     if run_agents:
         record["run_agents"] = run_agents  # SHA-256 only; the raw token never reaches the gateway's disk
+    record.update(run_test_mode_fields(payload, cfg, verified, allowed_routes, record["reason"], record["expires_at"], now))
     return record
 
 
@@ -4053,7 +4139,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return_receipt = report_policy_enabled(self.path, decision, "return_audit_receipt")
             notify_on_block = report_policy_notify_on_block(self.path, decision)
             check_report_receipt_rate_limit(self.path, verified, decision)
-            if inbound.scan.blocked:
+            input_guard_log_only = False
+            if active_input_guard_test_mode(cfg, decision):
+                event["test_mode"] = TEST_MODE_INPUT_GUARD_LOG_ONLY
+                if inbound.scan.blocked or inbound.scan.requires_review:
+                    input_guard_log_only = True
+                    event["input_guard_would_block"] = bool(inbound.scan.blocked)
+                    event["input_guard_would_review"] = bool(inbound.scan.requires_review)
+                    write_audit(cfg, {"event": "test_mode_input_guard_bypass", "reason": "input_guard_log_only", **event})
+            if inbound.scan.blocked and not input_guard_log_only:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
                     request_id,
@@ -4077,7 +4171,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.write_json(403, json_error("blocked_by_input_guard", "request was blocked by input guard", request_id))
                 return
-            if inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get("block_on_review", cfg.get("review_policy", {}).get("block_forward", False))):
+            if not input_guard_log_only and inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get("block_on_review", cfg.get("review_policy", {}).get("block_forward", False))):
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
                     request_id,
@@ -4301,6 +4395,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "registered_allowed_callers": record["allowed_callers"],
                     "registered_expires_at": record["expires_at"],
                     "registered_run_agents": sorted(record.get("run_agents") or {}),
+                    **({"test_mode": record["test_mode"], "test_mode_routes": record["test_mode_routes"]} if record.get("test_mode") else {}),
                     "reason": record["reason"][:RUN_REASON_MAX_CHARS],
                     "scan": security.public_scan_for_audit(inbound.scan, cfg),
                 },

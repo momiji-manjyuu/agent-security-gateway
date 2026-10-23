@@ -63,5 +63,28 @@ class WorkerAgentTruncationTests(unittest.TestCase):
         self.assertLessEqual(caps["max_llm_calls"][1], 6)
 
 
+class SpawnWorkerMcpArgumentTests(unittest.TestCase):
+    def test_operator_only_arguments_are_rejected(self):
+        import importlib.util
+        import io
+        import sys
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("spawn_worker_under_test", ROOT / "spawn_worker.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        calls = []
+        for extra in ({"decoy_file": "/etc/passwd"}, {"test_mode": "input_guard_log_only"}, {"timeout": 1}):
+            msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "spawn_worker", "arguments": {"task": "t", **extra}}}
+            out = io.StringIO()
+            with mock.patch.object(mod, "spawn_worker", side_effect=lambda **kw: calls.append(kw)), \
+                    mock.patch.object(sys, "stdin", io.StringIO(json.dumps(msg) + "\n")), mock.patch.object(sys, "stdout", out):
+                mod.mcp()
+            res = json.loads(out.getvalue())["result"]
+            self.assertTrue(res["isError"])
+            self.assertIn("unknown_arguments", res["content"][0]["text"])
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
