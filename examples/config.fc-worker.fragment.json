@@ -92,6 +92,9 @@
         "block_secrets": true,
         "block_private_urls": true,
         "block_internal_paths": true
+      },
+      "action_policy": {
+        "read_only_model": true
       }
     },
     "security.decoy.export": {
@@ -111,5 +114,10 @@
       "revoke_agent": true,
       "kill_switch": false
     }
+  },
+  "llm_snippet_check": {
+    "enabled": true,
+    "timeout_seconds": 50,
+    "_note": "endpoint/model default to llm_inspector; may only lower downgradable pattern findings"
   }
 }

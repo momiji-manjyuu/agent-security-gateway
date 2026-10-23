@@ -74,6 +74,7 @@ APPROVABLE_ACTION_CATEGORIES = {
     "external_upload",
     "privileged_command",
     "delete_operation",
+    "git_publish",
 }
 CALLER_BACKEND_FIELD_NAMES = {
     "target_url",
@@ -219,6 +220,7 @@ def _scanner_defaults() -> dict[str, Any]:
         "output_guard": base["output_guard"],
         "normalize": base["normalize"],
         "llm_inspector": base["llm_inspector"],
+        "llm_snippet_check": base["llm_snippet_check"],
         "structured_extract": base["structured_extract"],
     }
 
@@ -401,11 +403,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 class GatewayError(Exception):
-    def __init__(self, status: int, code: str, message: str) -> None:
+    def __init__(self, status: int, code: str, message: str, audit_extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.audit_extra = audit_extra  # extra non-secret audit fields for the deny event (e.g. the scan summary)
+
+
+def input_guard_error(message: str, inbound: Any, cfg: dict[str, Any]) -> GatewayError:
+    return GatewayError(403, "blocked_by_input_guard", message,
+                        audit_extra={"scan": security.public_scan_for_audit(inbound.scan, cfg)})
 
 
 @dataclasses.dataclass
@@ -778,6 +786,33 @@ def validate_config(cfg: dict[str, Any]) -> None:
         if not canary.registry_path(cfg).is_file():
             errors.append("canary.registry_file must exist (create it with: asgctl canary init)")
 
+    for route_id, route in (cfg.get("routes") or {}).items():
+        policy = route.get("action_policy") if isinstance(route, dict) else None
+        if isinstance(policy, dict) and "read_only_model" in policy:
+            if not isinstance(policy.get("read_only_model"), bool):
+                errors.append(f"routes.{route_id}.action_policy.read_only_model must be a boolean")
+            elif policy["read_only_model"] and route.get("kind") != "openai_chat_completions":
+                errors.append(f"routes.{route_id}.action_policy.read_only_model is only valid for openai_chat_completions routes")
+    snippet = cfg.get("llm_snippet_check")
+    if snippet is not None:
+        if not isinstance(snippet, dict):
+            errors.append("llm_snippet_check must be an object")
+        else:
+            if "enabled" in snippet and not isinstance(snippet.get("enabled"), bool):
+                errors.append("llm_snippet_check.enabled must be a boolean")
+            categories = snippet.get("categories", [])
+            if not isinstance(categories, list) or not all(isinstance(c, str) for c in categories):
+                errors.append("llm_snippet_check.categories must be an array of strings")
+            else:
+                hard = sorted(set(categories) - security.SNIPPET_DOWNGRADABLE_CATEGORIES)
+                if hard:
+                    errors.append("llm_snippet_check.categories may only list downgradable pattern categories: " + ", ".join(hard))
+            for key in ("timeout_seconds", "max_tokens", "context_chars", "max_matches_per_finding", "max_checks"):
+                if key in snippet:
+                    value, ok = parse_int(snippet.get(key), default=0)
+                    if not ok or value <= 0:
+                        errors.append(f"llm_snippet_check.{key} must be a positive integer")
+
     if errors:
         raise ValueError("invalid config: " + "; ".join(errors))
 
@@ -1116,6 +1151,8 @@ def enforce_input_policy(payload: dict[str, Any], decision: RouteDecision) -> No
     policy = decision.route.get("input_policy", {})
     if not isinstance(policy, dict):
         raise GatewayError(403, "input_policy_denied", "route input_policy is invalid")
+    if route_is_read_only_model(decision.route) and READ_ONLY_FORBIDDEN_FIELDS & set(payload):
+        raise GatewayError(403, "input_policy_denied", "read-only model route does not accept tools or function calls")
 
     if "max_messages" in policy:
         max_messages, ok = parse_int(policy.get("max_messages"), default=0)
@@ -1507,12 +1544,26 @@ def route_allows_action_finding(decision: RouteDecision, finding: security.Findi
     return False
 
 
+READ_ONLY_FORBIDDEN_FIELDS = {"tools", "functions", "tool_choice", "function_call", "parallel_tool_calls"}
+
+
+def route_is_read_only_model(route: dict[str, Any]) -> bool:
+    policy = route.get("action_policy")
+    return route.get("kind") == "openai_chat_completions" and isinstance(policy, dict) and policy.get("read_only_model") is True
+
+
 def apply_route_action_guard_policy(result: ActionGuardResult, decision: RouteDecision, payload: dict[str, Any]) -> ActionGuardResult:
     text = "\n".join([security.extract_content(payload), json.dumps(payload, ensure_ascii=False, sort_keys=True),
                       *security.multipart_texts(payload)])
     kept: list[security.Finding] = []
     ignored_categories: list[str] = []
+    read_only = route_is_read_only_model(decision.route)
     for finding in result.findings:
+        # A read-only model route (no tools, model text only) cannot perform actions; only non-approvable categories
+        # (secret exfiltration, private/metadata destinations, dangerous schemes, inspection limits, caller backends) apply.
+        if read_only and finding.category.removeprefix("action_guard:") not in NON_APPROVABLE_ACTION_CATEGORIES:
+            ignored_categories.append("read_only_model:" + finding.category)
+            continue
         if route_allows_action_finding(decision, finding, text):
             ignored_categories.append(finding.category)
             continue
@@ -3728,7 +3779,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             metadata_inbound = scan_inbound_for_route(metadata_payload, cfg, decision)
             metadata_action = apply_route_action_guard_policy(action_guard(self.headers, metadata_payload, cfg), decision, metadata_payload)
             if metadata_inbound.scan.blocked:
-                raise GatewayError(403, "blocked_by_input_guard", "artifact metadata was blocked by input guard")
+                raise input_guard_error("artifact metadata was blocked by input guard", metadata_inbound, cfg)
             if metadata_inbound.scan.requires_review and bool(decision.route.get("input_policy", {}).get("block_on_review", cfg.get("review_policy", {}).get("block_forward", False))):
                 raise GatewayError(403, "manual_review_required", "artifact metadata requires manual review")
             enforce_action_guard(cfg, decision, verified, metadata_action)
@@ -4146,7 +4197,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             parse_datetime(payload["expires_at"])
             inbound = scan_inbound(payload, cfg)
             if inbound.scan.blocked:
-                raise GatewayError(403, "blocked_by_input_guard", "approval payload was blocked by input guard")
+                raise input_guard_error("approval payload was blocked by input guard", inbound, cfg)
             record = {
                 "approval_id": payload["approval_id"],
                 "approver_agent_id": verified.agent_id,
@@ -4204,7 +4255,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             scan_payload = {k: v for k, v in payload.items() if k != "run_agents"}
             inbound = scan_inbound(scan_payload, cfg)
             if inbound.scan.blocked:
-                raise GatewayError(403, "blocked_by_input_guard", "run registration payload was blocked by input guard")
+                raise input_guard_error("run registration payload was blocked by input guard", inbound, cfg)
             append_jsonl_record(run_store_path(cfg), record)
             write_audit(
                 cfg,
@@ -4396,6 +4447,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             "reason": exc.code,
             **audit_base(request_id, verified, client_ip, decision),
         }
+        if getattr(exc, "audit_extra", None):
+            event.update(exc.audit_extra)
         if extra:
             event.update(extra)
         try:
