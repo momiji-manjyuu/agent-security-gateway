@@ -28,7 +28,7 @@ def _env_int(name, default, low, high):
 
 CONCURRENCY = _env_int('RELAY_CONCURRENCY', 4, 1, 16)        # simultaneous upstream model calls
 DEADLINE_SECONDS = _env_int('RELAY_DEADLINE_SECONDS', 45, 5, 120)  # queue wait + attempts; keep below the gateway timeout
-ATTEMPT_SECONDS = _env_int('RELAY_ATTEMPT_SECONDS', 30, 3, 120)    # one upstream attempt
+ATTEMPT_SECONDS = _env_int('RELAY_ATTEMPT_SECONDS', 40, 3, 120)    # one upstream attempt
 MIN_RETRY_SECONDS = _env_int('RELAY_MIN_RETRY_SECONDS', 8, 1, 60)  # retry only if this much budget is left
 READ_TIMEOUT_SECONDS = _env_int('RELAY_READ_TIMEOUT_SECONDS', 10, 1, 60)
 LOG_PATH = os.environ.get('RELAY_LOG', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'inspector_relay.log'))
