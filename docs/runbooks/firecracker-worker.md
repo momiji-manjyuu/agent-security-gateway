@@ -28,7 +28,7 @@
 
 1. ワーカーホスト: `sudo bash setup/firecracker-worker/install-worker.sh <親が ssh するユーザー>`。
    必要なら `/etc/asg/fc-worker.env` (root 所有) を編集。
-2. ASG: fragment をマージし、`fc_worker` トークンを生成 (`python gateway.py generate-token`)、ハッシュのみ config へ。
+2. ASG: fragment をマージする。`fc_worker` は `run_scoped: true` のテンプレートで静的トークンを持たない (`token_sha256: ""`)。
    `python gateway.py validate-config` → 再起動。
 3. 親: `setup/firecracker-worker/spawn_worker.py` と `spawn_worker.example.json` を `~/.asg/` に置き、トークンファイルの ACL を本人のみに。
    MCP (stdio) として登録: `python spawn_worker.py mcp`、ツール名 `spawn_worker(task, urls, allowed_hosts, probe_lan)`。
@@ -45,8 +45,12 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 1200, max_seconds ≤ 240, 
 - シリアルから親へ戻るのは正規表現で検証済みのトークン (artifact_id, status, イベント) のみ。本文は ASG 経由のみ。
 - 結果 (`result_untrusted`) は非信頼データ。親モデルは指示として扱わないこと。
 - `fc.llm.chat` の `block_on_review=false` は運用判断 (無害な Web 本文の正規表現誤検知で止まるため)。risk ≥ 8 は遮断、出力ガードは有効。
+- run ごとの識別子 (Rev13): `spawn_worker` は run ごとに新しいトークンを生成し、`/v1/runs` 登録時に `run_agents: {"fc_worker": <sha256>}` としてハッシュのみ渡す。
+  ASG はそれを `fc_worker@<run_id>` として認証する。条件は 同じ `X-ASG-Run-Id`・run の有効期限内・失効 (再登録) 前 のみ。権限はテンプレート `fc_worker` と同じ。
+  run 識別子は run 登録不可、静的トークンと同じハッシュは拒否、1 run あたり最大 4 件。
 - canary: 囮の資格情報 (`asgctl canary add`) が依頼・応答・成果物に現れる、または囮ルートが呼ばれると、そのエージェントを失効。
-  `fc_worker` は全 run 共通のため、失効すると人が `asgctl canary release --agent fc_worker` するまで全ワーカーが止まる (fail-closed)。
+  失効するのは発火した run の `fc_worker@<run_id>` のみ。他の run・親・以後の新しい run は影響を受けず、解除操作は不要。
+  `spawn_worker` は `status: "canary_tripped"` と明示的なエラーを返す (結果は返さない)。テンプレート `fc_worker` 自体を失効させると全 run が止まる (緊急停止用)。
 
 ## 検証
 

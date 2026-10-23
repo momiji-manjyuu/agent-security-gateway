@@ -155,6 +155,8 @@ ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-f0-9]{32}$")
 ARTIFACT_SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 ARTIFACT_PARTITION_PATTERN = re.compile(r"^\d{4}/\d{2}/\d{2}$")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+MAX_RUN_AGENTS = 4
 RUN_REASON_MAX_CHARS = 200
 ARTIFACT_TEXT_MEDIA_TYPES = {
     "application/json",
@@ -410,6 +412,14 @@ class GatewayError(Exception):
 class VerifiedAgent:
     agent_id: str
     agent: dict[str, Any]
+    # Run-scoped identities: agent_id is "<template>@<run_id>" (audit, rate limits, canary revocation),
+    # principal is the template agent used for route/run caller checks, bound_run_id pins the identity to its run.
+    principal: str = ""
+    bound_run_id: str = ""
+
+    @property
+    def role(self) -> str:
+        return self.principal or self.agent_id
 
 
 @dataclasses.dataclass
@@ -712,6 +722,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
         token_hash = str(agent.get("token_sha256", ""))
         if token_hash and not re.fullmatch(r"[a-fA-F0-9]{64}", token_hash):
             errors.append(f"agents.{agent_id}.token_sha256 must be a 64-character SHA-256 hex digest")
+        if "run_scoped" in agent and not isinstance(agent.get("run_scoped"), bool):
+            errors.append(f"agents.{agent_id}.run_scoped must be a boolean")
+        if "@" in agent_id:
+            errors.append(f"agents.{agent_id}: '@' is reserved for run-scoped identities")
         allowed_capabilities = agent.get("allowed_capabilities", [])
         if not isinstance(allowed_capabilities, list):
             errors.append(f"agents.{agent_id}.allowed_capabilities must be an array")
@@ -850,7 +864,62 @@ def verify_agent(headers: Any, cfg: dict[str, Any], client_ip: str) -> VerifiedA
             if not client_allowed(client_ip, agent):
                 raise GatewayError(403, "client_ip_denied", f"client IP is not allowed for agent '{agent_id}'")
             return VerifiedAgent(str(agent_id), agent)
+    run_scoped = verify_run_scoped_agent(headers, cfg, client_ip, token_hash)
+    if run_scoped is not None:
+        return run_scoped
     raise GatewayError(401, "unauthorized", "unknown bearer token")
+
+
+def verify_run_scoped_agent(headers: Any, cfg: dict[str, Any], client_ip: str, token_hash: str) -> VerifiedAgent | None:
+    """Resolve a per-run worker identity registered by the parent (only its SHA-256 is stored, in the run record).
+
+    The identity is valid only with its own X-ASG-Run-Id, only until that run expires or is re-registered
+    without it, and a canary trip revokes "<template>@<run_id>" alone, not the template or other runs."""
+    run_id = headers.get("X-ASG-Run-Id", "")
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    record = latest_dynamic_run_record(cfg, run_id)
+    if record is None:
+        return None
+    run_agents = record.get("run_agents")
+    if not isinstance(run_agents, dict):
+        return None
+    for template_id, configured_hash in run_agents.items():
+        if not isinstance(configured_hash, str) or not hmac.compare_digest(configured_hash, token_hash):
+            continue
+        template = (cfg.get("agents") or {}).get(template_id)
+        if not isinstance(template, dict) or template.get("run_scoped") is not True:
+            return None
+        identity = f"{template_id}@{run_id}"
+        if parse_datetime(str(record["expires_at"])) < dt.datetime.now(dt.timezone.utc):
+            raise GatewayError(403, "run_expired", f"run-scoped identity '{identity}' has expired")
+        if canary.is_revoked(cfg, identity) or canary.is_revoked(cfg, str(template_id)):
+            raise GatewayError(403, "agent_revoked", f"agent '{identity}' is revoked")
+        if not client_allowed(client_ip, template):
+            raise GatewayError(403, "client_ip_denied", f"client IP is not allowed for agent '{identity}'")
+        return VerifiedAgent(identity, template, principal=str(template_id), bound_run_id=run_id)
+    return None
+
+
+def run_agents_from_payload(payload: dict[str, Any], cfg: dict[str, Any], allowed_callers: list[str]) -> dict[str, str]:
+    raw = payload.get("run_agents")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not raw or len(raw) > MAX_RUN_AGENTS:
+        raise GatewayError(400, "invalid_json", f"run_agents must be an object with 1-{MAX_RUN_AGENTS} entries")
+    agents = cfg.get("agents") or {}
+    static_hashes = {str(a.get("token_sha256", "")).lower() for a in agents.values() if isinstance(a, dict)}
+    result: dict[str, str] = {}
+    for template_id, token_hash in raw.items():
+        template = agents.get(template_id)
+        if not isinstance(template, dict) or template.get("run_scoped") is not True:
+            raise GatewayError(403, "input_policy_denied", f"run_agents: '{template_id}' is not a run_scoped agent")
+        if template_id not in allowed_callers:
+            raise GatewayError(400, "invalid_json", f"run_agents: '{template_id}' must also be in allowed_callers")
+        if not isinstance(token_hash, str) or not SHA256_HEX_PATTERN.fullmatch(token_hash) or token_hash in static_hashes:
+            raise GatewayError(400, "invalid_json", "run_agents values must be fresh lowercase SHA-256 hex digests")
+        result[str(template_id)] = token_hash
+    return result
 
 
 def route_alias_map(cfg: dict[str, Any]) -> dict[str, str]:
@@ -976,15 +1045,17 @@ def enforce_route_policy(verified: VerifiedAgent, decision: RouteDecision, cfg: 
         raise GatewayError(403, "route_denied", f"route '{decision.route_id}' is not allowed for agent '{verified.agent_id}'")
 
     allowed_callers = set(str(item) for item in route.get("allowed_callers") or [])
-    if "*" not in allowed_callers and verified.agent_id not in allowed_callers:
+    if "*" not in allowed_callers and verified.role not in allowed_callers:
         raise GatewayError(403, "caller_not_allowed", f"agent '{verified.agent_id}' is not allowed to call route '{decision.route_id}'")
+    if verified.bound_run_id and decision.run_id != verified.bound_run_id:
+        raise GatewayError(403, "run_scope_denied", f"agent '{verified.agent_id}' is bound to its own run_id")
 
     route_capabilities = set(str(item) for item in route.get("allowed_capabilities") or [])
     required = str(route.get("required_capability", ""))
     if capability != required and capability not in route_capabilities:
         raise GatewayError(403, "capability_denied", f"route '{decision.route_id}' requires capability '{required}'")
 
-    enforce_run_scope(decision, cfg, verified.agent_id)
+    enforce_run_scope(decision, cfg, verified.role)
     enforce_taint_policy(decision)
 
 
@@ -3526,8 +3597,11 @@ def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], 
         raw_reason = ""
     if not isinstance(raw_reason, str):
         raise GatewayError(400, "invalid_json", "reason must be a string")
+    if verified.bound_run_id:
+        raise GatewayError(403, "capability_denied", "run-scoped identities cannot register runs")
+    run_agents = run_agents_from_payload(payload, cfg, allowed_callers)
     now = dt.datetime.now(dt.timezone.utc)
-    return {
+    record = {
         "run_id": run_id,
         "allowed_routes": allowed_routes,
         "denied_routes": denied_routes,
@@ -3537,6 +3611,9 @@ def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], 
         "created_at": now.isoformat(timespec="seconds"),
         "reason": raw_reason.strip()[:RUN_REASON_MAX_CHARS],
     }
+    if run_agents:
+        record["run_agents"] = run_agents  # SHA-256 only; the raw token never reaches the gateway's disk
+    return record
 
 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
@@ -3814,7 +3891,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             allowed_routes = set(str(item) for item in verified.agent.get("allowed_routes") or [])
             for route_id, route in (cfg.get("routes") or {}).items():
                 callers = set(str(item) for item in route.get("allowed_callers") or [])
-                if route_id in allowed_routes and ("*" in callers or verified.agent_id in callers):
+                if route_id in allowed_routes and ("*" in callers or verified.role in callers):
                     visible.append(public_route(route_id, route))
             write_audit(cfg, {"event": "routes", "decision": "allow", **audit_base(request_id, verified, client_ip)})
             self.write_json(200, {"routes": visible, "request_id": request_id})
@@ -4124,7 +4201,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(payload, decision)
             record = build_run_registration_record(payload, cfg, verified)
-            inbound = scan_inbound(payload, cfg)
+            scan_payload = {k: v for k, v in payload.items() if k != "run_agents"}
+            inbound = scan_inbound(scan_payload, cfg)
             if inbound.scan.blocked:
                 raise GatewayError(403, "blocked_by_input_guard", "run registration payload was blocked by input guard")
             append_jsonl_record(run_store_path(cfg), record)
@@ -4140,6 +4218,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "registered_denied_route_count": len(record["denied_routes"]),
                     "registered_allowed_callers": record["allowed_callers"],
                     "registered_expires_at": record["expires_at"],
+                    "registered_run_agents": sorted(record.get("run_agents") or {}),
                     "reason": record["reason"][:RUN_REASON_MAX_CHARS],
                     "scan": security.public_scan_for_audit(inbound.scan, cfg),
                 },
@@ -4152,6 +4231,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "allowed_routes": record["allowed_routes"],
                     "denied_routes": record["denied_routes"],
                     "allowed_callers": record["allowed_callers"],
+                    "run_agents": sorted(record.get("run_agents") or {}),
                 },
             )
         except GatewayError as exc:

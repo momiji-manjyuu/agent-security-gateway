@@ -1,8 +1,10 @@
 {
-  "_comment": "Fragment to merge into config.json for Firecracker disposable workers. Replace token_sha256 values (python gateway.py hash-token <token>). Backend URL is your parent model's OpenAI-compatible endpoint.",
+  "_comment": "Fragment to merge into config.json for Firecracker disposable workers. Replace parent token_sha256 values (python gateway.py hash-token <token>). Backend URL is your parent model's OpenAI-compatible endpoint.",
   "agents": {
     "fc_worker": {
-      "token_sha256": "<sha256-of-fc_worker-token>",
+      "_note": "run_scoped template: no static token. Each spawn_worker run registers a fresh token hash (run_agents) valid only for that run as fc_worker@<run_id>.",
+      "run_scoped": true,
+      "token_sha256": "",
       "trust_tier": "web_dmz",
       "allowed_client_cidrs": [
         "127.0.0.1/32"
