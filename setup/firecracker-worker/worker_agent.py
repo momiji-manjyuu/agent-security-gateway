@@ -152,6 +152,13 @@ def partial_answer(text):
             return body.replace('\\n', "\n").replace('\\"', '"')
     return "" if text.startswith("{") else text
 
+LLM_CALL_TIMEOUT = 1000  # one long generation (32k tokens at ~50 tok/s is ~11 min); ASG backend timeout is 1000 s too
+
+
+def llm_timeout(remaining):
+    """Per-call HTTP timeout: never past the run budget (+15 s grace), never above LLM_CALL_TIMEOUT, at least 30 s."""
+    return max(30, min(LLM_CALL_TIMEOUT, int(remaining) + 15))
+
 CONDENSE = ("Your previous reply was cut off by the output limit. Reply now with ONLY one JSON object "
             '{"action":"final","answer":"..."}; keep the answer under 200 words; no reasoning, no prose outside JSON.')
 
@@ -166,7 +173,7 @@ def main():
     asg = Asg(a["asg_url"], cred, a["run_id"], a["task_id"]); cred = None
     lim = a.get("limits", {})
     max_steps, max_llm = int(lim.get("max_steps", 6)), int(lim.get("max_llm_calls", 4))
-    max_tokens, max_secs = int(lim.get("max_tokens", 3000)), int(lim.get("max_seconds", 180))
+    max_tokens, max_secs = int(lim.get("max_tokens", 32768)), int(lim.get("max_seconds", 1200))
     page_chars = int(lim.get("page_chars", 6000))
     allowed = set(a.get("allowed_hosts", []))
     con("mmds_ok run_id=%s steps=%d llm=%d" % (a["run_id"], max_steps, max_llm))
@@ -193,7 +200,8 @@ def main():
                     SYSTEM % ", ".join(sorted(allowed)), a["task"], docs or "(none)",
                     CONDENSE if condense else "You must now reply with the final action." if last else "")}]
         st, r = asg.post("/v1/chat/completions", "fc.llm.chat", "worker_llm",
-                         {"taint": ["untrusted_web"], "messages": msgs, "max_tokens": max_tokens, "temperature": 0.2}, 240)
+                         {"taint": ["untrusted_web"], "messages": msgs, "max_tokens": max_tokens, "temperature": 0.2},
+                         llm_timeout(max_secs - (time.time() - T0)))
         llm_calls += 1
         if st != 200:
             con("llm http=%d code=%s" % (st, r.get("error", {}).get("code", ""))); answer = None; break
