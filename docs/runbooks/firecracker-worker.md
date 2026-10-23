@@ -92,3 +92,31 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_s
   - 入力ガード・行動ガードが本来止めたはずの一致箇所の前後 (最大 600 文字 × 12 件)。
   - 出力ガードが止めたモデル出力 (最大 4000 文字)。
 
+
+## 警告付き抽出 (warn-and-extract) と出力ガード誤検知対策 (Rev18)
+
+- **fetch アクションのクエリ文字列**: モデル応答が厳密に `{"action":"fetch","url":...}` のみで、URL が https・userinfo/ポート無し・
+  ホストが登録時の `fetch_hosts` (spawn_worker が allowed_hosts から送る) に含まれる場合に限り `output_dlp:url_query` だけを外す。
+  他の URL/DLP 検出はそのまま。route の `output_policy.allow_fetch_query_to_run_hosts: true` で有効。
+- **出力側スニペット意図判定**: `llm_snippet_check.apply_to_output: true` で、モデル出力 (fc.llm.chat 応答とワーカー成果物) にも
+  スニペット判定を適用。入力側の下げられるカテゴリに加え `*_dlp:local_path`、さらに `secret_exfiltration` /
+  `ja_secret_exfiltration` / `local_secret_file_request` は **窓内にスキーム付き URL が無い場合のみ** 下げられる。
+  実秘密・private/危険 URL・canary・fetch 以外の url_query は決して下げない。取得ページ (入力) 側の対象は従来どおり。
+- **ワーカー警告**: ワーカーの final は `warnings:[{source,categories,description}]` を持てる。出典 URL と回答中の許可外 URL は
+  `⚠️攻撃の可能性あり（開かないこと）hxxps://host[.]tld/...` に無害化。入力/アクションガードで止まったページは捨てて警告を残し続行、
+  出力ガードで止まった応答は 1 回だけ書き直しを依頼する。
+- **ASG 側警告**: `report_run_warnings: true` の route では、run ごとに検出カテゴリ・無害化した出典 URL・リスク・結果
+  (blocked / allowed / test_mode_pass / quarantined_pass) のみを `run_warnings.jsonl` (run store と同じディレクトリ) に記録し、
+  その run の成果物 manifest の `asg_warnings` に添付する。spawn_worker は `warnings_asg` として返す (ワーカーが警告を省いても親に届く)。
+  ページ本文は保存しない。
+
+### quarantined read (opt-in、既定 OFF)
+
+- config `quarantined_read.enabled` + 登録時 `read_mode:"quarantined"` (parent のみ、spawn_worker の operator 引数のみ。MCP 非公開)。
+- 対象 route は `openai_chat_completions` かつ `action_policy.read_only_model: true` に限定 (validator が強制)。
+- 入力の検出が **すべて注入系** (prompt_injection / obfuscation / llm_inspector / input_dlp:local_path) で、リスクが
+  `max_risk_score` 以下のときだけ、ツールの無いモデルへ通す。アクションガードの阻止も同条件で通す。秘密・DLP・境界・canary・出力ガードは全て有効のまま。
+  通過は `quarantined_read_pass` として監査し、`asg_warnings` が必ず付く。証拠ファイルは書かない。
+- トレードオフ: 注入文がモデルに届くので、モデルが従うリスク (誤った要約、許可ホスト内の余計な fetch) は残る。
+  被害はツール無し・秘密無し・許可ホスト限定・出力ガード・使い捨て VM で抑える。結果は常に untrusted。
+  既定の通常モードは従来どおり高リスクページをモデル前で止める (警告付きで他ページの情報は返る)。

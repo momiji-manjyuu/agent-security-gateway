@@ -94,11 +94,13 @@
       "output_policy": {
         "block_secrets": true,
         "block_private_urls": true,
-        "block_internal_paths": true
+        "block_internal_paths": true,
+        "allow_fetch_query_to_run_hosts": true
       },
       "action_policy": {
         "read_only_model": true
-      }
+      },
+      "report_run_warnings": true
     },
     "security.decoy.export": {
       "kind": "canary",
@@ -121,7 +123,8 @@
   "llm_snippet_check": {
     "enabled": true,
     "timeout_seconds": 50,
-    "_note": "endpoint/model default to llm_inspector; may only lower downgradable pattern findings"
+    "_note": "endpoint/model default to llm_inspector; may only lower downgradable pattern findings",
+    "apply_to_output": true
   },
   "test_modes": {
     "input_guard_log_only": {
@@ -134,5 +137,16 @@
       ],
       "max_ttl_seconds": 3600
     }
+  },
+  "quarantined_read": {
+    "enabled": false,
+    "routes": [
+      "fc.llm.chat"
+    ],
+    "allowed_registrars": [
+      "parent_mcp"
+    ],
+    "max_risk_score": 40,
+    "_note": "opt-in per run (read_mode=quarantined, operator-only); injection-type findings only; see runbook"
   }
 }
