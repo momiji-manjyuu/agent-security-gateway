@@ -59,3 +59,7 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 1200, max_seconds ≤ 240, 
 - ASG 監査: `run_registration` → `fc.llm.chat allow (backend_model/upstream_model)` → `artifact stored` → 親の download → 失効。
 - canary 演習: 囮ルートはルーティング系エンドポイント (`/v1/tasks` 等) で評価される。`/inspect` はルートを評価しないため囮ルートは発火しない。
 - プロンプトインジェクション演習では、`fc.llm.chat` の入力ガードが公開テストページ (umage-ai canary-pages L1-L4) をモデル到達前に遮断した (risk 11-27)。
+- ガード調整 (Rev14):
+  - `fc.llm.chat` は `action_policy.read_only_model: true`。ツールを持たないモデル呼び出しなので、アクションガードは承認不可カテゴリ (秘密情報の持ち出し・プライベート/メタデータ宛先・危険なスキーム・検査上限・呼び出し側バックエンド指定) のみ評価する。`tools` 等のフィールドは拒否。
+  - `llm_snippet_check`: 下げてよいパターン (tool_escalation, external_write, role_reassignment, hidden_instruction_marker, authority_laundering, long_base64/hex) が発火したとき、該当箇所の前後を非信頼データとして囲み、ツールなしのモデルに instruction / description / unknown を判定させる。description のときだけその所見を 0 にする。unknown・エラーは現状維持。秘密情報・宛先・スキーム・tool_hijack・decoded_instruction 等は下げない。判定は監査ログに (カテゴリ・判定・snippet の sha256・文字数のみ) 記録される。
+  - 全文の LLM inspector は従来どおり後段で実行される。
