@@ -15,8 +15,8 @@ Install (elevated): `Install-AsgServiceAccounts.ps1`. Backups: `C:\ProgramData\a
 Rollback (elevated): `Rollback-AsgServiceAccounts.ps1` (re-imports the SYSTEM tasks, removes the ACEs, disables the accounts).
 
 ## Self-healing
-- The supervisor checks `/healthz` every 15 s. After 4 failures, or if the gateway or relay exits, it stops both and exits 1.
-- Task Scheduler then restarts the task (RestartCount 999, 1 min). The tunnel task loops on its own (10 s).
+- The supervisor checks `/healthz` every 15 s and restarts the gateway and relay itself (4 failures, or either exits), backoff 5–120 s.
+- Task Scheduler restart-on-failure does not fire on a non-zero exit code (found in Rev19 testing), so the supervisor never exits. The tunnel task loops on its own (10 s).
 - Worker host: `asg-health-check.sh` in the user crontab logs up/down changes of `10.90.0.1:8788/healthz`.
 
 ## Single point of failure (fail-closed)
