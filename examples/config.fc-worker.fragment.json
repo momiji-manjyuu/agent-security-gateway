@@ -53,7 +53,8 @@
         "allowed_operations": [
           "submit"
         ],
-        "max_artifact_bytes": 65536
+        "max_artifact_bytes": 65536,
+        "review_injection_as_warning": true
       },
       "output_policy": {
         "block_secrets": true,

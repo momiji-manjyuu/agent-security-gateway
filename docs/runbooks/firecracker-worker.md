@@ -120,3 +120,10 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_s
 - トレードオフ: 注入文がモデルに届くので、モデルが従うリスク (誤った要約、許可ホスト内の余計な fetch) は残る。
   被害はツール無し・秘密無し・許可ホスト限定・出力ガード・使い捨て VM で抑える。結果は常に untrusted。
   既定の通常モードは従来どおり高リスクページをモデル前で止める (警告付きで他ページの情報は返る)。
+
+## Rev19
+- `fc.artifacts.submit` の `artifact_policy.review_injection_as_warning: true` を有効にすると、注入の「説明」のみによる review 判定
+  (prompt_injection / obfuscation、ブロック値未満、秘密・DLP・URL・canary 無し) の回答を `verified_with_warnings` として親へ返す。
+  manifest の `asg_warnings` に `artifact_scan / warned` が必ず付き、taint `describes_untrusted_instructions` が付く。ブロック級はそのまま保留。
+- 出力側スニペット判定の「URL あり」判定は無害化済み URL (`hxxps://`, `[.]`) を数えない。
+- Windows 側アカウント分離・自己修復・SPOF は `setup/windows-service-account/README.md`。
