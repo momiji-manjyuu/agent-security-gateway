@@ -1842,6 +1842,20 @@ def safe_summary_token(value: Any, *, max_chars: int = 64) -> str:
     return cleaned
 
 
+def backend_model_audit_fields(decision: RouteDecision, upstream: Any) -> dict[str, Any]:
+    """Model identity for audit (route-configured model and the model the backend reports). No content."""
+    if decision.route.get("kind") != "openai_chat_completions":
+        return {}
+    backend = decision.route.get("backend", {}) if isinstance(decision.route.get("backend"), dict) else {}
+    fields: dict[str, Any] = {"backend_model": safe_summary_token(str(backend.get("model_rewrite") or backend.get("model") or ""), max_chars=96)}
+    if isinstance(upstream, dict):
+        fields["upstream_model"] = safe_summary_token(upstream.get("model"), max_chars=96)
+        usage = upstream.get("usage")
+        if isinstance(usage, dict):
+            fields["upstream_usage"] = {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if isinstance(usage.get(k), int)}
+    return fields
+
+
 def receipt_report_kind_ja(receipt: dict[str, Any]) -> str:
     message_type = safe_summary_token(receipt.get("message_type"), max_chars=48)
     message_type_labels = {
@@ -3995,6 +4009,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "backend_status": upstream_status,
                     "forward_payload_mode": forward_payload_mode,
                     "output_scan": security.public_scan_for_audit(output_scan, cfg),
+                    **backend_model_audit_fields(decision, upstream),
                 },
             )
             self.write_json(200, receipt if return_receipt else upstream)

@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/asg-fc-worker — launch ONE disposable Firecracker worker, wait for it, destroy it.
+# Invoked by `user` via a single NOPASSWD sudoers rule. Usage: asg-fc-worker <run_id> <task_id>
+# stdin line 1: per-run scoped ASG worker credential; line 2: task spec JSON (task, urls, allowed_hosts, limits, probe_lan).
+# Rev11: guest runs worker_agent.py (agent loop; model only via ASG fc.llm.chat). The credential is written only to a 0400 $ASG_FC_USER-owned MMDS file
+# on tmpfs (/run/asg/<id>), never logged, and removed with the VM. Firecracker itself runs as $ASG_FC_USER (setpriv).
+# Output: one JSON object on stdout. No direct worker<->parent link: the worker's result goes to ASG only;
+# this script relays nothing from the guest except regex-validated status tokens (artifact_id, status, probes).
+set -euo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+# Site settings: root-owned /etc/asg/fc-worker.env (sudo resets the caller env, so callers cannot override these).
+ASG_FC_GOLDEN=/srv/asg/golden/current; ASG_FC_BIN=/srv/asg/bin/firecracker; ASG_FC_USER=asg-orch; ASG_FC_GROUP=asg
+ASG_FC_BRIDGE=asgbr0; ASG_FC_TAP=asgtap-w; ASG_FC_HOST_IP=10.90.0.1; ASG_FC_GUEST_IP=10.90.0.2; ASG_FC_ASG_PORT=8788
+ASG_FC_RUN_ROOT=/run/asg; ASG_FC_LOG_DIR=/srv/asg/logs; ASG_FC_KVM_PERMS=/usr/local/sbin/asg-kvm-perms
+ASG_FC_AGENT=/usr/local/lib/asg/worker_agent.py; ASG_FC_MEM_MIB=2048; ASG_FC_VCPUS=2; ASG_FC_TIMEOUT=300
+if [[ -f /etc/asg/fc-worker.env ]]; then
+  [[ $(stat -c %u /etc/asg/fc-worker.env) == 0 ]] || { echo '{"ok":false,"error":"env_file_not_root_owned"}'; exit 2; }
+  # shellcheck disable=SC1091
+  . /etc/asg/fc-worker.env
+fi
+RUN_ID=${1:-}; TASK_ID=${2:-}
+die(){ printf '{"ok":false,"error":"%s"}\n' "$1"; exit 2; }
+[[ $RUN_ID =~ ^[A-Za-z0-9._-]{1,96}$ ]] || die bad_run_id
+[[ $TASK_ID =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die bad_task_id
+IFS= read -r -t 10 CRED || die no_credential
+CRED=${CRED%$'\r'}
+[[ $CRED =~ ^[A-Za-z0-9_-]{20,128}$ ]] || die bad_credential
+IFS= read -r -t 10 SPEC || die no_spec
+SPEC=${SPEC%$'\r'}
+(( ${#SPEC} <= 16384 )) || die spec_too_large
+TIMEOUT=$ASG_FC_TIMEOUT
+exec 9>"$ASG_FC_RUN_ROOT/fc-worker.lock"; flock -w 400 9 || die busy
+T0=$(date +%s.%N)
+"$ASG_FC_KVM_PERMS"
+G=$(readlink -f "$ASG_FC_GOLDEN"); GVER=$(basename "$G")
+( cd "$G" && sha256sum --quiet -c MANIFEST.sha256 ) || die golden_manifest_mismatch
+T_VERIFY=$(date +%s.%N)
+ID=w-$(date +%Y%m%dT%H%M%S)-$$; RUN=$ASG_FC_RUN_ROOT/$ID; TAP=$ASG_FC_TAP
+install -d -o "$ASG_FC_USER" -g "$ASG_FC_GROUP" -m0700 "$RUN"
+cleanup(){
+  [[ -n ${FC:-} ]] && { kill "$FC" 2>/dev/null || true; sleep 1; kill -9 "$FC" 2>/dev/null || true; wait "$FC" 2>/dev/null || true; }
+  ip link del "$TAP" 2>/dev/null || true
+  [[ -f $RUN/metadata.json ]] && shred -u "$RUN/metadata.json" 2>/dev/null || true
+  rm -rf "$RUN"
+}
+trap cleanup EXIT
+# task drive: the reviewed guest script, padded with newlines to a 4 KiB multiple (raw, read-only virtio-blk)
+ASG_FC_AGENT=$ASG_FC_AGENT python3 - "$RUN/task.img" <<'P'
+import os, sys
+src = open(os.environ["ASG_FC_AGENT"], "rb").read()
+pad = (-len(src)) % 4096 or 0
+open(sys.argv[1], "wb").write(src + b"\n" * (pad + 4096))
+P
+# MMDS (V2, session-token) payload: validated + clipped per-run spec and the scoped ASG credential
+ASG_GUEST_URL=http://$ASG_FC_HOST_IP:$ASG_FC_ASG_PORT ASG_RUN_ID=$RUN_ID ASG_TASK_ID=$TASK_ID ASG_SPEC=$SPEC ASG_CRED=$CRED python3 - "$RUN/metadata.json" <<'P' || die bad_spec
+import ipaddress, json, os, re, sys, urllib.parse
+s = json.loads(os.environ["ASG_SPEC"]); assert isinstance(s, dict)
+task = s.get("task"); assert isinstance(task, str) and 1 <= len(task) <= 4000
+hosts = s.get("allowed_hosts") or []; assert isinstance(hosts, list) and 1 <= len(hosts) <= 10
+for h in hosts:
+    assert isinstance(h, str) and re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", h) and len(h) <= 253
+    assert not h.endswith((".local", ".lan", ".internal", ".home", ".arpa")) and not re.fullmatch(r"[0-9.]+", h)
+urls = s.get("urls") or []; assert isinstance(urls, list) and len(urls) <= 5
+for u in urls:
+    p = urllib.parse.urlsplit(u)
+    assert isinstance(u, str) and len(u) <= 300 and re.fullmatch(r"https://[A-Za-z0-9._~%/?=&+():,-]+", u)
+    assert p.hostname in hosts and not p.username and p.port in (None, 443)
+L = s.get("limits") or {}
+cap = lambda k, d, hi: max(1, min(int(L.get(k, d)), hi))
+limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 1000, 1200),
+          "max_seconds": cap("max_seconds", 180, 240), "page_chars": cap("page_chars", 6000, 8000)}
+probes = s.get("probe_targets") or []; assert isinstance(probes, list) and len(probes) <= 12
+for t in probes:
+    assert isinstance(t, list) and len(t) == 2 and isinstance(t[1], int) and 1 <= t[1] <= 65535
+    ipaddress.IPv4Address(t[0])
+json.dump({"asg": {"run_id": os.environ["ASG_RUN_ID"], "task_id": os.environ["ASG_TASK_ID"], "task": task, "urls": urls,
+                   "allowed_hosts": hosts, "limits": limits, "probe_lan": bool(s.get("probe_lan")), "probe_targets": probes,
+                   "credential": os.environ["ASG_CRED"], "asg_url": os.environ["ASG_GUEST_URL"]}}, open(sys.argv[1], "w"))
+P
+unset CRED SPEC
+cat > "$RUN/vm.json" <<J
+{ "boot-source": { "kernel_image_path": "$G/vmlinux",
+    "boot_args": "console=ttyS0 loglevel=6 reboot=k panic=1 rootfstype=squashfs init=/sbin/overlay-init ip=$ASG_FC_GUEST_IP::$ASG_FC_HOST_IP:255.255.255.0::eth0:off systemd.run=\"/usr/bin/python3 /dev/vdb\" systemd.run_success_action=reboot systemd.run_failure_action=reboot" },
+  "drives": [ { "drive_id": "rootfs", "path_on_host": "$G/rootfs.squashfs", "is_root_device": true, "is_read_only": true },
+              { "drive_id": "task", "path_on_host": "$RUN/task.img", "is_root_device": false, "is_read_only": true } ],
+  "machine-config": { "vcpu_count": $ASG_FC_VCPUS, "mem_size_mib": $ASG_FC_MEM_MIB },
+  "network-interfaces": [ { "iface_id": "eth0", "host_dev_name": "$TAP", "guest_mac": "06:00:0a:5a:00:02" } ],
+  "mmds-config": { "version": "V2", "network_interfaces": ["eth0"] },
+  "entropy": {} }
+J
+chown "$ASG_FC_USER:$ASG_FC_GROUP" "$RUN"/{task.img,metadata.json,vm.json}; chmod 0400 "$RUN"/{task.img,metadata.json,vm.json}
+ip link set "$ASG_FC_BRIDGE" up
+ip link del "$TAP" 2>/dev/null || true
+ip tuntap add dev "$TAP" mode tap user "$ASG_FC_USER"
+ip link set "$TAP" master "$ASG_FC_BRIDGE" up; bridge link set dev "$TAP" isolated on
+SER=$RUN/serial.log; : > "$SER"; chown "$ASG_FC_USER:$ASG_FC_GROUP" "$SER"
+T_BOOT=$(date +%s.%N)
+setpriv --reuid "$ASG_FC_USER" --regid "$ASG_FC_GROUP" --init-groups -- \
+  "$ASG_FC_BIN" --no-api --config-file "$RUN/vm.json" --metadata "$RUN/metadata.json" </dev/null >"$SER" 2>&1 &
+FC=$!
+DONE=0; END=$(( $(date +%s) + TIMEOUT ))
+while (( $(date +%s) < END )); do
+  grep -aq 'ASG_WORKER done' "$SER" && { DONE=1; break; }
+  kill -0 "$FC" 2>/dev/null || break
+  sleep 1
+done
+T_DONE=$(date +%s.%N)
+# give the guest up to 15s to reboot (=> firecracker exits on its own), then force
+for i in $(seq 1 15); do kill -0 "$FC" 2>/dev/null || break; sleep 1; done
+SELF_EXIT=1; kill -0 "$FC" 2>/dev/null && SELF_EXIT=0
+kill "$FC" 2>/dev/null || true; sleep 1; kill -9 "$FC" 2>/dev/null || true; wait "$FC" 2>/dev/null || true; FC=
+LOG=$ASG_FC_LOG_DIR/fc-worker-$ID.log
+{ echo "# $ID run_id=$RUN_ID golden=$GVER"; grep -a 'ASG_WORKER' "$SER" | tr -d '\r' || true; echo "# serial tail"; cat "$SER" | tr -d '\r' || true; } > "$LOG"
+chown "$ASG_FC_USER:$ASG_FC_GROUP" "$LOG"; chmod 0640 "$LOG"
+WLINES=$(grep -a 'ASG_WORKER' "$SER" | tr -d '\r' || true)
+cleanup; trap - EXIT
+T_END=$(date +%s.%N)
+FC_LEFT=$(pgrep -fc "firecracker.*$ID" || true)
+TAP_LEFT=$(ip link show "$TAP" >/dev/null 2>&1 && echo 1 || echo 0)
+RUN_LEFT=$([[ -e $RUN ]] && echo 1 || echo 0)
+ID=$ID GVER=$GVER DONE=$DONE SELF_EXIT=$SELF_EXIT WLINES=$WLINES LOG=$LOG FC_LEFT=$FC_LEFT TAP_LEFT=$TAP_LEFT RUN_LEFT=$RUN_LEFT \
+T0=$T0 T_VERIFY=$T_VERIFY T_BOOT=$T_BOOT T_DONE=$T_DONE T_END=$T_END python3 - <<'P'
+import json, os, re
+e = os.environ; f = lambda k: float(e[k])
+wl = e["WLINES"].splitlines()
+aid = st = submit = None; probes = []; events = []
+for l in wl:
+    m = re.search(r"ASG_WORKER submitted http=200 artifact_id=(art_[a-f0-9]{32}) status=([a-z_]{1,32})$", l)
+    if m: aid, st, submit = m.group(1), m.group(2), "ok"
+    m = re.search(r"ASG_WORKER submit_failed (http=\d{3} code=[a-z_]{0,48}|exc=[A-Za-z]{1,48})$", l)
+    if m: submit = "failed " + m.group(1)
+    m = re.search(r"ASG_WORKER probe ((?:\d{1,3}\.){3}\d{1,3}:\d{1,5}) ([a-zA-Z0-9]{1,12})$", l)
+    if m: probes.append({"target": m.group(1), "result": m.group(2)})
+    m = re.search(r"ASG_WORKER (keyscan hits=\d+ files=\d+(?: first=[A-Za-z0-9/._:-]{0,60})?|neg_llm_[a-z_]+ http=\d{3}(?: code=[a-z_]{0,48})?|llm (?:ok call=\d+ action=[a-z]+|http=\d{3} code=[a-z_]{0,48})|fetch [A-Za-z0-9_]{1,32}(?: host=[a-z0-9.-]{1,80})?|fatal [A-Za-z]{1,48})$", l)
+    if m: events.append(m.group(1))
+print(json.dumps({"ok": e["DONE"] == "1" and aid is not None, "worker_id": e["ID"], "golden": e["GVER"],
+  "artifact_id": aid, "artifact_status_reported_by_worker": st, "submit": submit, "lan_probes": probes, "worker_events": events,
+  "timings_s": {"golden_verify": round(f("T_VERIFY")-f("T0"),2), "boot_to_done": round(f("T_DONE")-f("T_BOOT"),2),
+                "teardown": round(f("T_END")-f("T_DONE"),2), "total": round(f("T_END")-f("T0"),2)},
+  "teardown": {"guest_rebooted_self": e["SELF_EXIT"] == "1", "firecracker_procs_left": int(e["FC_LEFT"] or 0),
+               "tap_left": e["TAP_LEFT"] == "1", "run_dir_left": e["RUN_LEFT"] == "1"},
+  "serial_log": e["LOG"]}))
+P
