@@ -81,5 +81,23 @@ class DropReasoningConfigValidation(unittest.TestCase):
                 gateway.validate_config(bad)
 
 
+class BackendTimeoutCeiling(unittest.TestCase):
+    def test_long_generation_timeout_allowed_but_bounded(self):
+        import tempfile
+        import test_gateway as fixtures
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = fixtures.GatewayTests.make_config(None, tmp.name)
+        rid = next(r for r, v in base["routes"].items() if v.get("kind") == "openai_chat_completions")
+        for ok in (1000, 1800):
+            cfg = copy.deepcopy(base)
+            cfg["routes"][rid].setdefault("backend", {})["timeout_seconds"] = ok
+            gateway.validate_config(cfg)
+        cfg = copy.deepcopy(base)
+        cfg["routes"][rid]["backend"]["timeout_seconds"] = 1801
+        with self.assertRaises(Exception):
+            gateway.validate_config(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()
