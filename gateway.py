@@ -674,6 +674,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
                     for status in statuses:
                         if status not in ARTIFACT_STATUSES:
                             errors.append(f"routes.{route_id}.artifact_policy.allowed_statuses contains invalid status: {status}")
+            if "review_injection_as_warning" in artifact_policy and not isinstance(artifact_policy.get("review_injection_as_warning"), bool):
+                errors.append(f"routes.{route_id}.artifact_policy.review_injection_as_warning must be a boolean")
             if "max_artifact_bytes" in artifact_policy:
                 route_max, route_max_ok = parse_int(artifact_policy.get("max_artifact_bytes"), default=0)
                 if not route_max_ok or route_max <= 0:
@@ -3489,6 +3491,24 @@ def inspect_artifact_content(content: bytes, media_type: str, cfg: dict[str, Any
     }
 
 
+def apply_injection_review_warning(inspection: dict[str, Any], decision: RouteDecision, cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Rev19 (opt-in per route: artifact_policy.review_injection_as_warning): a worker answer that only *describes*
+    injection attempts (review-level prompt_injection/obfuscation findings, nothing blocking, no secret/DLP/URL/canary
+    finding) is released with a mandatory warning instead of being withheld. Anything that blocks stays blocked."""
+    if route_artifact_policy(decision).get("review_injection_as_warning") is not True:
+        return None
+    scan = inspection["scan"]
+    if inspection.get("status") != "needs_review" or inspection.get("reason") != "artifact_scan_requires_review" or scan.blocked:
+        return None
+    active = [f for f in scan.findings if f.severity > 0]
+    if not active or any(not f.category.startswith(("prompt_injection:", "obfuscation:")) for f in active):
+        return None
+    inspection["status"] = "verified"
+    inspection["reason"] = "verified_with_warnings"
+    return {"source": "(worker answer)", "stage": "artifact_scan", "outcome": "warned",
+            "categories": sorted({f.category for f in active}), "max_risk": int(scan.risk_score)}
+
+
 def build_artifact_manifest(
     *,
     request_id: str,
@@ -4170,6 +4190,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 raise GatewayError(413, "request_too_large", "artifact content is too large")
             media_type = normalize_media_type(payload.get("media_type"))
             inspection = inspect_artifact_content(content, media_type, cfg)
+            warned = apply_injection_review_warning(inspection, decision, cfg)
 
             root = artifact_store_root(cfg)
             ensure_artifact_store(root)
@@ -4187,6 +4208,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             write_artifact_manifest(root, manifest)
             write_artifact_index(root, manifest)
             manifest = finalize_artifact_manifest(manifest, inspection, cfg)
+            if warned:
+                manifest["asg_warnings"] = (manifest.get("asg_warnings") or []) + [warned]
+                manifest["taint"] = sorted(set(manifest.get("taint") or []) | {"describes_untrusted_instructions"})
             write_artifact_manifest(root, manifest)
             write_artifact_index(root, manifest)
 

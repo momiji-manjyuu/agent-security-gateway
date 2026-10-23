@@ -1399,6 +1399,8 @@ OUTPUT_SNIPPET_EXTRA_CATEGORIES = frozenset({"output_dlp:local_path", "input_dlp
 CONDITIONAL_SNIPPET_CATEGORIES = frozenset({"prompt_injection:secret_exfiltration", "prompt_injection:ja_secret_exfiltration",
                                             "prompt_injection:local_secret_file_request", "prompt_injection:policy_bypass"})
 SCHEME_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]{1,15}://", re.IGNORECASE)
+# defanged references (hxxp(s)://, host[.]tld) are not navigable destinations and do not count as "has URL"
+DEFANGED_URL_RE = re.compile(r"(?i)\b(?:hxxps?|fxp)://\S+|\S*\[\.\]\S*")
 
 
 def _snippet_pattern(category: str) -> str | None:
@@ -1519,7 +1521,7 @@ def apply_snippet_check(scan: ScanResult, cfg: dict[str, Any], checker: SnippetC
             if budget <= 0:
                 verdicts.append("unknown")
                 break
-            if finding.category in CONDITIONAL_SNIPPET_CATEGORIES and SCHEME_URL_RE.search(snippet):
+            if finding.category in CONDITIONAL_SNIPPET_CATEGORIES and SCHEME_URL_RE.search(DEFANGED_URL_RE.sub(" ", snippet)):
                 verdicts.append("has_url")  # never lowered: a key/secret request next to a URL is treated as real
                 scan.snippet_checks.append({"category": finding.category, "verdict": "has_url",
                                             "snippet_sha256": sha256_text(snippet), "snippet_chars": len(snippet)})
