@@ -88,7 +88,7 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_s
 - **途中で無効にする方法。** 設定で `enabled` を `false` にするか、ランを `test_mode` なしで登録し直す (失効させる)。どちらでも直ちに効く。
 - **spawn_worker 側。** `test_mode` / `decoy_file` / `timeout` / `limits` は運用者のスクリプト専用の引数。MCP ツールは公開スキーマの項目 (task, urls, allowed_hosts, probe_lan) 以外を `unknown_arguments` で拒否する。
 - **(Rev17c) 行動ガードも記録のみ。** 対象ランでは、モデルへ渡す前の行動ガード (`blocked_by_action_guard`) も記録のみになり、`test_mode_action_guard_bypass` を監査する。承認フロー (`approval_required`) とツール欄の拒否は従来どおり有効。
-- **(Rev17c) 証拠ファイル。** `evidence_file` を指定すると、対象ランについて次のものだけを .80 のローカルファイルに保存する (ワーカーにも親にも渡さない)。テスト後に消すか隔離すること。
+- **(Rev17c) 証拠ファイル。** `evidence_file` を指定すると、対象ランについて次のものだけを ゲートウェイホストのローカルファイルに保存する (ワーカーにも親にも渡さない)。テスト後に消すか隔離すること。
   - 入力ガード・行動ガードが本来止めたはずの一致箇所の前後 (最大 600 文字 × 12 件)。
   - 出力ガードが止めたモデル出力 (最大 4000 文字)。
 
