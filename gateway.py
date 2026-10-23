@@ -696,6 +696,15 @@ def validate_config(cfg: dict[str, Any]) -> None:
                         errors.append(f"routes.{route_id}.backend.require_signature requires backend_hmac_key_env")
                     elif not os.environ.get(hmac_env, ""):
                         errors.append(f"routes.{route_id}.backend.require_signature requires environment variable {hmac_env}")
+                if "drop_response_message_fields" in backend:
+                    dropped = backend.get("drop_response_message_fields")
+                    if kind != "openai_chat_completions":
+                        errors.append(f"routes.{route_id}.backend.drop_response_message_fields is only valid on openai_chat_completions routes")
+                    elif not isinstance(dropped, list) or not dropped or any(field not in DROPPABLE_RESPONSE_MESSAGE_FIELDS for field in dropped):
+                        errors.append(
+                            f"routes.{route_id}.backend.drop_response_message_fields must be a non-empty list drawn from "
+                            + ", ".join(sorted(DROPPABLE_RESPONSE_MESSAGE_FIELDS))
+                        )
                 mode = str(backend.get("mode", "http"))
                 if mode not in {"http", "command"}:
                     errors.append(f"routes.{route_id}.backend.mode must be 'http' or 'command'")
@@ -2222,6 +2231,28 @@ def forward_http_json(
         raise GatewayError(502, "backend_error", f"backend request failed: {type(exc).__name__}") from exc
 
 
+# Model "thinking" side channels that some OpenAI-compatible backends return next to message.content.
+# Dropping them (opt-in per route) means the caller never receives them, so the output guard scans
+# exactly what is delivered. The canary check still runs on the full, undropped backend reply first.
+DROPPABLE_RESPONSE_MESSAGE_FIELDS = frozenset({"reasoning_content", "reasoning", "thinking"})
+
+
+def drop_response_message_fields(cfg: dict[str, Any], parsed: dict[str, Any], backend: dict[str, Any]) -> dict[str, Any]:
+    fields = backend.get("drop_response_message_fields")
+    if not isinstance(fields, list) or not fields:
+        return parsed
+    enforce_canary(cfg, parsed, agent_id=None, client_ip="backend", source="backend_response")
+    drop = {field for field in fields if field in DROPPABLE_RESPONSE_MESSAGE_FIELDS}
+    choices = parsed.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            message = choice.get("message") if isinstance(choice, dict) else None
+            if isinstance(message, dict):
+                for field in drop:
+                    message.pop(field, None)
+    return parsed
+
+
 def forward_openai_chat(
     cfg: dict[str, Any],
     payload: dict[str, Any],
@@ -2248,7 +2279,7 @@ def forward_openai_chat(
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 raise GatewayError(502, "backend_error", "backend response was not a JSON object")
-            return response.status, parsed
+            return response.status, drop_response_message_fields(cfg, parsed, backend)
     except (socket.timeout, TimeoutError) as exc:
         raise GatewayError(504, "backend_timeout", "backend request timed out") from exc
     except urllib.error.URLError as exc:
