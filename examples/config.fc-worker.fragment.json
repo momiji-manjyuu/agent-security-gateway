@@ -76,7 +76,10 @@
         "model_rewrite": "main",
         "api_key_env": "ASG_WORKER_LLM_API_KEY",
         "max_tokens": 4096,
-        "timeout_seconds": 240
+        "timeout_seconds": 240,
+        "drop_response_message_fields": [
+          "reasoning_content"
+        ]
       },
       "input_policy": {
         "accepted_taint": [
