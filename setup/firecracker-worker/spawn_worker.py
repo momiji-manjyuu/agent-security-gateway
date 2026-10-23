@@ -154,8 +154,16 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
         aid = orch.get("artifact_id")
         if not (isinstance(aid, str) and ART_RE.match(aid)):
             raise SpawnError("no_artifact " + json.dumps({k: orch.get(k) for k in ("error", "submit", "worker_id", "ok")}) + (" stderr=" + p.stderr.strip()[-200:] if p.stderr.strip() else ""))
-        meta = asg("GET", f"/v1/artifacts/{aid}/metadata", route="security.artifacts.download",
-                   capability="download_artifact", run_id=run_id)
+        try:
+            meta = asg("GET", f"/v1/artifacts/{aid}/metadata", route="security.artifacts.download",
+                       capability="download_artifact", run_id=run_id)
+        except SpawnError as exc:
+            if "artifact_status_denied" not in str(exc):
+                raise
+            # ASG quarantined the answer (needs_review/blocked): nothing from it reaches the parent
+            out.update(status="artifact_withheld", result_untrusted=None, warnings_asg=[],
+                       error="artifact_withheld: ASG kept the worker answer in quarantine (needs review); no content returned")
+            return out
         man = meta.get("manifest", {})
         if man.get("run_id") != run_id or man.get("producer_agent_id") != f"fc_worker@{run_id}":
             raise SpawnError("artifact_scope_mismatch")
