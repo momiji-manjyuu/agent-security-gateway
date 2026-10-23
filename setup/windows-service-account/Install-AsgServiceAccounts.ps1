@@ -55,10 +55,14 @@ icacls $home0 /grant 'asgsvc:(X)' | Out-Null                                   #
 icacls $code  /grant 'asgsvc:(OI)(CI)RX' | Out-Null                            # code: read/execute
 icacls "$code\model_runtime" /grant 'asgsvc:(OI)(CI)M' | Out-Null              # relay log
 icacls $state /grant 'asgsvc:(OI)(CI)M' | Out-Null                             # config, audit, runs, artifacts, logs
+# subdirectories with protected (non-inherited) ACLs need explicit grants; quarantine is deliberately excluded
+Get-ChildItem $state -Directory -Force | Where-Object { $_.Name -ne 'quarantine' -and (Get-Acl $_.FullName).AreAccessRulesProtected } |
+  ForEach-Object { icacls $_.FullName /grant 'asgsvc:(OI)(CI)M' | Out-Null }
 icacls "$state\quarantine" /inheritance:r /grant:r 'User:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' | Out-Null   # never readable by ASG
 icacls "$state\asg-tunnel.ps1" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' | Out-Null      # retired copy
 # tunnel: key owned by asgtun (OpenSSH key permission check), readable only by asgtun/SYSTEM/Administrators
 icacls $tun /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' 'asgtun:(OI)(CI)RX' | Out-Null
+icacls "$tun\known_hosts" /grant 'asgtun:R' | Out-Null
 icacls "$tun\logs" /grant 'asgtun:(OI)(CI)M' | Out-Null
 icacls "$tun\id_ed25519" /setowner asgtun | Out-Null
 icacls "$tun\id_ed25519" /inheritance:r /grant:r 'asgtun:R' 'SYSTEM:F' 'Administrators:F' | Out-Null
