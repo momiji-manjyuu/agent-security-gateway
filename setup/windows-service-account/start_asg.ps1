@@ -3,11 +3,12 @@
 # restart-on-failure does not fire on a non-zero exit code, so the supervisor never relies on it).
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$home0 = 'C:\Users\User'                                   # ASG state/config live under this profile (paths use ~)
-$root  = "$home0\agent-security-gateway"
+. (Join-Path $PSScriptRoot '_site.ps1'); $S = Get-AsgSite
+$home0 = $S.StateHome                                      # ASG state/config live under this profile (paths use ~)
+$root  = $S.CodeDir
 $state = "$home0\.agent-security-gateway\disposable-search"
-$python = 'C:\Program Files\Python312\python.exe'
-$health = 'http://127.0.0.1:8788/healthz'
+$python = $S.PythonExe
+$health = "http://127.0.0.1:$($S.AsgPort)/healthz"
 function Log($m) {
     $f = "$state\supervisor.log"
     if ((Test-Path $f) -and (Get-Item $f).Length -gt 2MB) { Move-Item -Force $f "$f.1" }

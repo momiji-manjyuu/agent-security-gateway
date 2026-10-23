@@ -63,7 +63,7 @@ ASGとの通信はランナーが担当します。子にはASGトークン、�
 
 今回のSSH先はWindowsホストです。`<ユーザー>@<隔離ホストのアドレス>`で接続します。Docker Linuxエンジンを起動し、ホストランナー用のPython 3.13.15を専用フォルダーへ配置しました。WSLのUbuntuは26.04.1 LTSです。子イメージは`python:3.12-slim-bookworm`を使います。
 
-Windowsでの配置例は`C:\Users\User\Documents\disposable-search-agent`、Pythonは`C:\Users\User\Documents\disposable-search-runtime\python.exe`です。自動起動は各ホストで設定します。このリポジトリをコピーするだけでは、OSの起動タスクや認証情報は設定されません。
+Windowsでの配置例は`C:\Users\<operator>\Documents\disposable-search-agent`、Pythonは`C:\Users\<operator>\Documents\disposable-search-runtime\python.exe`です。自動起動は各ホストで設定します。このリポジトリをコピーするだけでは、OSの起動タスクや認証情報は設定されません。
 
 配置先フォルダーを開き、以下を実行します。Windowsでは`python`を実際のPython実行ファイル、Linuxでは必要に応じて`python3`へ読み替えます。
 

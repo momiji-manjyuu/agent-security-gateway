@@ -1,17 +1,18 @@
 # Rev20: deny SSH logins for the ASG service accounts. Run elevated on the ASG host (best as a one-shot SYSTEM task,
 # so an sshd restart cannot kill it). Backs up sshd_config, inserts DenyUsers before the first Match block,
 # validates with sshd -t, restarts sshd, then rolls back unless a fresh admin login creates $Marker within 180 s.
-param([string]$Marker = 'C:\ProgramData\asg\r20-login-ok')
+param([string]$Marker = 'C:\ProgramData\asg\sshd-login-ok', [string[]]$Accounts = @('asgsvc', 'asgtun'))
 $ErrorActionPreference = 'Stop'
-$cfg = 'C:\ProgramData\ssh\sshd_config'; $bak = "$cfg.bak-r20"; $log = 'C:\ProgramData\asg\r20-sshd.log'
+$cfg = 'C:\ProgramData\ssh\sshd_config'; $bak = "$cfg.bak-r20"; $log = 'C:\ProgramData\asg\sshd-denyusers.log'
 function L($m) { Add-Content $log ("{0} {1}" -f (Get-Date -Format s), $m) }
 Remove-Item $Marker -ErrorAction SilentlyContinue
 if (-not (Test-Path $bak)) { Copy-Item $cfg $bak }
 $lines = Get-Content $cfg
 if (-not ($lines -match '^\s*DenyUsers\b')) {
-  $deny = "DenyUsers asgsvc asgtun $($env:COMPUTERNAME.ToLower())\asgsvc $($env:COMPUTERNAME.ToLower())\asgtun"
+  $hn = $env:COMPUTERNAME.ToLower()
+  $deny = 'DenyUsers ' + (($Accounts + ($Accounts | ForEach-Object { "$hn\$_" })) -join ' ')
   $i = [Array]::FindIndex([string[]]$lines, [Predicate[string]] { param($l) $l -match '^\s*Match\s' })
-  if ($i -lt 0) { $lines += $deny } else { $lines = $lines[0..($i - 1)] + '# Rev20: ASG service accounts never log in over SSH' + $deny + '' + $lines[$i..($lines.Count - 1)] }
+  if ($i -lt 0) { $lines += $deny } else { $lines = $lines[0..($i - 1)] + '# ASG service accounts never log in over SSH' + $deny + '' + $lines[$i..($lines.Count - 1)] }
   [IO.File]::WriteAllLines($cfg, [string[]]$lines)
 }
 $t = & "$env:WINDIR\System32\OpenSSH\sshd.exe" -t 2>&1
