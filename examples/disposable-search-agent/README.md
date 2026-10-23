@@ -217,3 +217,11 @@ python tests/smoke_docker.py
 - [Docker: none network](https://docs.docker.com/engine/network/drivers/none/) / [Docker Engine security](https://docs.docker.com/engine/security/)。
 - [OWASP: Prompt Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html) / [SSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)。
 - [Brave Search API](https://api-dashboard.search.brave.com/app/documentation/web-search/get-started)。検索APIの契約・キー設定は別途必要です。
+
+### 検査仲介 (inspector_relay.py) の並行処理と運用ログ
+
+- 接続ごとにスレッドで処理し、上流モデルへの同時呼び出しは `RELAY_CONCURRENCY` (既定 4) 件まで。
+- 1 リクエストの期限 `RELAY_DEADLINE_SECONDS` (既定 45、ASG の inspector timeout より短くする) に待ち時間を含む。上流 1 回の上限は `RELAY_ATTEMPT_SECONDS` (既定 30)。一時的な失敗 (接続・タイムアウト・上流応答の契約違反) は残り時間が `RELAY_MIN_RETRY_SECONDS` (既定 8) 以上あれば 1 回だけ再試行する。
+- 空きが出ない・失敗・不正リクエストはいずれも非 200 で返すため、ASG の `fail_closed` はそのまま効く。
+- ログ `RELAY_LOG` (既定はスクリプトと同じ場所の `inspector_relay.log`、5 MB で 1 世代ローテート) はメタデータのみ: 時刻・所要 ms・待ち ms・状態・試行回数・エラー種別・バイト数/文字数。プロンプトや応答本文は書かない。
+

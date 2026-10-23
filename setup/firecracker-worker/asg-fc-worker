@@ -68,7 +68,7 @@ for u in urls:
     assert p.hostname in hosts and not p.username and p.port in (None, 443)
 L = s.get("limits") or {}
 cap = lambda k, d, hi: max(1, min(int(L.get(k, d)), hi))
-limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 1000, 1200),
+limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 3000, 4096),
           "max_seconds": cap("max_seconds", 180, 240), "page_chars": cap("page_chars", 6000, 8000)}
 probes = s.get("probe_targets") or []; assert isinstance(probes, list) and len(probes) <= 12
 for t in probes:

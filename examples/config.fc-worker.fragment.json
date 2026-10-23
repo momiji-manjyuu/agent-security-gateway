@@ -75,7 +75,7 @@
         "path": "/chat/completions",
         "model_rewrite": "main",
         "api_key_env": "ASG_WORKER_LLM_API_KEY",
-        "max_tokens": 1200,
+        "max_tokens": 4096,
         "timeout_seconds": 240
       },
       "input_policy": {

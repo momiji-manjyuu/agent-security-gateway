@@ -37,7 +37,7 @@
 ## タスク spec の上限 (オーケストレーターが root で検証・切り詰め)
 
 task ≤ 4000 文字 / urls ≤ 5 (https, allowed_hosts 内) / allowed_hosts ≤ 10 (IP リテラル・.local/.lan 等は拒否) /
-max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 1200, max_seconds ≤ 240, page_chars ≤ 8000 / probe_targets ≤ 12。
+max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 4096 (既定 3000), max_seconds ≤ 240, page_chars ≤ 8000 / probe_targets ≤ 12。
 
 ## セキュリティ上の性質
 
@@ -63,3 +63,4 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 1200, max_seconds ≤ 240, 
   - `fc.llm.chat` は `action_policy.read_only_model: true`。ツールを持たないモデル呼び出しなので、アクションガードは承認不可カテゴリ (秘密情報の持ち出し・プライベート/メタデータ宛先・危険なスキーム・検査上限・呼び出し側バックエンド指定) のみ評価する。`tools` 等のフィールドは拒否。
   - `llm_snippet_check`: 下げてよいパターン (tool_escalation, external_write, role_reassignment, hidden_instruction_marker, authority_laundering, long_base64/hex) が発火したとき、該当箇所の前後を非信頼データとして囲み、ツールなしのモデルに instruction / description / unknown を判定させる。description のときだけその所見を 0 にする。unknown・エラーは現状維持。秘密情報・宛先・スキーム・tool_hijack・decoded_instruction 等は下げない。判定は監査ログに (カテゴリ・判定・snippet の sha256・文字数のみ) 記録される。
   - 全文の LLM inspector は従来どおり後段で実行される。
+- 出力切れ対策 (Rev15): モデル応答が `finish_reason=length` で切れた場合、JSON が完結していればそのまま使う。完結していなければ、呼び出し回数と時間 (残り 20 秒以上) に余裕があるときに 1 回だけ「200 語以内で final JSON のみ」と要約を再要求する。それも無理なら、取り出せた部分を `[TRUNCATED: …]` 付きで提出し、フッターに `truncated=1` を付ける。`fc.llm.chat` の `backend.max_tokens` は 4096。
