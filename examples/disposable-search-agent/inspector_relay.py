@@ -17,7 +17,7 @@ import uuid
 
 from contract import BoundaryError, encode, exact_keys, limited_text, load_json, require
 import model_broker
-from model_broker import INSPECTOR_MODEL
+INSPECTOR_MODEL = getattr(model_broker, 'INSPECTOR_MODEL', 'main')  # older brokers hard-code 'main'
 
 
 def _env_int(name, default, low, high):
