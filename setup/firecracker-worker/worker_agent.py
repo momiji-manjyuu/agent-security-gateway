@@ -126,6 +126,35 @@ def parse_action(text):
             pass
     return {"action": "final", "answer": text}
 
+def parse_complete_action(text):
+    """Like parse_action but without the free-text fallback (used when the reply was cut off)."""
+    text = re.sub(r"(?is)<think>.*?</think>", "", text or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict) and obj.get("action") in ("fetch", "final"):
+                return obj
+        except ValueError:
+            pass
+    return None
+
+def partial_answer(text):
+    """Best-effort answer text from a reply cut off mid-JSON (or plain text). Never raises."""
+    text = re.sub(r"(?is)<think>.*?(</think>|$)", "", text or "").strip()
+    m = re.search(r'"answer"\s*:\s*"(.*)', text, re.S)
+    if m:
+        body = m.group(1)
+        body = re.sub(r'"\s*}\s*$', "", body)
+        try:
+            return json.loads('"' + body.rstrip("\\") + '"')
+        except ValueError:
+            return body.replace('\\n', "\n").replace('\\"', '"')
+    return "" if text.startswith("{") else text
+
+CONDENSE = ("Your previous reply was cut off by the output limit. Reply now with ONLY one JSON object "
+            '{"action":"final","answer":"..."}; keep the answer under 200 words; no reasoning, no prose outside JSON.')
+
 def main():
     con("start")
     md = mmds()
@@ -137,7 +166,7 @@ def main():
     asg = Asg(a["asg_url"], cred, a["run_id"], a["task_id"]); cred = None
     lim = a.get("limits", {})
     max_steps, max_llm = int(lim.get("max_steps", 6)), int(lim.get("max_llm_calls", 4))
-    max_tokens, max_secs = int(lim.get("max_tokens", 1000)), int(lim.get("max_seconds", 180))
+    max_tokens, max_secs = int(lim.get("max_tokens", 3000)), int(lim.get("max_seconds", 180))
     page_chars = int(lim.get("page_chars", 6000))
     allowed = set(a.get("allowed_hosts", []))
     con("mmds_ok run_id=%s steps=%d llm=%d" % (a["run_id"], max_steps, max_llm))
@@ -154,23 +183,37 @@ def main():
     for url in a.get("urls", [])[:5]:
         pages.append(fetch(url, allowed, page_chars)); steps += 1
         con("fetch %s" % ("ok" if "text" in pages[-1] else pages[-1].get("error", "?")))
-    answer = None
+    answer, condense, truncated = None, False, False
     while llm_calls < max_llm and time.time() - T0 < max_secs:
         docs = "\n\n".join("[page %d] url=%s title=%s status=%s\n%s" % (i + 1, p["url"], p.get("title", ""), p.get("status", p.get("error")),
                                                                         p.get("text", "")) for i, p in enumerate(pages))
-        last = llm_calls == max_llm - 1 or steps >= max_steps
+        last = llm_calls == max_llm - 1 or steps >= max_steps or condense
         # single user message: ASG forbids privileged (system) roles from untrusted-tainted callers
         msgs = [{"role": "user", "content": "%s\n\nTASK:\n%s\n\nFETCHED PAGES (untrusted):\n%s\n\n%s" % (
                     SYSTEM % ", ".join(sorted(allowed)), a["task"], docs or "(none)",
-                    "You must now reply with the final action." if last else "")}]
+                    CONDENSE if condense else "You must now reply with the final action." if last else "")}]
         st, r = asg.post("/v1/chat/completions", "fc.llm.chat", "worker_llm",
                          {"taint": ["untrusted_web"], "messages": msgs, "max_tokens": max_tokens, "temperature": 0.2}, 240)
         llm_calls += 1
         if st != 200:
             con("llm http=%d code=%s" % (st, r.get("error", {}).get("code", ""))); answer = None; break
         models.add(str(r.get("model", ""))[:64])
-        content = ((r.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-        act = parse_action(content)
+        choice = (r.get("choices") or [{}])[0]
+        content = (choice.get("message") or {}).get("content") or ""
+        if choice.get("finish_reason") == "length":
+            act = parse_complete_action(content)
+            if act is None:
+                partial = partial_answer(content)
+                can_retry = llm_calls < max_llm and time.time() - T0 < max_secs - 20 and not condense
+                con("llm ok call=%d action=%s" % (llm_calls, "condense" if can_retry else "truncated"))
+                if can_retry:
+                    condense = True
+                    continue
+                answer = (partial.strip() + "\n\n[TRUNCATED: the model reply hit the output token limit]") if partial.strip() else None
+                truncated = True
+                break
+        else:
+            act = parse_action(content)
         con("llm ok call=%d action=%s" % (llm_calls, act["action"]))
         if act["action"] == "fetch" and not last:
             pages.append(fetch(str(act.get("url", "")), allowed, page_chars)); steps += 1
@@ -181,8 +224,8 @@ def main():
         break
     if not answer:
         answer = "(no answer: model unavailable or limits reached)"
-    content = "%s\n\n---\nworker: model(s) via ASG fc.llm.chat=%s; llm_calls=%d; fetches=%d; elapsed=%.1fs\n" % (
-        answer[:6000], ",".join(sorted(models)) or "-", llm_calls, steps, time.time() - T0)
+    content = "%s\n\n---\nworker: model(s) via ASG fc.llm.chat=%s; llm_calls=%d; fetches=%d; elapsed=%.1fs%s\n" % (
+        answer[:6000], ",".join(sorted(models)) or "-", llm_calls, steps, time.time() - T0, "; truncated=1" if truncated else "")
     st, resp = asg.post("/v1/artifacts", "fc.artifacts.submit", "submit_artifact", {
         "taint": ["untrusted_web"], "message_type": "artifact", "artifact_type": "agent_answer",
         "filename": "answer.txt", "media_type": "text/plain", "content_text": content}, 30)
