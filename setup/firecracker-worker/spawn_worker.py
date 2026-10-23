@@ -3,7 +3,7 @@
 
 Flow (no direct worker<->parent link; everything content-bearing goes through ASG):
   1. register a short-lived ASG run scope (parent_mcp -> security.runs.register): routes fc.artifacts.submit +
-     security.artifacts.download, callers parent_mcp + fc_worker, TTL 600 s
+     security.artifacts.download, callers parent_mcp + fc_worker, TTL 2700 s (covers a 1800 s run + VM/queue slack)
      The registration carries run_agents={"fc_worker": sha256(fresh token)}: a per-run worker identity
      "fc_worker@<run_id>" valid only for this run_id and only until the run expires or is revoked (Rev13).
   2. ssh <worker host> sudo -n /usr/local/sbin/asg-fc-worker <run_id> <task_id>; the per-run worker
@@ -65,7 +65,7 @@ def asg(method, path, *, route, capability, body=None, run_id=None, raw=False, t
         raise SpawnError(f"asg_http_{e.code}:{code}") from None
 
 
-def register(run_id=None, ttl=600, revoke=False, worker_hash=None):
+def register(run_id=None, ttl=2700, revoke=False, worker_hash=None):
     body = {"route_id": "security.runs.register", "capability": "register_run", "taint": ["trusted_instruction"],
             "ttl_seconds": 1 if revoke else ttl}
     if revoke:
@@ -82,7 +82,7 @@ def register(run_id=None, ttl=600, revoke=False, worker_hash=None):
     return asg("POST", "/v1/runs", route="security.runs.register", capability="register_run", body=body)
 
 
-def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=380, decoy_file=None):
+def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=2400, decoy_file=None):
     if not isinstance(task, str) or not task.strip() or len(task) > 4000:
         raise SpawnError("invalid_task")
     if decoy_file:  # canary drill only: plant a registered decoy credential in the worker's task context
@@ -114,7 +114,7 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
         if provider_key and (provider_key in spec or provider_key in cred):
             raise SpawnError("provider_key_leak_guard")
         provider_key = None
-        p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", HOST90,
+        p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", HOST90,
                             f"sudo -n /usr/local/sbin/asg-fc-worker {run_id} {task_id}"],
                            input=cred + "\n" + spec + "\n", capture_output=True, text=True, timeout=timeout)
         cred = None

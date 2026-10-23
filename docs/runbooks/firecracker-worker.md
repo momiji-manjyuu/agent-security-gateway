@@ -37,7 +37,7 @@
 ## タスク spec の上限 (オーケストレーターが root で検証・切り詰め)
 
 task ≤ 4000 文字 / urls ≤ 5 (https, allowed_hosts 内) / allowed_hosts ≤ 10 (IP リテラル・.local/.lan 等は拒否) /
-max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 4096 (既定 3000), max_seconds ≤ 240, page_chars ≤ 8000 / probe_targets ≤ 12。
+max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_seconds ≤ 1800 (既定 1200), page_chars ≤ 8000 / probe_targets ≤ 12。
 
 ## セキュリティ上の性質
 
@@ -63,5 +63,14 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 4096 (既定 3000), max_sec
   - `fc.llm.chat` は `action_policy.read_only_model: true`。ツールを持たないモデル呼び出しなので、アクションガードは承認不可カテゴリ (秘密情報の持ち出し・プライベート/メタデータ宛先・危険なスキーム・検査上限・呼び出し側バックエンド指定) のみ評価する。`tools` 等のフィールドは拒否。
   - `llm_snippet_check`: 下げてよいパターン (tool_escalation, external_write, role_reassignment, hidden_instruction_marker, authority_laundering, long_base64/hex) が発火したとき、該当箇所の前後を非信頼データとして囲み、ツールなしのモデルに instruction / description / unknown を判定させる。description のときだけその所見を 0 にする。unknown・エラーは現状維持。秘密情報・宛先・スキーム・tool_hijack・decoded_instruction 等は下げない。判定は監査ログに (カテゴリ・判定・snippet の sha256・文字数のみ) 記録される。
   - 全文の LLM inspector は従来どおり後段で実行される。
-- 出力切れ対策 (Rev15): モデル応答が `finish_reason=length` で切れた場合、JSON が完結していればそのまま使う。完結していなければ、呼び出し回数と時間 (残り 20 秒以上) に余裕があるときに 1 回だけ「200 語以内で final JSON のみ」と要約を再要求する。それも無理なら、取り出せた部分を `[TRUNCATED: …]` 付きで提出し、フッターに `truncated=1` を付ける。`fc.llm.chat` の `backend.max_tokens` は 4096。
+- 出力切れ対策 (Rev15): モデル応答が `finish_reason=length` で切れた場合、JSON が完結していればそのまま使う。完結していなければ、呼び出し回数と時間 (残り 20 秒以上) に余裕があるときに 1 回だけ「200 語以内で final JSON のみ」と要約を再要求する。それも無理なら、取り出せた部分を `[TRUNCATED: …]` 付きで提出し、フッターに `truncated=1` を付ける。`fc.llm.chat` の `backend.max_tokens` は 32768。
 - 思考出力の除去 (Rev15): 推論 (thinking) 型のモデルは `message.reasoning_content` に思考過程を返す。ワーカーはこれを使わないが、出力検査は応答全体を見るため、上限を上げて思考が長くなると、システムプロンプトへの言及などで `blocked_by_output_guard` になっていた。`fc.llm.chat` の `backend.drop_response_message_fields: ["reasoning_content"]` を指定すると、ASG はまず未加工の応答全体でカナリア検査を行い、その後で思考欄を取り除く。出力検査は取り除いた後の、実際にワーカーへ渡す内容にかける。指定できるのは `reasoning_content` / `reasoning` / `thinking` だけで (`content` は不可)、対象は `openai_chat_completions` 経路に限る。
+- 長文生成向けの上限 (Rev16):
+  - 出力上限: 既定・上限とも 32768 トークン。
+  - 実行時間: 既定 1200 秒、上限 1800 秒。
+  - モデル 1 回の呼び出し: ワーカーの HTTP タイムアウトは min(1000, 残り時間+15) 秒。ASG の `fc.llm.chat` `backend.timeout_seconds` は 1000。
+  - VM の寿命: `ASG_FC_TIMEOUT=1920`。
+  - spawn_worker: ssh タイムアウト 2400 秒 (`ServerAliveInterval=30` 付き)、ラン TTL 2700 秒。dsh の `toolCallTimeoutMs` は 2460000。
+  - 目安: GLM-5.3-Flash で約 50 トークン/秒、32k トークンで約 11 分。llm-fleet 側は request/attempt timeout 1800 秒、コンテキスト長 500k 以上なので余裕がある。
+  - 手順数とモデル呼び出し回数の上限は変えていない。
+

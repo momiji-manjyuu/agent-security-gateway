@@ -13,7 +13,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 ASG_FC_GOLDEN=/srv/asg/golden/current; ASG_FC_BIN=/srv/asg/bin/firecracker; ASG_FC_USER=asg-orch; ASG_FC_GROUP=asg
 ASG_FC_BRIDGE=asgbr0; ASG_FC_TAP=asgtap-w; ASG_FC_HOST_IP=10.90.0.1; ASG_FC_GUEST_IP=10.90.0.2; ASG_FC_ASG_PORT=8788
 ASG_FC_RUN_ROOT=/run/asg; ASG_FC_LOG_DIR=/srv/asg/logs; ASG_FC_KVM_PERMS=/usr/local/sbin/asg-kvm-perms
-ASG_FC_AGENT=/usr/local/lib/asg/worker_agent.py; ASG_FC_MEM_MIB=2048; ASG_FC_VCPUS=2; ASG_FC_TIMEOUT=300
+ASG_FC_AGENT=/usr/local/lib/asg/worker_agent.py; ASG_FC_MEM_MIB=2048; ASG_FC_VCPUS=2; ASG_FC_TIMEOUT=1920
 if [[ -f /etc/asg/fc-worker.env ]]; then
   [[ $(stat -c %u /etc/asg/fc-worker.env) == 0 ]] || { echo '{"ok":false,"error":"env_file_not_root_owned"}'; exit 2; }
   # shellcheck disable=SC1091
@@ -68,8 +68,8 @@ for u in urls:
     assert p.hostname in hosts and not p.username and p.port in (None, 443)
 L = s.get("limits") or {}
 cap = lambda k, d, hi: max(1, min(int(L.get(k, d)), hi))
-limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 3000, 4096),
-          "max_seconds": cap("max_seconds", 180, 240), "page_chars": cap("page_chars", 6000, 8000)}
+limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 32768, 32768),
+          "max_seconds": cap("max_seconds", 1200, 1800), "page_chars": cap("page_chars", 6000, 8000)}
 probes = s.get("probe_targets") or []; assert isinstance(probes, list) and len(probes) <= 12
 for t in probes:
     assert isinstance(t, list) and len(t) == 2 and isinstance(t[1], int) and 1 <= t[1] <= 65535
