@@ -53,3 +53,5 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 1200, max_seconds ≤ 240, 
 - `python spawn_worker.py --task "..." --url https://example.com/ --probe-lan` → `orchestrator.teardown` が全て空、
   `worker_events` に `keyscan hits=0`、`neg_llm_bad_cred http=401`、`neg_llm_unregistered_run http=403`、LAN プローブは全て timeout。
 - ASG 監査: `run_registration` → `fc.llm.chat allow (backend_model/upstream_model)` → `artifact stored` → 親の download → 失効。
+- canary 演習: 囮ルートはルーティング系エンドポイント (`/v1/tasks` 等) で評価される。`/inspect` はルートを評価しないため囮ルートは発火しない。
+- プロンプトインジェクション演習では、`fc.llm.chat` の入力ガードが公開テストページ (umage-ai canary-pages L1-L4) をモデル到達前に遮断した (risk 11-27)。
