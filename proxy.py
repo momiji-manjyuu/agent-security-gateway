@@ -1397,7 +1397,7 @@ def snippet_check_settings(cfg: dict[str, Any]) -> dict[str, Any]:
 OUTPUT_SNIPPET_EXTRA_CATEGORIES = frozenset({"output_dlp:local_path", "input_dlp:local_path"})
 # ...and these only if the snippet window carries no scheme URL (an instruction to send keys to a URL stays blocked).
 CONDITIONAL_SNIPPET_CATEGORIES = frozenset({"prompt_injection:secret_exfiltration", "prompt_injection:ja_secret_exfiltration",
-                                            "prompt_injection:local_secret_file_request"})
+                                            "prompt_injection:local_secret_file_request", "prompt_injection:policy_bypass"})
 SCHEME_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]{1,15}://", re.IGNORECASE)
 
 
