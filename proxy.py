@@ -1393,6 +1393,20 @@ def snippet_check_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+# Rev18: model-produced text (output guard, worker artifacts) may also lower these when the snippet is descriptive.
+OUTPUT_SNIPPET_EXTRA_CATEGORIES = frozenset({"output_dlp:local_path", "input_dlp:local_path"})
+# ...and these only if the snippet window carries no scheme URL (an instruction to send keys to a URL stays blocked).
+CONDITIONAL_SNIPPET_CATEGORIES = frozenset({"prompt_injection:secret_exfiltration", "prompt_injection:ja_secret_exfiltration",
+                                            "prompt_injection:local_secret_file_request"})
+SCHEME_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]{1,15}://", re.IGNORECASE)
+
+
+def _snippet_pattern(category: str) -> str | None:
+    if category in OUTPUT_SNIPPET_EXTRA_CATEGORIES:
+        return LOCAL_PATH_PATTERN.pattern
+    return _pattern_for(category)
+
+
 def _pattern_for(category: str) -> str | None:
     prefix, _, name = category.partition(":")
     table = PROMPT_INJECTION_PATTERNS if prefix == "prompt_injection" else OBFUSCATION_PATTERNS if prefix == "obfuscation" else []
@@ -1474,13 +1488,18 @@ def parse_snippet_verdict(content: str) -> str:
     return hits[0] if len(hits) == 1 else "unknown"
 
 
-def apply_snippet_check(scan: ScanResult, cfg: dict[str, Any], checker: SnippetChecker | None = None) -> None:
+def apply_snippet_check(scan: ScanResult, cfg: dict[str, Any], checker: SnippetChecker | None = None, *,
+                        model_output: bool = False) -> None:
     settings = snippet_check_settings(cfg)
     if not settings.get("enabled") or not (scan.blocked or scan.requires_review):
+        return
+    if model_output and not settings.get("apply_to_output"):
         return
     if any(f.category.startswith("boundary:") for f in scan.findings):
         return
     allowed = SNIPPET_DOWNGRADABLE_CATEGORIES & {str(c) for c in settings.get("categories") or []}
+    if model_output:
+        allowed = allowed | OUTPUT_SNIPPET_EXTRA_CATEGORIES | CONDITIONAL_SNIPPET_CATEGORIES
     candidates = [f for f in scan.findings if f.category in allowed and f.severity > 0]
     if not candidates:
         return
@@ -1492,13 +1511,18 @@ def apply_snippet_check(scan: ScanResult, cfg: dict[str, Any], checker: SnippetC
     budget = int(settings.get("max_checks", 6))
     lowered: list[Finding] = []
     for finding in candidates:
-        pattern = _pattern_for(finding.category)
+        pattern = _snippet_pattern(finding.category)
         windows = snippet_windows(scan.normalized_text, pattern, int(settings.get("context_chars", 240)),
                                   int(settings.get("max_matches_per_finding", 2))) if pattern else []
         verdicts: list[str] = []
         for snippet, matched in windows:
             if budget <= 0:
                 verdicts.append("unknown")
+                break
+            if finding.category in CONDITIONAL_SNIPPET_CATEGORIES and SCHEME_URL_RE.search(snippet):
+                verdicts.append("has_url")  # never lowered: a key/secret request next to a URL is treated as real
+                scan.snippet_checks.append({"category": finding.category, "verdict": "has_url",
+                                            "snippet_sha256": sha256_text(snippet), "snippet_chars": len(snippet)})
                 break
             budget -= 1
             verdict = checker.ask(snippet, matched, finding.category)

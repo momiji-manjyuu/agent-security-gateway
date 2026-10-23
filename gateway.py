@@ -816,6 +816,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 hard = sorted(set(categories) - security.SNIPPET_DOWNGRADABLE_CATEGORIES)
                 if hard:
                     errors.append("llm_snippet_check.categories may only list downgradable pattern categories: " + ", ".join(hard))
+            if "apply_to_output" in snippet and not isinstance(snippet.get("apply_to_output"), bool):
+                errors.append("llm_snippet_check.apply_to_output must be a boolean")
             for key in ("timeout_seconds", "max_tokens", "context_chars", "max_matches_per_finding", "max_checks"):
                 if key in snippet:
                     value, ok = parse_int(snippet.get(key), default=0)
@@ -823,6 +825,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
                         errors.append(f"llm_snippet_check.{key} must be a positive integer")
 
     validate_test_modes(cfg, errors)
+    validate_quarantined_read(cfg, errors)
     if errors:
         raise ValueError("invalid config: " + "; ".join(errors))
 
@@ -2685,6 +2688,9 @@ def output_text_for_route(payload: dict[str, Any], route_kind: str) -> str:
 def enforce_output_guard(payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> security.ScanResult:
     enforce_canary(cfg, payload, agent_id=None, client_ip="backend", source="backend_response")
     scan = security.output_guard_scan_for_upstream(payload, cfg, None)
+    if decision.route.get("kind") == "openai_chat_completions":
+        relax_fetch_action_url_query(scan, payload, cfg, decision)
+        security.apply_snippet_check(scan, cfg, model_output=True)
     output_policy = decision.route.get("output_policy", {})
     if isinstance(output_policy, dict) and output_policy.get("require_json_object"):
         try:
@@ -3315,6 +3321,7 @@ def public_artifact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     public_fields = (
         "artifact_id",
         "artifact_type",
+        "asg_warnings",
         "content_sha256",
         "created_at",
         "updated_at",
@@ -3445,6 +3452,7 @@ def inspect_artifact_content(content: bytes, media_type: str, cfg: dict[str, Any
         else:
             text_scanned = True
             scan = security.scan_text(text, cfg)
+            security.apply_snippet_check(scan, cfg, model_output=True)  # worker artifacts are model-produced text
             if scan.blocked:
                 status = "blocked"
                 reason = "blocked_by_artifact_scan"
@@ -3528,6 +3536,9 @@ def build_artifact_manifest(
             "scan": security.public_scan_for_audit(scan, cfg),
         },
     }
+    warnings = load_run_warnings(cfg, decision.run_id)
+    if warnings:
+        manifest["asg_warnings"] = warnings  # ASG's own record of risky sources seen in this run (metadata, defanged)
     return manifest
 
 
@@ -3795,6 +3806,209 @@ def write_test_mode_evidence(cfg: dict[str, Any], decision: RouteDecision, reque
         pass
 
 
+# ---- Rev18: quarantined read, run warnings, fetch hosts -------------------------------------------------------
+# quarantined_read (opt-in per run, parent-registered, read-only model routes only): fetched content whose ONLY
+# findings are injection-type (prompt_injection / obfuscation / llm_inspector / local path) and whose risk stays under
+# max_risk_score still reaches the tool-less model, and ASG records a mandatory warning that is attached to the run's
+# artifacts. Secrets, DLP, canary, boundary and every output-side check stay enforced.
+QUARANTINE_CATEGORY_PREFIXES = ("prompt_injection:", "obfuscation:", "llm_inspector:")
+QUARANTINE_EXTRA_CATEGORIES = frozenset({"input_dlp:local_path"})
+FETCH_HOST_PATTERN = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
+PAGE_HEADER_PATTERN = re.compile(r"\[page \d+\] url=(\S+)")
+DEFANG_PREFIX = "\u26a0\ufe0f\u653b\u6483\u306e\u53ef\u80fd\u6027\u3042\u308a\uff08\u958b\u304b\u306a\u3044\u3053\u3068\uff09"
+RUN_WARNINGS_MAX = 20
+
+
+def quarantined_read_settings(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    settings = cfg.get("quarantined_read")
+    if not isinstance(settings, dict) or settings.get("enabled") is not True:
+        return None
+    return settings
+
+
+def validate_quarantined_read(cfg: dict[str, Any], errors: list[str]) -> None:
+    settings = cfg.get("quarantined_read")
+    if settings is None:
+        return
+    if not isinstance(settings, dict):
+        errors.append("quarantined_read must be an object")
+        return
+    if not isinstance(settings.get("enabled", False), bool):
+        errors.append("quarantined_read.enabled must be a boolean")
+    routes = settings.get("routes")
+    configured = cfg.get("routes") or {}
+    if not isinstance(routes, list) or not routes or any(not isinstance(r, str) or r not in configured for r in routes):
+        errors.append("quarantined_read.routes must be a non-empty list of configured routes")
+    else:
+        for r in routes:
+            route = configured[r]
+            policy = route.get("action_policy") if isinstance(route, dict) else None
+            if route.get("kind") != "openai_chat_completions" or not (isinstance(policy, dict) and policy.get("read_only_model") is True):
+                errors.append(f"quarantined_read.routes: '{r}' must be an openai_chat_completions route with action_policy.read_only_model")
+    registrars = settings.get("allowed_registrars")
+    if not isinstance(registrars, list) or not registrars or any(not isinstance(a, str) or a not in (cfg.get("agents") or {}) for a in registrars):
+        errors.append("quarantined_read.allowed_registrars must be a non-empty list of configured agents")
+    risk = settings.get("max_risk_score", 40)
+    if isinstance(risk, bool) or not isinstance(risk, int) or not 1 <= risk <= 200:
+        errors.append("quarantined_read.max_risk_score must be between 1 and 200")
+
+
+def run_read_mode_fields(payload: dict[str, Any], cfg: dict[str, Any], verified: VerifiedAgent, allowed_routes: list[str]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    hosts = payload.get("fetch_hosts")
+    if hosts is not None:
+        if (not isinstance(hosts, list) or len(hosts) > 10
+                or any(not isinstance(h, str) or len(h) > 253 or not FETCH_HOST_PATTERN.fullmatch(h) for h in hosts)):
+            raise GatewayError(400, "invalid_json", "fetch_hosts must be a list of at most 10 lowercase hostnames")
+        fields["fetch_hosts"] = sorted(set(hosts))
+    mode = payload.get("read_mode")
+    if mode is None:
+        return fields
+    if mode != "quarantined":
+        raise GatewayError(400, "invalid_json", "read_mode must be 'quarantined'")
+    settings = quarantined_read_settings(cfg)
+    if settings is None:
+        raise GatewayError(403, "quarantined_read_disabled", "quarantined_read is not enabled in this gateway's config")
+    if verified.agent_id not in set(settings.get("allowed_registrars") or []):
+        raise GatewayError(403, "quarantined_read_denied", f"agent '{verified.agent_id}' may not register quarantined-read runs")
+    routes = sorted(set(allowed_routes) & set(settings.get("routes") or []))
+    if not routes:
+        raise GatewayError(400, "invalid_json", "quarantined read run must allow at least one quarantined_read route")
+    fields.update({"read_mode": "quarantined", "quarantined_routes": routes})
+    return fields
+
+
+def active_quarantined_read(cfg: dict[str, Any], decision: RouteDecision) -> dict[str, Any] | None:
+    settings = quarantined_read_settings(cfg)
+    if settings is None or not decision.run_id or decision.route_id not in set(settings.get("routes") or []):
+        return None
+    policy = decision.route.get("action_policy")
+    if decision.route.get("kind") != "openai_chat_completions" or not (isinstance(policy, dict) and policy.get("read_only_model") is True):
+        return None
+    record, _source = resolve_run_scope_record(cfg, decision.run_id)
+    if not isinstance(record, dict) or record.get("read_mode") != "quarantined":
+        return None
+    if decision.route_id not in set(record.get("quarantined_routes") or []):
+        return None
+    if record.get("created_by") not in set(settings.get("allowed_registrars") or []):
+        return None
+    return settings
+
+
+def quarantine_eligible(scan: Any, settings: dict[str, Any]) -> bool:
+    """Only injection-type findings may be quarantined; anything else (secrets, DLP, private URLs, boundary limits...)
+    keeps blocking. Risk must stay at or under max_risk_score."""
+    for finding in scan.findings:
+        if finding.severity <= 0:
+            continue
+        if not (finding.category.startswith(QUARANTINE_CATEGORY_PREFIXES) or finding.category in QUARANTINE_EXTRA_CATEGORIES):
+            return False
+    return int(scan.risk_score) <= int(settings.get("max_risk_score", 40))
+
+
+def defang_url(url: str) -> str:
+    text = str(url)[:300]
+    match = re.match(r"(?i)^(https?)://([^/?#]*)(.*)$", text)
+    if match:
+        scheme = "hxxps" if match.group(1).lower() == "https" else "hxxp"
+        text = scheme + "://" + match.group(2).replace(".", "[.]") + match.group(3)
+    return DEFANG_PREFIX + text
+
+
+def run_warnings_path(cfg: dict[str, Any]) -> Path:
+    return run_store_path(cfg).parent / "run_warnings.jsonl"
+
+
+def finding_sources(text: str, category: str) -> list[str]:
+    pages = [(m.start(), m.group(1)) for m in PAGE_HEADER_PATTERN.finditer(text or "")]
+    if not pages:
+        return []
+    pattern = _test_mode_pattern(category)
+    if not pattern:
+        return sorted({url for _pos, url in pages})[:5]
+    sources: list[str] = []
+    for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+        before = [url for pos, url in pages if pos <= match.start()]
+        if before and before[-1] not in sources:
+            sources.append(before[-1])
+        if len(sources) >= 3:
+            break
+    return sources
+
+
+def record_run_warning(cfg: dict[str, Any], decision: RouteDecision, stage: str, outcome: str, findings: list[Any],
+                       risk: int, text: str) -> None:
+    """Metadata only (categories, defanged source URLs, risk, outcome); no page content."""
+    if decision.route.get("report_run_warnings") is not True or not decision.run_id:
+        return
+    items = []
+    for finding in findings:
+        if getattr(finding, "severity", 0) <= 0:
+            continue
+        category = str(finding.category)
+        items.append({"category": category, "sources": [defang_url(u) for u in finding_sources(text, category)]})
+    if not items:
+        return
+    record = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "run_id": decision.run_id,
+              "route_id": decision.route_id, "stage": stage, "outcome": outcome, "risk": int(risk), "items": items[:20]}
+    try:
+        append_jsonl_record(run_warnings_path(cfg), record)
+    except OSError:
+        pass
+
+
+def load_run_warnings(cfg: dict[str, Any], run_id: str | None) -> list[dict[str, Any]]:
+    path = run_warnings_path(cfg)
+    if not run_id or not path.exists():
+        return []
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or record.get("run_id") != run_id:
+                continue
+            for item in record.get("items") or []:
+                for source in (item.get("sources") or ["(unattributed)"]):
+                    key = (str(source), str(record.get("stage")), str(record.get("outcome")))
+                    entry = merged.setdefault(key, {"source": key[0], "stage": key[1], "outcome": key[2], "categories": [], "max_risk": 0})
+                    if item.get("category") not in entry["categories"]:
+                        entry["categories"].append(item.get("category"))
+                    entry["max_risk"] = max(entry["max_risk"], int(record.get("risk") or 0))
+    return list(merged.values())[:RUN_WARNINGS_MAX]
+
+
+def relax_fetch_action_url_query(scan: Any, payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> None:
+    """A model reply that is exactly {"action":"fetch","url":...} to a host the parent registered for this run may carry
+    a query string (pagination etc.). Only output_dlp:url_query is dropped; every other URL/DLP finding stays."""
+    policy = decision.route.get("output_policy")
+    if not (isinstance(policy, dict) and policy.get("allow_fetch_query_to_run_hosts") is True) or not decision.run_id:
+        return
+    if not any(f.category == "output_dlp:url_query" for f in scan.findings):
+        return
+    record, _source = resolve_run_scope_record(cfg, decision.run_id)
+    hosts = set(record.get("fetch_hosts") or []) if isinstance(record, dict) else set()
+    if not hosts:
+        return
+    text = re.sub(r"(?is)<think>.*?</think>", "", security.extract_openai_response_text(payload)).strip()
+    try:
+        action = json.loads(text)
+    except json.JSONDecodeError:
+        return
+    if not (isinstance(action, dict) and set(action) == {"action", "url"} and action.get("action") == "fetch" and isinstance(action.get("url"), str)):
+        return
+    parts = urllib.parse.urlsplit(action["url"])
+    if parts.scheme != "https" or parts.username or parts.password or parts.port not in (None, 443) or (parts.hostname or "") not in hosts:
+        return
+    scan.findings = [f for f in scan.findings if f.category != "output_dlp:url_query"]
+    scan.risk_score = sum(f.severity for f in scan.findings)
+    guard = cfg.get("output_guard", {})
+    scan.blocked = scan.risk_score >= int(guard.get("block_risk_score", cfg.get("block_risk_score", 8)))
+    scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", cfg.get("review_risk_score", 4)))
+
+
 def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], verified: VerifiedAgent) -> dict[str, Any]:
     raw_run_id = payload.get("run_id")
     if raw_run_id is None:
@@ -3829,6 +4043,7 @@ def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], 
     if run_agents:
         record["run_agents"] = run_agents  # SHA-256 only; the raw token never reaches the gateway's disk
     record.update(run_test_mode_fields(payload, cfg, verified, allowed_routes, record["reason"], record["expires_at"], now))
+    record.update(run_read_mode_fields(payload, cfg, verified, allowed_routes))
     return record
 
 
@@ -4198,6 +4413,20 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     write_audit(cfg, {"event": "test_mode_input_guard_bypass", "reason": "input_guard_log_only", **event})
                     write_test_mode_evidence(cfg, decision, request_id, "input_guard", text=inbound.scan.normalized_text,
                                              findings=inbound.scan.findings)
+            quarantine = None if test_mode_active else active_quarantined_read(cfg, decision)
+            quarantine_ok = bool(quarantine) and quarantine_eligible(inbound.scan, quarantine)
+            if quarantine_ok:
+                event["read_mode"] = "quarantined"
+                if inbound.scan.blocked or inbound.scan.requires_review:
+                    input_guard_log_only = True
+                    event["input_guard_would_block"] = bool(inbound.scan.blocked)
+                    event["input_guard_would_review"] = bool(inbound.scan.requires_review)
+                    write_audit(cfg, {"event": "quarantined_read_pass", "reason": "quarantined_read", **event})
+            if inbound.scan.risk_score > 0:
+                outcome = ("test_mode_pass" if test_mode_active else "quarantined_pass" if quarantine_ok else "blocked") if (
+                    inbound.scan.blocked or inbound.scan.requires_review) else "allowed"
+                record_run_warning(cfg, decision, "input_guard", outcome, inbound.scan.findings, inbound.scan.risk_score,
+                                   inbound.scan.normalized_text)
             if inbound.scan.blocked and not input_guard_log_only:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
@@ -4252,12 +4481,18 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 except GatewayError as exc:
                     # TEST-ONLY: the pre-model action guard on an opted-in run is log-only too (the model has no tools;
                     # read_only_model routes refuse tool fields regardless). Approval flows are never bypassed.
-                    if not (test_mode_active and exc.code == "blocked_by_action_guard"):
+                    if not ((test_mode_active or quarantine_ok) and exc.code == "blocked_by_action_guard"):
+                        record_run_warning(cfg, decision, "action_guard", "blocked", action.findings, 10, inbound.scan.normalized_text)
                         raise
                     event["action_guard_would_block"] = True
-                    write_audit(cfg, {"event": "test_mode_action_guard_bypass", "reason": "input_guard_log_only", **event})
-                    write_test_mode_evidence(cfg, decision, request_id, "action_guard", text=inbound.scan.normalized_text,
-                                             findings=action.findings)
+                    record_run_warning(cfg, decision, "action_guard", "test_mode_pass" if test_mode_active else "quarantined_pass",
+                                       action.findings, 10, inbound.scan.normalized_text)
+                    if test_mode_active:
+                        write_audit(cfg, {"event": "test_mode_action_guard_bypass", "reason": "input_guard_log_only", **event})
+                        write_test_mode_evidence(cfg, decision, request_id, "action_guard", text=inbound.scan.normalized_text,
+                                                 findings=action.findings)
+                    else:
+                        write_audit(cfg, {"event": "quarantined_read_action_pass", "reason": "quarantined_read", **event})
             except GatewayError as exc:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
@@ -4303,6 +4538,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 if test_mode_active:
                     write_test_mode_evidence(cfg, decision, request_id, "output_guard", findings=[],
                                              output_text=security.extract_openai_response_text(upstream))
+                record_run_warning(cfg, decision, "output_guard", "blocked", output_scan.findings, output_scan.risk_score, "")
                 write_audit(
                     cfg,
                     {
@@ -4441,7 +4677,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             enforce_route_policy(verified, decision, cfg)
             enforce_input_policy(payload, decision)
             record = build_run_registration_record(payload, cfg, verified)
-            scan_payload = {k: v for k, v in payload.items() if k not in ("run_agents", "test_mode")}  # both strictly validated, not free text
+            scan_payload = {k: v for k, v in payload.items() if k not in ("run_agents", "test_mode", "read_mode", "fetch_hosts")}  # both strictly validated, not free text
             inbound = scan_inbound(scan_payload, cfg)
             if inbound.scan.blocked:
                 raise input_guard_error("run registration payload was blocked by input guard", inbound, cfg)
@@ -4460,6 +4696,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     "registered_expires_at": record["expires_at"],
                     "registered_run_agents": sorted(record.get("run_agents") or {}),
                     **({"test_mode": record["test_mode"], "test_mode_routes": record["test_mode_routes"]} if record.get("test_mode") else {}),
+                    **({"read_mode": record["read_mode"], "quarantined_routes": record["quarantined_routes"]} if record.get("read_mode") else {}),
+                    **({"fetch_hosts": record["fetch_hosts"]} if record.get("fetch_hosts") else {}),
                     "reason": record["reason"][:RUN_REASON_MAX_CHARS],
                     "scan": security.public_scan_for_audit(inbound.scan, cfg),
                 },
