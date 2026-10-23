@@ -3700,6 +3700,8 @@ def validate_test_modes(cfg: dict[str, Any], errors: list[str]) -> None:
     registrars = settings.get("allowed_registrars")
     if not isinstance(registrars, list) or not registrars or any(not isinstance(a, str) or a not in (cfg.get("agents") or {}) for a in registrars):
         errors.append("test_modes.input_guard_log_only.allowed_registrars must be a non-empty list of configured agents")
+    if "evidence_file" in settings and not (isinstance(settings["evidence_file"], str) and settings["evidence_file"].strip()):
+        errors.append("test_modes.input_guard_log_only.evidence_file must be a non-empty path string")
     ttl = settings.get("max_ttl_seconds", TEST_MODE_DEFAULT_MAX_TTL)
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 60 <= ttl <= 86400:
         errors.append("test_modes.input_guard_log_only.max_ttl_seconds must be between 60 and 86400")
@@ -3745,6 +3747,52 @@ def active_input_guard_test_mode(cfg: dict[str, Any], decision: RouteDecision) -
         return parse_datetime(str(record.get("expires_at"))) > dt.datetime.now(dt.timezone.utc)
     except (TypeError, ValueError):
         return False
+
+
+TEST_MODE_EVIDENCE_MAX_ITEMS = 12
+TEST_MODE_EVIDENCE_SNIPPET_CHARS = 600
+TEST_MODE_EVIDENCE_OUTPUT_CHARS = 4000
+
+
+def _test_mode_pattern(category: str) -> Any:
+    prefix, _, name = category.partition(":")
+    if prefix in ("prompt_injection", "obfuscation"):
+        return security._pattern_for(category)
+    if prefix == "action_guard":
+        return next((pattern for cat, pattern, _sev, _detail in DANGEROUS_ACTION_PATTERNS if cat == name), None)
+    if category == "input_dlp:local_path":
+        return security.LOCAL_PATH_PATTERN.pattern
+    return None
+
+
+def write_test_mode_evidence(cfg: dict[str, Any], decision: RouteDecision, request_id: str, stage: str, *,
+                             text: str = "", findings: list[Any] = (), output_text: str | None = None) -> None:
+    """TEST-ONLY evidence (Rev17): short matched windows (input/action stages) or the blocked model output, so an
+    operator can study live injections. Written only for opted-in test-mode runs, only if test_modes...evidence_file is
+    set; never sent to the worker or the parent. Contains untrusted text: treat as data."""
+    settings = test_mode_settings(cfg)
+    path = settings.get("evidence_file") if settings else None
+    if not isinstance(path, str) or not path:
+        return
+    items: list[dict[str, Any]] = []
+    for finding in findings:
+        category = str(getattr(finding, "category", ""))
+        pattern = _test_mode_pattern(category)
+        if not pattern:
+            items.append({"category": category, "snippet": None})
+            continue
+        for window, matched in security.snippet_windows(text, pattern, 160, 2):
+            items.append({"category": category, "matched": matched[:200], "snippet": window[:TEST_MODE_EVIDENCE_SNIPPET_CHARS]})
+        if len(items) >= TEST_MODE_EVIDENCE_MAX_ITEMS:
+            break
+    record = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "run_id": decision.run_id,
+              "route_id": decision.route_id, "request_id": request_id, "stage": stage, "items": items[:TEST_MODE_EVIDENCE_MAX_ITEMS]}
+    if output_text is not None:
+        record["output_text"] = output_text[:TEST_MODE_EVIDENCE_OUTPUT_CHARS]
+    try:
+        append_jsonl_record(Path(path), record)
+    except OSError:
+        pass
 
 
 def build_run_registration_record(payload: dict[str, Any], cfg: dict[str, Any], verified: VerifiedAgent) -> dict[str, Any]:
@@ -4140,13 +4188,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             notify_on_block = report_policy_notify_on_block(self.path, decision)
             check_report_receipt_rate_limit(self.path, verified, decision)
             input_guard_log_only = False
-            if active_input_guard_test_mode(cfg, decision):
+            test_mode_active = active_input_guard_test_mode(cfg, decision)
+            if test_mode_active:
                 event["test_mode"] = TEST_MODE_INPUT_GUARD_LOG_ONLY
                 if inbound.scan.blocked or inbound.scan.requires_review:
                     input_guard_log_only = True
                     event["input_guard_would_block"] = bool(inbound.scan.blocked)
                     event["input_guard_would_review"] = bool(inbound.scan.requires_review)
                     write_audit(cfg, {"event": "test_mode_input_guard_bypass", "reason": "input_guard_log_only", **event})
+                    write_test_mode_evidence(cfg, decision, request_id, "input_guard", text=inbound.scan.normalized_text,
+                                             findings=inbound.scan.findings)
             if inbound.scan.blocked and not input_guard_log_only:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
@@ -4196,7 +4247,17 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     self.write_json(403, json_error("manual_review_required", "request requires manual review", request_id))
                 return
             try:
-                enforce_action_guard(cfg, decision, verified, action)
+                try:
+                    enforce_action_guard(cfg, decision, verified, action)
+                except GatewayError as exc:
+                    # TEST-ONLY: the pre-model action guard on an opted-in run is log-only too (the model has no tools;
+                    # read_only_model routes refuse tool fields regardless). Approval flows are never bypassed.
+                    if not (test_mode_active and exc.code == "blocked_by_action_guard"):
+                        raise
+                    event["action_guard_would_block"] = True
+                    write_audit(cfg, {"event": "test_mode_action_guard_bypass", "reason": "input_guard_log_only", **event})
+                    write_test_mode_evidence(cfg, decision, request_id, "action_guard", text=inbound.scan.normalized_text,
+                                             findings=action.findings)
             except GatewayError as exc:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
@@ -4239,6 +4300,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             upstream_status, upstream = self.forward(forward_payload, cfg, decision, verified, request_id=request_id, client_ip=client_ip)
             output_scan = enforce_output_guard(upstream, cfg, decision)
             if output_guard_blocks(output_scan, cfg, decision):
+                if test_mode_active:
+                    write_test_mode_evidence(cfg, decision, request_id, "output_guard", findings=[],
+                                             output_text=security.extract_openai_response_text(upstream))
                 write_audit(
                     cfg,
                     {
