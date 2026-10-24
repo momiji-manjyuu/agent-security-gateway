@@ -41,14 +41,16 @@
 
 - **修正前**: `. /etc/asg/fc-worker.env` で root シェルコードとして実行 (所有 UID のみ確認)。spec 検査は `assert` (`python -O` で消える)。
 - **修正後**: env は **データとして解析** (`load_fc_worker_env`): 既知 `ASG_FC_*` キーのみ・`KEY=VALUE` (前後の任意引用符、値後の空白＋`#` コメントは許可)・展開や置換なし・許可文字集合外は fail-closed。root 所有に加え **ファイルと親ディレクトリが group/other 書込可なら起動拒否**。spec 検査は明示的な if + `bad()` (`SystemExit`) に置換し、ポート表記の例外も明示処理。
+- **フォローアップ修正 (2026-10-24, ??? レビュー指摘)**: 上記パーサの割り当て `case` に `ASG_FC_ASG_PORT` が抜けていた (数値検証 `case` には存在)。その結果、`fc-worker.env.example` (ASG_FC_ASG_PORT=8788) の読み込みが `env_file_invalid: ... unknown key ASG_FC_ASG_PORT` で fail-closed した。割り当て arm (`ASG_FC_ASG_PORT) ASG_FC_ASG_PORT=$value ;;`) を追加。**実際の bash パーサを実行するテスト** を追加 (従来の静的キー集合テストでは「検証されるが割り当てられない」バグは検出できない)。
 
 ## テスト
 
 - 追加/修正した回帰テスト:
   - `tests/test_gateway.py::ReviewFixRegressionTests` — quarantined read で action guard がブロックを維持すること (X-Target-URL が 403 `blocked_by_action_guard`、注入は従来どおり隔離通過)、gc_runs が失効 run の全レコードを削除して復活を防ぐこと・TTL 延長 run を保持すること、per-run モデル呼び出し上限 (429・ガード拒否はカウントしない・run_id 無しは影響なし)・config 検査。
   - `tests/test_guard_tuning.py::SnippetCheckTests` — 全一致の判定 (3 件目の指示で格下げされない)・全件 description なら格下げ・予算超過でフェイルクローズ・判定パーサの完全一致。
-  - `tests/test_fc_worker_agent.py::WorkerAgentRedirectTests` — `url_allowed` 規則・不許可リダイレクト先を送信前に拒否・許可先は追従・fetch が `redirect_not_allowed` を返す・初期 URL 不許可で未接続。`OrchestratorHardeningTests` — env を source しない・権限チェック・assert 不使用・env 例ファイルがパーサ規則に適合。
-- **ローカル結果**: `python -m unittest discover -s tests` — 393 テストのうち、本修正で追加したテストを含め全て成功。失敗は 12 件で **すべて main でも再現する環境起因**:
+  - `tests/test_fc_worker_agent.py::WorkerAgentRedirectTests` — `url_allowed` 規則・不許可リダイレクト先を送信前に拒否・許可先は追従・fetch が `redirect_not_allowed` を返す・初期 URL 不許可で未接続。`OrchestratorHardeningTests` — env を source しない・権限チェック・assert 不使用・env 例ファイルがパーサ規則に適合・**検証 case のキーが全て割り当て case に存在する静的検査 (フォローアップ)**。
+  - `tests/test_fc_worker_agent.py::FcWorkerEnvParserShellTests` (フォローアップ) — `asg-fc-worker` から `load_fc_worker_env` を抽出し **実物の bash で実行**: `fc-worker.env.example` が解析成功し 16 キー全てが (デフォルト無しのクリーンな状態から) 期待値どおり割り当てられること (`ASG_FC_ASG_PORT=8788` を含む)、`ASG_FC_ASG_PORT=9443` / `ASG_FC_TIMEOUT=1234` の上書きが反映されること、不正ファイル (未知キー・非数値ポート・`$(reboot)` 等メタ文字・`=` 無し行) が fail-closed すること。bash が使用不能な環境では skip (CI ubuntu-latest では実行)。
+- **ローカル結果** (フォローアップ後再実行): `python -m unittest discover -s tests` — 394 テスト実行 (シェルテスト class はこのサンドボックスでは bash 不能のため 1 スキップ)、失敗 12 件 (failures 6 + errors 6) は **すべて main でも再現する環境起因** で下記と同一の集合・本修正無関係:
   - `test_canary_ops` (4) / `test_incident_bundle` (5) / `test_asgctl_ops` (2) — `make_private` が icacls `/inheritance:r` でサンドボックス実行ユーザ自身のアクセスを剥がすため (Windows サンドボックス環境固有)。
   - `test_vm_presets::test_render_seed_fills_every_placeholder` — テスト内の bash 呼び出しがこのサンドボックスで使用不能 (シグナルパイプ作成に失敗)。CI (ubuntu-latest) では実行可能。
   - 加えて、このサンドボックスでは `tempfile` が 0700 で作るディレクトリにアクセスできないため、テスト実行時のみ workspace ローカルの `sitecustomize.py` で mkdtemp を置換して確認した (リポジトリには入れない)。

@@ -47,6 +47,7 @@ load_fc_worker_env() {
       ASG_FC_TAP) ASG_FC_TAP=$value ;;
       ASG_FC_HOST_IP) ASG_FC_HOST_IP=$value ;;
       ASG_FC_GUEST_IP) ASG_FC_GUEST_IP=$value ;;
+      ASG_FC_ASG_PORT) ASG_FC_ASG_PORT=$value ;;
       ASG_FC_RUN_ROOT) ASG_FC_RUN_ROOT=$value ;;
       ASG_FC_LOG_DIR) ASG_FC_LOG_DIR=$value ;;
       ASG_FC_KVM_PERMS) ASG_FC_KVM_PERMS=$value ;;

@@ -1,10 +1,21 @@
 """Firecracker worker agent helpers: truncation handling (finish_reason=length) and orchestrator limit caps."""
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "setup" / "firecracker-worker"
+
+# Keys load_fc_worker_env accepts in /etc/asg/fc-worker.env (asg-fc-worker), shared by the
+# static example-file test and the shell parser test so the two cannot drift apart.
+FC_ENV_KEYS = ("ASG_FC_GOLDEN", "ASG_FC_BIN", "ASG_FC_USER", "ASG_FC_GROUP", "ASG_FC_BRIDGE", "ASG_FC_TAP",
+               "ASG_FC_HOST_IP", "ASG_FC_GUEST_IP", "ASG_FC_ASG_PORT", "ASG_FC_RUN_ROOT", "ASG_FC_LOG_DIR",
+               "ASG_FC_KVM_PERMS", "ASG_FC_AGENT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT")
+FC_ENV_NUMERIC_KEYS = ("ASG_FC_ASG_PORT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT")
 
 
 def load_agent():
@@ -84,10 +95,8 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertIn("SystemExit", segment)
 
     def test_fc_worker_env_example_is_parseable_data(self):
-        known = {"ASG_FC_GOLDEN", "ASG_FC_BIN", "ASG_FC_USER", "ASG_FC_GROUP", "ASG_FC_BRIDGE", "ASG_FC_TAP",
-                 "ASG_FC_HOST_IP", "ASG_FC_GUEST_IP", "ASG_FC_ASG_PORT", "ASG_FC_RUN_ROOT", "ASG_FC_LOG_DIR",
-                 "ASG_FC_KVM_PERMS", "ASG_FC_AGENT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT"}
-        numeric = {"ASG_FC_ASG_PORT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT"}
+        known = set(FC_ENV_KEYS)
+        numeric = set(FC_ENV_NUMERIC_KEYS)
         seen = set()
         for n, raw in enumerate((ROOT / "fc-worker.env.example").read_text(encoding="utf-8").splitlines(), 1):
             line = raw.strip()
@@ -105,6 +114,146 @@ class OrchestratorHardeningTests(unittest.TestCase):
                 self.assertRegex(value, r"^[A-Za-z0-9_./:+@%=-]+$", f"line {n}: unsafe value")
             seen.add(key)
         self.assertTrue(seen)
+
+    def test_every_validated_env_key_has_an_assignment_arm(self):
+        # A key listed only in the numeric-validation case is accepted but then dropped into
+        # the assignment case's `*` arm and fails closed as "unknown key" — exactly what
+        # happened to ASG_FC_ASG_PORT. Validation and assignment must stay in sync.
+        text = (ROOT / "asg-fc-worker").read_text(encoding="utf-8")
+        fn = text[text.index("load_fc_worker_env() {"):]
+        fn = fn[:fn.index("\n}\n")]
+        first_case = fn.index("case $key in")
+        second_case = fn.index("case $key in", first_case + 1)
+        validated = set(re.findall(r"ASG_FC_[A-Z0-9_]+", fn[first_case:second_case]))
+        assigned = set(re.findall(r"^\s+(ASG_FC_[A-Z0-9_]+)\) \1=\$value ;;$", fn[second_case:], re.M))
+        self.assertTrue(validated, "numeric validation case not found")
+        self.assertEqual(len(assigned), len(FC_ENV_KEYS), "assignment case does not cover all known keys")
+        self.assertEqual(validated - assigned, set())
+
+
+def _find_working_bash():
+    """Return a bash that can actually run and read repo files, or None. Sandboxed Windows
+    hosts may only ship a WSL stub (or block cygwin's signal pipe), so probe before trusting;
+    ASG_TEST_BASH overrides the search."""
+    repo_script = _bash_path(ROOT / "asg-fc-worker")
+    override = os.environ.get("ASG_TEST_BASH")
+    candidates = ([override] if override else []) + [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        shutil.which("bash") or "",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            # Bytes, not text: a failing bash may print locale-invalid bytes (WSL stub / cygwin).
+            probe = subprocess.run([candidate, "-c", '[[ -f "$1" ]] && printf ok', "probe", repo_script],
+                                   capture_output=True, timeout=30)
+        except OSError:
+            continue
+        if probe.returncode == 0 and probe.stdout.strip() == b"ok":
+            return candidate
+    return None
+
+
+def _bash_path(path) -> str:
+    """MSYS-style path for Git Bash (/c/...); POSIX paths pass through unchanged (CI)."""
+    resolved = str(Path(path).resolve())
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", resolved)
+    return "/{}/{}".format(m.group(1).lower(), m.group(2).replace("\\", "/")) if m else resolved
+
+
+class FcWorkerEnvParserShellTests(unittest.TestCase):
+    """Run the real bash parser (load_fc_worker_env) instead of re-implementing its rules:
+    a static key-set test cannot catch a key that is validated but never assigned, which made
+    fc-worker.env.example fail closed with "unknown key ASG_FC_ASG_PORT"."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = _find_working_bash()
+        if cls.bash is None:
+            raise unittest.SkipTest("no runnable bash that reads repo paths; shell parser test needs bash (runs in CI)")
+        cls.tmp = Path(tempfile.mkdtemp(prefix="asg-fc-env-test-"))
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "tmp", None) is not None:
+            shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def parser_fn(self):
+        text = (ROOT / "asg-fc-worker").read_text(encoding="utf-8")
+        lines = text[text.index("load_fc_worker_env() {"):].split("\n")
+        return "\n".join(lines[:next(i for i, l in enumerate(lines) if l == "}") + 1])
+
+    def run_parser(self, env_file):
+        # The harness starts from a clean slate (no script defaults) so it proves that the
+        # parser itself assigns each key, and reports via `declare -p` (values are charset-
+        # restricted: no quotes/backslashes, so the output is safe to parse back).
+        harness = "\n".join([
+            "set -euo pipefail",
+            self.parser_fn(),
+            'if ! load_fc_worker_env "$1"; then echo PARSE_FAILED; exit 3; fi',
+            "for k in " + " ".join(FC_ENV_KEYS) + "; do",
+            '  if declare -p "$k" >/dev/null 2>&1; then declare -p "$k"; else printf \'UNSET %s\\n\' "$k"; fi',
+            "done",
+        ])
+        harness_path = self.tmp / "harness.sh"
+        harness_path.write_text(harness, encoding="utf-8", newline="\n")
+        return subprocess.run([self.bash, _bash_path(harness_path), _bash_path(env_file)],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+
+    def assigned_values(self, proc):
+        values = {}
+        for line in proc.stdout.splitlines():
+            m = re.fullmatch(r'declare -- (ASG_FC_[A-Z0-9_]+)="(.*)"', line)
+            if m:
+                values[m.group(1)] = m.group(2)
+        return values
+
+    @staticmethod
+    def expected_values(env_path):
+        expected = {}
+        for raw in Path(env_path).read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            value = re.sub(r"\s+#.*$", "", value).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            expected[key] = value
+        return expected
+
+    def test_fc_worker_env_example_parses_and_assigns_every_key(self):
+        proc = self.run_parser(ROOT / "fc-worker.env.example")
+        self.assertEqual(proc.returncode, 0, f"parser rejected the example env file: {proc.stderr.strip()}")
+        # Fails if any key is unknown to the parser (PARSE_FAILED) or validated-but-dropped (UNSET):
+        # before the ASG_FC_ASG_PORT fix this returned "unknown key ASG_FC_ASG_PORT".
+        self.assertEqual(self.assigned_values(proc), self.expected_values(ROOT / "fc-worker.env.example"))
+
+    def test_parser_assigns_override_values_for_numeric_keys(self):
+        env = self.tmp / "override.env"
+        env.write_text("ASG_FC_ASG_PORT=9443\nASG_FC_TIMEOUT=1234\n", encoding="utf-8", newline="\n")
+        proc = self.run_parser(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        got = self.assigned_values(proc)
+        self.assertEqual(got.get("ASG_FC_ASG_PORT"), "9443")
+        self.assertEqual(got.get("ASG_FC_TIMEOUT"), "1234")
+
+    def test_parser_still_fails_closed(self):
+        cases = {
+            "unknown key": "ASG_FC_NOPE=1\n",
+            "non-numeric port": "ASG_FC_ASG_PORT=abc\n",
+            "shell metacharacters": "ASG_FC_GOLDEN=$(reboot)\n",
+            "line without equals": "ASG_FC_ASG_PORT\n",
+        }
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                env = self.tmp / "bad.env"
+                env.write_text(content, encoding="utf-8", newline="\n")
+                proc = self.run_parser(env)
+                self.assertNotEqual(proc.returncode, 0, label)
+                self.assertIn("env_file_invalid", proc.stderr)
 
 
 class WorkerAgentRedirectTests(unittest.TestCase):
