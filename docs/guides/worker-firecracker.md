@@ -7,8 +7,10 @@ Runbooks with full details: [../runbooks/firecracker-golden-image.md](../runbook
    - `setup/firecracker-golden/golden.env.example` → `golden.env`. It sets the bridge, CIDR, pinned kernel/rootfs
      hashes and the Firecracker binary.
    - Run `sudo ./host-setup.sh`, `sudo ./host-network.sh` and `sudo ./host-kvm-perms.sh`.
-   - `host-network.sh` installs the `inet asg` nftables table (`asg-nft.service`). The worker CIDR may reach only
-     `<BRIDGE_IP>:<ASG_PORT>`; LAN, link-local and metadata ranges are dropped.
+   - `host-network.sh` installs the `inet asg` nftables table (`asg-nft.service`). Workers keep general outbound
+     internet access via NAT (no ASG-only egress lockdown, by design); they may also reach `<BRIDGE_IP>:<ASG_PORT>`
+     (the reverse-tunnel endpoint) and, if the ASG hub were hosted on the LAN, `ASG_IP:ASG_PORT`. LAN, link-local,
+     metadata and other special ranges are dropped, and IPv6 is fully blocked.
 2. **Kernel and golden image.**
    - Build as a normal user: `./build-kernel.sh`. Then build as root: `sudo ./build-golden.sh v1`.
    - Sign/verify the image with `sign-manifest.sh` / `verify-manifest.sh`. Test: `sudo ./boot-test.sh v1`.

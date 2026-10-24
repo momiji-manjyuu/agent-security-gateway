@@ -695,6 +695,10 @@ python3 gateway.py --config ~/.agent-security-gateway/config.json gc-runs --dry-
 python3 gateway.py --config ~/.agent-security-gateway/config.json gc-runs
 ```
 
+GC drops every record of a run whose latest record is expired: revoking a run is itself an expiring record, so pruning expired records individually would let an older pre-revocation registration survive and revive the revoked identity.
+
+Per-run model invocations are capped gateway-side (`run_model_quota.enabled`, `run_model_quota.max_model_calls_per_run`, default 200): chat-completions requests that carry a `run_id` count against the run across all such routes, and further calls fail with `run_model_quota_exceeded`. Requests without a `run_id` are unaffected, and only forwarded requests count.
+
 ## Taint Tracking
 
 Requests carry taint in `metadata.taint` or top-level `taint`.

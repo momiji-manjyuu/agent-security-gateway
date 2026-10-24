@@ -148,6 +148,11 @@
       "parent_mcp"
     ],
     "max_risk_score": 40,
-    "_note": "opt-in per run (read_mode=quarantined, operator-only); injection-type findings only; see runbook"
+    "_note": "opt-in per run (read_mode=quarantined, operator-only); injection-type input findings only - the action guard keeps blocking private/metadata/dangerous targets and caller-controlled backends; see runbook"
+  },
+  "run_model_quota": {
+    "enabled": true,
+    "max_model_calls_per_run": 200,
+    "_note": "hard gateway-side per-run cap on model invocations (chat-completions routes with a run_id); restart resets the counter"
   }
 }

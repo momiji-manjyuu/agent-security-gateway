@@ -15,6 +15,7 @@
   "port": 8788,
   "require_known_run_id": true,
   "review_risk_score": 4,
+  "run_model_quota": { "enabled": true, "max_model_calls_per_run": 200 },
   "agents": {
     "mac_gpt55": {
       "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",

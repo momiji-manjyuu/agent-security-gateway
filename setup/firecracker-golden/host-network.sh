@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ホストのネットワーク隔離 (root, 冪等)。nftables `inet asg` テーブルを専用 asg-nft.service で読み込む
-# (Ubuntu の nftables.service とは独立)。方針:
-#  - ワーカー (BRIDGE) → インターネットは NAT で許可
-#  - ワーカー → LAN/RFC1918/特殊アドレスは遮断。例外は ASG_IP:ASG_PORT (tcp) のみ
-#  - ワーカー IPv6 は全遮断、ワーカー → ホスト自身への新規接続も遮断
+# (Ubuntu の nftables.service とは独立)。方針 (docs/guides/reverse-tunnel.md のトンネル構成と整合):
+#  - ワーカー (BRIDGE) → インターネットは NAT で許可 (LAN/RFC1918/特殊アドレス以外)
+#  - ワーカー → BRIDGE_IP:ASG_PORT (tcp) は許可: 逆トンネルの終点 (ssh -R が worker ホストの
+#    BRIDGE_IP:ASG_PORT で待ち受け、ゲートウェイの 127.0.0.1:ASG_PORT へ転送する)
+#  - ワーカー → LAN/RFC1918/特殊アドレスは遮断。ASG ハブを LAN 上で直接運用する場合の例外が
+#    ASG_IP:ASG_PORT (tcp, forward)。トンネル構成では未使用
+#  - ワーカー IPv6 は全遮断、ワーカー → ホスト自身への新規接続も (BRIDGE_IP:ASG_PORT を除き) 遮断
 #  - ホスト → LAN の新規接続は ASG_IP と LAN_GW の DNS/DHCP のみ
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
 CONF=${ASG_GOLDEN_CONF:-$(dirname "$(readlink -f "$0")")/golden.env}; [[ -f $CONF ]] && . "$CONF"
 : "${WAN_IF:?set WAN_IF}" "${LAN_CIDR:?set LAN_CIDR}" "${LAN_GW:?set LAN_GW}" "${ASG_IP:?set ASG_IP}"
-BR=${BRIDGE:-asgbr0}; WNET=${WORKER_CIDR:-10.90.0.0/24}; PORT=${ASG_PORT:-8788}
+BR=${BRIDGE:-asgbr0}; WNET=${WORKER_CIDR:-10.90.0.0/24}; PORT=${ASG_PORT:-8788}; BRIP=${BRIDGE_IP:-10.90.0.1}
 OUT=${NFT_FILE:-/etc/nftables.d/asg.nft}
 install -d "$(dirname "$OUT")"
 TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
@@ -23,6 +26,7 @@ define LAN      = $LAN_CIDR
 define LAN_GW   = $LAN_GW
 define ASG_HUB  = $ASG_IP
 define ASG_PORT = $PORT
+define BRIDGEIP = $BRIP
 table inet asg
 delete table inet asg
 table inet asg {
@@ -34,6 +38,7 @@ table inet asg {
   }
   chain input {
     type filter hook input priority -10; policy accept;
+    iifname \$WBR ip daddr \$BRIDGEIP tcp dport \$ASG_PORT accept
     iifname \$WBR ct state established,related accept
     iifname \$WBR counter drop
   }

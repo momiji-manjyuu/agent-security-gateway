@@ -47,16 +47,17 @@ Firecracker は公式リリースを `sha256sum -c SHA256SUMS` で検証後 `/sr
 
 Ubuntu 標準の `nftables.service` とは独立した `asg-nft.service` が `/etc/nftables.d/asg.nft` (生成物) を読み込みます。
 ufw と共存します (優先度 -10 の別テーブル。ここでの drop は最終)。設定値:
-`WAN_IF`, `BRIDGE`, `WORKER_CIDR`, `LAN_CIDR`, `LAN_BCAST`, `LAN_GW`, `ASG_IP`, `ASG_PORT` (既定 8788)。
+`WAN_IF`, `BRIDGE`, `BRIDGE_IP`, `WORKER_CIDR`, `LAN_CIDR`, `LAN_BCAST`, `LAN_GW`, `ASG_IP`, `ASG_PORT` (既定 8788)。
 例の値は文書用アドレス (192.0.2.0/24) なので **必ず自環境の値に置き換えてください**。
 
 | 通信 | 扱い |
 |---|---|
-| ワーカー → インターネット (IPv4) | NAT (masquerade) で許可 |
-| ワーカー → `ASG_IP:ASG_PORT` (tcp) | 許可 (LAN 唯一の例外) |
+| ワーカー → インターネット (IPv4) | NAT (masquerade) で許可 (ASG-only への egress 制限は意図的に入れない) |
+| ワーカー → `BRIDGE_IP:ASG_PORT` (tcp, input) | 許可: 逆トンネルの終点 (docs/guides/reverse-tunnel.md) |
+| ワーカー → `ASG_IP:ASG_PORT` (tcp) | 許可: ASG ハブを LAN 上で直接運用する場合の例外 (トンネル構成では未使用) |
 | ワーカー → LAN / RFC1918 / 100.64/10 / 169.254/16 / ループバック / マルチキャスト等 | 遮断 |
 | ワーカー IPv6 | 全遮断 |
-| ワーカー → ホスト自身 (新規) | 遮断 (ゲスト DNS は公開リゾルバを使う) |
+| ワーカー → ホスト自身 (新規) | 遮断 (`BRIDGE_IP:ASG_PORT` のみ例外。ゲスト DNS は公開リゾルバを使う) |
 | ホスト → LAN (新規) | `ASG_IP` と `LAN_GW` の DNS(53)/DHCP(67) のみ |
 | ホスト IPv6 | `lo` 以外遮断 (sysctl でも無効化) |
 

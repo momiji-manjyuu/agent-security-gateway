@@ -69,6 +69,21 @@
         }
       ]
     },
+    "run_model_quota": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_model_calls_per_run": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 200
+        }
+      }
+    },
     "artifact_store": {
       "type": "object",
       "additionalProperties": true,

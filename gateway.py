@@ -239,6 +239,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "path": str(DEFAULT_RUN_STORE),
         "max_ttl_seconds": DEFAULT_RUN_MAX_TTL_SECONDS,
     },
+    # Hard per-run cap on model invocations, enforced gateway-side (worker-side limits are advisory only).
+    # Counted per run_id across all chat-completions routes; requests without a run_id are not affected.
+    "run_model_quota": {
+        "enabled": True,
+        "max_model_calls_per_run": 200,
+    },
     "artifact_store": {
         "path": str(DEFAULT_ARTIFACT_STORE),
         "max_artifact_bytes": 10_485_760,
@@ -553,6 +559,20 @@ def validate_config(cfg: dict[str, Any]) -> None:
         max_ttl, max_ttl_ok = parse_int(run_store.get("max_ttl_seconds", DEFAULT_RUN_MAX_TTL_SECONDS), default=DEFAULT_RUN_MAX_TTL_SECONDS)
         if not max_ttl_ok or max_ttl <= 0:
             errors.append("run_store.max_ttl_seconds must be a positive integer")
+    quota = cfg.get("run_model_quota")
+    if quota is not None:
+        if not isinstance(quota, dict):
+            errors.append("run_model_quota must be an object")
+        else:
+            if "enabled" in quota and not isinstance(quota.get("enabled"), bool):
+                errors.append("run_model_quota.enabled must be a boolean")
+            raw_max_calls = quota.get("max_model_calls_per_run", 200)
+            if isinstance(raw_max_calls, bool):
+                errors.append("run_model_quota.max_model_calls_per_run must be a positive integer")
+            else:
+                max_calls, max_calls_ok = parse_int(raw_max_calls, default=200)
+                if not max_calls_ok or max_calls <= 0:
+                    errors.append("run_model_quota.max_model_calls_per_run must be a positive integer")
     artifact_store = cfg.get("artifact_store", {})
     if artifact_store is not None and not isinstance(artifact_store, dict):
         errors.append("artifact_store must be an object")
@@ -820,11 +840,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
                     errors.append("llm_snippet_check.categories may only list downgradable pattern categories: " + ", ".join(hard))
             if "apply_to_output" in snippet and not isinstance(snippet.get("apply_to_output"), bool):
                 errors.append("llm_snippet_check.apply_to_output must be a boolean")
-            for key in ("timeout_seconds", "max_tokens", "context_chars", "max_matches_per_finding", "max_checks"):
+            for key in ("timeout_seconds", "max_tokens", "context_chars", "max_checks"):
                 if key in snippet:
                     value, ok = parse_int(snippet.get(key), default=0)
                     if not ok or value <= 0:
                         errors.append(f"llm_snippet_check.{key} must be a positive integer")
+            # max_matches_per_finding is no longer used (lowering now requires checking every match up to
+            # max_checks, fail closed); it is still accepted so existing configs keep validating.
 
     validate_test_modes(cfg, errors)
     validate_quarantined_read(cfg, errors)
@@ -1609,6 +1631,70 @@ def run_store_max_ttl_seconds(cfg: dict[str, Any]) -> int:
     return DEFAULT_RUN_MAX_TTL_SECONDS
 
 
+# Per-run quota on model invocations. Worker-side limits (max_llm_calls et al.) are advisory: a compromised
+# or buggy worker can ignore them, so the gateway enforces a hard cap per run_id. Counted in-memory across
+# all chat-completions routes of the run; a gateway restart resets it and run expiry bounds the window.
+RUN_MODEL_CALLS_LOCK = threading.Lock()
+RUN_MODEL_CALLS: dict[str, int] = {}
+RUN_MODEL_CALL_LAST_SEEN: dict[str, float] = {}
+RUN_MODEL_CALLS_MAX_KEYS = 4096
+RUN_MODEL_CALL_TTL_SECONDS = DEFAULT_RUN_MAX_TTL_SECONDS
+
+
+def run_model_quota_settings(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    quota = cfg.get("run_model_quota")
+    if not isinstance(quota, dict) or quota.get("enabled") is not True:
+        return None
+    max_calls, ok = parse_int(quota.get("max_model_calls_per_run", 200), default=200)
+    if not ok or max_calls <= 0:
+        return None
+    return {"max_model_calls_per_run": max_calls}
+
+
+def route_is_model_call(decision: RouteDecision) -> bool:
+    """A caller-initiated model invocation: a chat-completions route attributed to a run."""
+    return decision.route.get("kind") == "openai_chat_completions" and bool(decision.run_id)
+
+
+def enforce_run_model_quota(cfg: dict[str, Any], decision: RouteDecision) -> None:
+    """Deny model invocations once the run's quota is exhausted. Runs after route/authorization policy so
+    authorization errors stay authoritative, and before any guard work or the forward itself."""
+    if not route_is_model_call(decision):
+        return
+    settings = run_model_quota_settings(cfg)
+    if settings is None:
+        return
+    with RUN_MODEL_CALLS_LOCK:
+        used = RUN_MODEL_CALLS.get(decision.run_id, 0)
+    if used >= settings["max_model_calls_per_run"]:
+        raise GatewayError(
+            429,
+            "run_model_quota_exceeded",
+            f"run '{decision.run_id}' reached its model call quota ({settings['max_model_calls_per_run']})",
+        )
+
+
+def record_run_model_call(decision: RouteDecision) -> None:
+    """Count one model invocation for the run (only requests that are actually forwarded count)."""
+    if not route_is_model_call(decision):
+        return
+    now = time.monotonic()
+    with RUN_MODEL_CALLS_LOCK:
+        if len(RUN_MODEL_CALLS) >= RUN_MODEL_CALLS_MAX_KEYS and decision.run_id not in RUN_MODEL_CALLS:
+            cutoff = now - RUN_MODEL_CALL_TTL_SECONDS
+            for run_id in [r for r, seen in RUN_MODEL_CALL_LAST_SEEN.items() if seen < cutoff]:
+                RUN_MODEL_CALLS.pop(run_id, None)
+                RUN_MODEL_CALL_LAST_SEEN.pop(run_id, None)
+            while len(RUN_MODEL_CALLS) >= RUN_MODEL_CALLS_MAX_KEYS:
+                oldest = min(RUN_MODEL_CALL_LAST_SEEN, key=RUN_MODEL_CALL_LAST_SEEN.get, default=None)
+                if oldest is None:
+                    break
+                RUN_MODEL_CALLS.pop(oldest, None)
+                RUN_MODEL_CALL_LAST_SEEN.pop(oldest, None)
+        RUN_MODEL_CALLS[decision.run_id] = RUN_MODEL_CALLS.get(decision.run_id, 0) + 1
+        RUN_MODEL_CALL_LAST_SEEN[decision.run_id] = now
+
+
 def append_jsonl_record(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
@@ -1720,44 +1806,57 @@ def run_record_expired(record: Any, now: dt.datetime) -> tuple[bool, str]:
     return expires_at < now, run_id if isinstance(run_id, str) else ""
 
 
-def split_run_store_for_gc(path: Path, now: dt.datetime) -> tuple[list[str], dict[str, Any]]:
-    kept_lines: list[str] = []
-    scanned = 0
-    expired = 0
-    skipped = 0
-    expired_run_ids: list[str] = []
+def split_run_store_for_gc(path: Path, now: dt.datetime, cfg: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    """Collect the lines GC keeps, plus the expiry summary.
+
+    Revoking a dynamic run is itself a run-store record: re-register the run_id with a short TTL and
+    "latest record wins" makes the identity dead (spawn_worker revoke, expiry). Pruning each expired
+    record individually would delete the revocation record while an older, still-unexpired registration
+    of the same run_id survived - and verification would then resolve to that older record and revive the
+    revoked credential. So a run_id whose LATEST valid record is expired has ALL of its records dropped:
+    nothing of a dead run survives GC. Records of runs whose latest record is still valid are kept, and
+    unparseable/invalid lines are kept (fail closed)."""
     if not path.exists():
-        return kept_lines, {
-            "scanned_records": 0,
-            "expired_records": 0,
-            "skipped_records": 0,
-            "expired_run_ids": [],
-        }
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            stripped = line.strip()
-            if not stripped:
-                kept_lines.append(line)
-                continue
-            scanned += 1
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                skipped += 1
-                kept_lines.append(line)
-                continue
-            is_expired, run_id = run_record_expired(record, now)
-            if is_expired:
-                expired += 1
-                if run_id:
-                    expired_run_ids.append(run_id)
-                continue
-            kept_lines.append(line if line.endswith("\n") else line + "\n")
+        return [], {"scanned_records": 0, "expired_records": 0, "skipped_records": 0, "expired_run_ids": []}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    scanned = 0
+    skipped = 0
+    latest: dict[str, dict[str, Any]] = {}
+    parsed: list[tuple[str, dict[str, Any] | None]] = []
+    for line in lines:
+        if not line.strip():
+            parsed.append((line, None))
+            continue
+        scanned += 1
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            parsed.append((line, None))
+            continue
+        record = record if isinstance(record, dict) else None
+        parsed.append((line, record))
+        if record is not None:
+            normalized = normalize_dynamic_run_record(record, cfg)
+            if normalized is not None:
+                latest[normalized["run_id"]] = normalized
+    dead_runs: set[str] = set()
+    for run_id, record in latest.items():
+        expired, _ = run_record_expired(record, now)
+        if expired:
+            dead_runs.add(run_id)
+    kept_lines: list[str] = []
+    expired_records = 0
+    for line, record in parsed:
+        if record is not None and isinstance(record.get("run_id"), str) and record["run_id"] in dead_runs:
+            expired_records += 1
+            continue
+        kept_lines.append(line if line.endswith("\n") else line + "\n")
     return kept_lines, {
         "scanned_records": scanned,
-        "expired_records": expired,
+        "expired_records": expired_records,
         "skipped_records": skipped,
-        "expired_run_ids": expired_run_ids,
+        "expired_run_ids": sorted(dead_runs),
     }
 
 
@@ -1769,7 +1868,7 @@ def gc_runs(cfg: dict[str, Any], *, dry_run: bool = False, now: dt.datetime | No
     now = now.astimezone(dt.timezone.utc)
     deleted_records = 0
     if dry_run:
-        _, counts = split_run_store_for_gc(path, now)
+        _, counts = split_run_store_for_gc(path, now, cfg)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.with_name(path.name + ".lock")
@@ -1781,7 +1880,7 @@ def gc_runs(cfg: dict[str, Any], *, dry_run: bool = False, now: dt.datetime | No
                         os.chmod(lock_path, stat.S_IRUSR | stat.S_IWUSR)
                     except FileNotFoundError:
                         pass
-                    kept_lines, counts = split_run_store_for_gc(path, now)
+                    kept_lines, counts = split_run_store_for_gc(path, now, cfg)
                     deleted_records = counts["expired_records"]
                     tmp = path.with_name(path.name + ".tmp")
                     with tmp.open("w", encoding="utf-8") as fh:
@@ -4410,6 +4509,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             decision = resolve_route_decision(self.headers, payload, cfg)
             self.check_rate_limit(cfg, verified, decision, client_ip)
             enforce_route_policy(verified, decision, cfg)
+            enforce_run_model_quota(cfg, decision)
             enforce_input_policy(payload, decision)
             message_type = payload_message_type(payload)
             inbound = scan_inbound_for_route(payload, cfg, decision)
@@ -4507,20 +4607,21 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 try:
                     enforce_action_guard(cfg, decision, verified, action)
                 except GatewayError as exc:
-                    # TEST-ONLY: the pre-model action guard on an opted-in run is log-only too (the model has no tools;
+                    # TEST-ONLY: the pre-model action guard on an opted-in run is log-only (the model has no tools;
                     # read_only_model routes refuse tool fields regardless). Approval flows are never bypassed.
-                    if not ((test_mode_active or quarantine_ok) and exc.code == "blocked_by_action_guard"):
+                    # Quarantined read is deliberately NOT an exception: quarantined routes are read-only-model
+                    # routes, so every surviving action-guard finding is a boundary violation (private/LAN URL,
+                    # metadata endpoint, dangerous scheme, caller-controlled backend, inspection limit, secret
+                    # exfiltration). None of those are injection/quarantine-related, so quarantined_read keeps
+                    # blocking them (only the INPUT guard has a quarantine exception, per quarantine_eligible).
+                    if not (test_mode_active and exc.code == "blocked_by_action_guard"):
                         record_run_warning(cfg, decision, "action_guard", "blocked", action.findings, 10, inbound.scan.normalized_text)
                         raise
                     event["action_guard_would_block"] = True
-                    record_run_warning(cfg, decision, "action_guard", "test_mode_pass" if test_mode_active else "quarantined_pass",
-                                       action.findings, 10, inbound.scan.normalized_text)
-                    if test_mode_active:
-                        write_audit(cfg, {"event": "test_mode_action_guard_bypass", "reason": "input_guard_log_only", **event})
-                        write_test_mode_evidence(cfg, decision, request_id, "action_guard", text=inbound.scan.normalized_text,
-                                                 findings=action.findings)
-                    else:
-                        write_audit(cfg, {"event": "quarantined_read_action_pass", "reason": "quarantined_read", **event})
+                    record_run_warning(cfg, decision, "action_guard", "test_mode_pass", action.findings, 10, inbound.scan.normalized_text)
+                    write_audit(cfg, {"event": "test_mode_action_guard_bypass", "reason": "input_guard_log_only", **event})
+                    write_test_mode_evidence(cfg, decision, request_id, "action_guard", text=inbound.scan.normalized_text,
+                                             findings=action.findings)
             except GatewayError as exc:
                 receipt, delivery = self.maybe_deliver_block_receipt(
                     cfg,
@@ -4560,6 +4661,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 message_type=message_type,
             )
             forward_payload = receipt if forward_receipt else payload
+            record_run_model_call(decision)
             upstream_status, upstream = self.forward(forward_payload, cfg, decision, verified, request_id=request_id, client_ip=client_ip)
             output_scan = enforce_output_guard(upstream, cfg, decision)
             if output_guard_blocks(output_scan, cfg, decision):
