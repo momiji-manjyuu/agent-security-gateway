@@ -48,8 +48,8 @@
   - `tests/test_gateway.py::ReviewFixRegressionTests` — quarantined read で action guard がブロックを維持すること (X-Target-URL が 403 `blocked_by_action_guard`、注入は従来どおり隔離通過)、gc_runs が失効 run の全レコードを削除して復活を防ぐこと・TTL 延長 run を保持すること、per-run モデル呼び出し上限 (429・ガード拒否はカウントしない・run_id 無しは影響なし)・config 検査。
   - `tests/test_guard_tuning.py::SnippetCheckTests` — 全一致の判定 (3 件目の指示で格下げされない)・全件 description なら格下げ・予算超過でフェイルクローズ・判定パーサの完全一致。
   - `tests/test_fc_worker_agent.py::WorkerAgentRedirectTests` — `url_allowed` 規則・不許可リダイレクト先を送信前に拒否・許可先は追従・fetch が `redirect_not_allowed` を返す・初期 URL 不許可で未接続。`OrchestratorHardeningTests` — env を source しない・権限チェック・assert 不使用・env 例ファイルがパーサ規則に適合。
-- **ローカル結果**: `python -m unittest discover -s tests` — 385 テストのうち、本修正で追加したテストを含め全て成功。失敗は 11 件で **すべて main でも再現する環境起因**:
-  - `test_canary_ops` / `test_incident_bundle` / `test_asgctl_ops` — `make_private` が icacls `/inheritance:r` でサンドボックス実行ユーザ自身のアクセスを剥がすため (Windows サンドボックス環境固有)。
+- **ローカル結果**: `python -m unittest discover -s tests` — 393 テストのうち、本修正で追加したテストを含め全て成功。失敗は 12 件で **すべて main でも再現する環境起因**:
+  - `test_canary_ops` (4) / `test_incident_bundle` (5) / `test_asgctl_ops` (2) — `make_private` が icacls `/inheritance:r` でサンドボックス実行ユーザ自身のアクセスを剥がすため (Windows サンドボックス環境固有)。
   - `test_vm_presets::test_render_seed_fills_every_placeholder` — テスト内の bash 呼び出しがこのサンドボックスで使用不能 (シグナルパイプ作成に失敗)。CI (ubuntu-latest) では実行可能。
   - 加えて、このサンドボックスでは `tempfile` が 0700 で作るディレクトリにアクセスできないため、テスト実行時のみ workspace ローカルの `sitecustomize.py` で mkdtemp を置換して確認した (リポジトリには入れない)。
 - `config.example.json` / `schemas/config.schema.json` / `examples/config.fc-worker.fragment.json` に `run_model_quota` を追加し `validate-config` 成功。
