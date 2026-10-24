@@ -1657,7 +1657,8 @@ def route_is_model_call(decision: RouteDecision) -> bool:
 
 
 def enforce_run_model_quota(cfg: dict[str, Any], decision: RouteDecision) -> None:
-    """Deny model invocations once the run's quota is exhausted (checked before any guard work or forward)."""
+    """Deny model invocations once the run's quota is exhausted. Runs after route/authorization policy so
+    authorization errors stay authoritative, and before any guard work or the forward itself."""
     if not route_is_model_call(decision):
         return
     settings = run_model_quota_settings(cfg)
@@ -4507,8 +4508,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             verified = verify_agent(self.headers, cfg, client_ip)
             decision = resolve_route_decision(self.headers, payload, cfg)
             self.check_rate_limit(cfg, verified, decision, client_ip)
-            enforce_run_model_quota(cfg, decision)
             enforce_route_policy(verified, decision, cfg)
+            enforce_run_model_quota(cfg, decision)
             enforce_input_policy(payload, decision)
             message_type = payload_message_type(payload)
             inbound = scan_inbound_for_route(payload, cfg, decision)
