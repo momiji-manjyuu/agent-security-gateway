@@ -72,13 +72,43 @@ def page_text(body):
     body = re.sub(r"(?is)<(script|style|noscript|svg|head)[^>]*>.*?</\1>", " ", body)
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body))).strip()
 
+
+def url_allowed(u, allowed_hosts):
+    """https://<allowed host>, no userinfo, default or 443 port only. Malformed syntax is never allowed."""
+    try:
+        return u.scheme == "https" and (u.hostname or "") in allowed_hosts and not u.username and u.port in (None, 443)
+    except ValueError:
+        return False
+
+
+class RedirectNotAllowed(Exception):
+    """A redirect target failed the same allowlist check as a directly requested URL."""
+
+
+class AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib follows redirects internally, so every target must be validated BEFORE the request is sent:
+    checking only the final geturl() afterwards would still have contacted the disallowed host."""
+
+    def __init__(self, allowed_hosts):
+        self.allowed_hosts = allowed_hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not url_allowed(urllib.parse.urlsplit(newurl), self.allowed_hosts):
+            raise RedirectNotAllowed(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_opener(allowed_hosts):
+    return urllib.request.build_opener(AllowlistRedirectHandler(allowed_hosts))
+
+
 def fetch(url, allowed_hosts, max_chars):
     u = urllib.parse.urlsplit(url)
-    if u.scheme != "https" or (u.hostname or "") not in allowed_hosts or u.username or u.port not in (None, 443):
+    if not url_allowed(u, allowed_hosts):
         return {"url": url, "error": "not_allowed", "host": re.sub(r"[^a-z0-9.-]", "", (u.hostname or "?").lower())[:80]}
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) asg-fc-worker/2"})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with fetch_opener(allowed_hosts).open(req, timeout=20) as r:
             if (urllib.parse.urlsplit(r.geturl()).hostname or "") not in allowed_hosts:
                 return {"url": url, "error": "redirect_not_allowed"}
             body = r.read(1024 * 1024).decode("utf-8", "replace")
@@ -86,6 +116,8 @@ def fetch(url, allowed_hosts, max_chars):
         m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
         return {"url": url, "status": status, "title": page_text(m.group(1))[:200] if m else "",
                 "text": page_text(body)[:max_chars]}
+    except RedirectNotAllowed:
+        return {"url": url, "error": "redirect_not_allowed"}
     except urllib.error.HTTPError as e:
         return {"url": url, "error": "http_%d" % e.code}
     except Exception as e:  # noqa: BLE001

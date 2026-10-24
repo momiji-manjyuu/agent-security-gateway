@@ -14,10 +14,59 @@ ASG_FC_GOLDEN=/srv/asg/golden/current; ASG_FC_BIN=/srv/asg/bin/firecracker; ASG_
 ASG_FC_BRIDGE=asgbr0; ASG_FC_TAP=asgtap-w; ASG_FC_HOST_IP=10.90.0.1; ASG_FC_GUEST_IP=10.90.0.2; ASG_FC_ASG_PORT=8788
 ASG_FC_RUN_ROOT=/run/asg; ASG_FC_LOG_DIR=/srv/asg/logs; ASG_FC_KVM_PERMS=/usr/local/sbin/asg-kvm-perms
 ASG_FC_AGENT=/usr/local/lib/asg/worker_agent.py; ASG_FC_MEM_MIB=2048; ASG_FC_VCPUS=2; ASG_FC_TIMEOUT=1920
+# Parse the root-owned env file as DATA, never source it: a hostile or corrupt line must not execute as
+# root. Only known ASG_FC_* keys, plain KEY=VALUE lines (optional surrounding quotes, optional comment
+# after whitespace, like the example file); no expansion, substitution or shell metacharacters - any
+# other line fails closed. Keep this function defined before its first use (die() comes later).
+load_fc_worker_env() {
+  local file=$1 line key value n=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+    key=${line%%=*}
+    if [[ $key == "$line" ]]; then echo "env_file_invalid: line $n has no '='" >&2; return 1; fi
+    value=${line#*=}
+    if [[ $value =~ ^(.*[^[:space:]])[[:space:]]+#.*$ ]]; then value=${BASH_REMATCH[1]}; fi
+    if [[ ${#value} -ge 2 && ( $value == \"*\" || $value == \'*\' ) ]]; then value=${value:1:${#value}-2}; fi
+    if [[ ! $key =~ ^ASG_FC_[A-Z0-9_]+$ ]]; then echo "env_file_invalid: line $n bad key" >&2; return 1; fi
+    case $key in
+      ASG_FC_ASG_PORT|ASG_FC_MEM_MIB|ASG_FC_VCPUS|ASG_FC_TIMEOUT)
+        [[ $value =~ ^[0-9]+$ ]] || { echo "env_file_invalid: line $n $key must be numeric" >&2; return 1; } ;;
+      *)
+        if [[ -z $value || $value == -* || ! $value =~ ^[A-Za-z0-9_./:+@%=-]+$ ]]; then
+          echo "env_file_invalid: line $n $key has forbidden characters" >&2; return 1
+        fi ;;
+    esac
+    case $key in
+      ASG_FC_GOLDEN) ASG_FC_GOLDEN=$value ;;
+      ASG_FC_BIN) ASG_FC_BIN=$value ;;
+      ASG_FC_USER) ASG_FC_USER=$value ;;
+      ASG_FC_GROUP) ASG_FC_GROUP=$value ;;
+      ASG_FC_BRIDGE) ASG_FC_BRIDGE=$value ;;
+      ASG_FC_TAP) ASG_FC_TAP=$value ;;
+      ASG_FC_HOST_IP) ASG_FC_HOST_IP=$value ;;
+      ASG_FC_GUEST_IP) ASG_FC_GUEST_IP=$value ;;
+      ASG_FC_ASG_PORT) ASG_FC_ASG_PORT=$value ;;
+      ASG_FC_RUN_ROOT) ASG_FC_RUN_ROOT=$value ;;
+      ASG_FC_LOG_DIR) ASG_FC_LOG_DIR=$value ;;
+      ASG_FC_KVM_PERMS) ASG_FC_KVM_PERMS=$value ;;
+      ASG_FC_AGENT) ASG_FC_AGENT=$value ;;
+      ASG_FC_MEM_MIB) ASG_FC_MEM_MIB=$value ;;
+      ASG_FC_VCPUS) ASG_FC_VCPUS=$value ;;
+      ASG_FC_TIMEOUT) ASG_FC_TIMEOUT=$value ;;
+      *) echo "env_file_invalid: line $n unknown key $key" >&2; return 1 ;;
+    esac
+  done < "$file"
+}
 if [[ -f /etc/asg/fc-worker.env ]]; then
-  [[ $(stat -c %u /etc/asg/fc-worker.env) == 0 ]] || { echo '{"ok":false,"error":"env_file_not_root_owned"}'; exit 2; }
-  # shellcheck disable=SC1091
-  . /etc/asg/fc-worker.env
+  ENVF=/etc/asg/fc-worker.env
+  [[ $(stat -c %u "$ENVF") == 0 ]] || { echo '{"ok":false,"error":"env_file_not_root_owned"}'; exit 2; }
+  # root must be the only writer (file and parent dir): a root-owned but group/other-writable
+  # file would let a non-root user inject config into a root process.
+  [[ $(( 8#$(stat -c %a "$ENVF") & 8#022 )) -eq 0 ]] || { echo '{"ok":false,"error":"env_file_writable_by_others"}'; exit 2; }
+  [[ $(( 8#$(stat -c %a "${ENVF%/*}") & 8#022 )) -eq 0 ]] || { echo '{"ok":false,"error":"env_dir_writable_by_others"}'; exit 2; }
+  load_fc_worker_env "$ENVF" || { echo '{"ok":false,"error":"env_file_invalid"}'; exit 2; }
 fi
 RUN_ID=${1:-}; TASK_ID=${2:-}
 die(){ printf '{"ok":false,"error":"%s"}\n' "$1"; exit 2; }
@@ -54,26 +103,62 @@ open(sys.argv[1], "wb").write(src + b"\n" * (pad + 4096))
 P
 # MMDS (V2, session-token) payload: validated + clipped per-run spec and the scoped ASG credential
 ASG_GUEST_URL=http://$ASG_FC_HOST_IP:$ASG_FC_ASG_PORT ASG_RUN_ID=$RUN_ID ASG_TASK_ID=$TASK_ID ASG_SPEC=$SPEC ASG_CRED=$CRED python3 - "$RUN/metadata.json" <<'P' || die bad_spec
+# Explicit checks only (never assert: python -O would drop them and skip validation entirely).
 import ipaddress, json, os, re, sys, urllib.parse
-s = json.loads(os.environ["ASG_SPEC"]); assert isinstance(s, dict)
-task = s.get("task"); assert isinstance(task, str) and 1 <= len(task) <= 4000
-hosts = s.get("allowed_hosts") or []; assert isinstance(hosts, list) and 1 <= len(hosts) <= 10
+
+def bad(msg):
+    raise SystemExit("bad_spec:" + msg)
+
+s = json.loads(os.environ["ASG_SPEC"])
+if not isinstance(s, dict):
+    bad("spec_type")
+task = s.get("task")
+if not isinstance(task, str) or not 1 <= len(task) <= 4000:
+    bad("task")
+hosts = s.get("allowed_hosts") or []
+if not isinstance(hosts, list) or not 1 <= len(hosts) <= 10:
+    bad("allowed_hosts")
 for h in hosts:
-    assert isinstance(h, str) and re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", h) and len(h) <= 253
-    assert not h.endswith((".local", ".lan", ".internal", ".home", ".arpa")) and not re.fullmatch(r"[0-9.]+", h)
-urls = s.get("urls") or []; assert isinstance(urls, list) and len(urls) <= 5
+    if not isinstance(h, str) or not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", h) or len(h) > 253:
+        bad("allowed_host")
+    if h.endswith((".local", ".lan", ".internal", ".home", ".arpa")) or re.fullmatch(r"[0-9.]+", h):
+        bad("allowed_host")
+urls = s.get("urls") or []
+if not isinstance(urls, list) or len(urls) > 5:
+    bad("urls")
 for u in urls:
+    if not isinstance(u, str) or len(u) > 300 or not re.fullmatch(r"https://[A-Za-z0-9._~%/?=&+():,-]+", u):
+        bad("url")
     p = urllib.parse.urlsplit(u)
-    assert isinstance(u, str) and len(u) <= 300 and re.fullmatch(r"https://[A-Za-z0-9._~%/?=&+():,-]+", u)
-    assert p.hostname in hosts and not p.username and p.port in (None, 443)
+    try:
+        port_ok = p.port in (None, 443)
+    except ValueError:
+        port_ok = False
+    if p.hostname not in hosts or p.username is not None or not port_ok:
+        bad("url")
 L = s.get("limits") or {}
-cap = lambda k, d, hi: max(1, min(int(L.get(k, d)), hi))
+if not isinstance(L, dict):
+    bad("limits")
+def cap(k, d, hi):
+    v = L.get(k, d)
+    if isinstance(v, bool) or not isinstance(v, int):
+        bad("limit_" + k)
+    return max(1, min(v, hi))
 limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 32768, 32768),
           "max_seconds": cap("max_seconds", 1200, 1800), "page_chars": cap("page_chars", 6000, 8000)}
-probes = s.get("probe_targets") or []; assert isinstance(probes, list) and len(probes) <= 12
+probes = s.get("probe_targets") or []
+if not isinstance(probes, list) or len(probes) > 12:
+    bad("probe_targets")
 for t in probes:
-    assert isinstance(t, list) and len(t) == 2 and isinstance(t[1], int) and 1 <= t[1] <= 65535
-    ipaddress.IPv4Address(t[0])
+    if not isinstance(t, list) or len(t) != 2:
+        bad("probe_target")
+    addr, port = t
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535 or not isinstance(addr, str):
+        bad("probe_target")
+    try:
+        ipaddress.IPv4Address(addr)
+    except ipaddress.AddressValueError:
+        bad("probe_target")
 json.dump({"asg": {"run_id": os.environ["ASG_RUN_ID"], "task_id": os.environ["ASG_TASK_ID"], "task": task, "urls": urls,
                    "allowed_hosts": hosts, "limits": limits, "probe_lan": bool(s.get("probe_lan")), "probe_targets": probes,
                    "credential": os.environ["ASG_CRED"], "asg_url": os.environ["ASG_GUEST_URL"]}}, open(sys.argv[1], "w"))

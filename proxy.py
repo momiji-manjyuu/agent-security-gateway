@@ -217,8 +217,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "no_think": True,
     },
     # Snippet intent check: when a downgradable pattern fires, ask a tool-less model whether the matched snippet is an
-    # instruction aimed at the agent or a description. It can only LOWER downgradable pattern findings; unknown/error
-    # keeps the pattern judgment. Endpoint fields default to llm_inspector's.
+    # instruction aimed at the agent or a description. It can only LOWER downgradable pattern findings, and only when
+    # EVERY match of the pattern was checked (within max_checks) and all were descriptions; anything unchecked or
+    # ambiguous keeps the pattern judgment. unknown/error keeps the pattern judgment. Endpoint fields default to
+    # llm_inspector's.
     "llm_snippet_check": {
         "enabled": False,
         "base_url": None,
@@ -229,7 +231,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_tokens": 256,
         "no_think": True,
         "context_chars": 240,
-        "max_matches_per_finding": 2,
         "max_checks": 6,
         "categories": [
             "prompt_injection:tool_escalation",
@@ -1484,10 +1485,12 @@ class SnippetChecker:
 
 
 def parse_snippet_verdict(content: str) -> str:
-    text = re.sub(r"(?is)<think>.*?</think>", " ", content or "").strip().lower()
-    words = set(re.findall(r"[a-z]+", text))
-    hits = [verdict for verdict in SNIPPET_VERDICTS if verdict in words]
-    return hits[0] if len(hits) == 1 else "unknown"
+    """Exact single-word parser. The model is asked for exactly one verdict word, so anything else -
+    a negation such as 'not a description', extra prose, several verdict words, or an unclosed think
+    tag - is 'unknown' and keeps the original pattern judgment (fail closed)."""
+    text = re.sub(r"(?is)<think>.*?</think>", " ", content or "")
+    text = text.strip().strip("`'\" \t\r\n.!?").lower()
+    return text if text in SNIPPET_VERDICTS else "unknown"
 
 
 def apply_snippet_check(scan: ScanResult, cfg: dict[str, Any], checker: SnippetChecker | None = None, *,
@@ -1514,13 +1517,20 @@ def apply_snippet_check(scan: ScanResult, cfg: dict[str, Any], checker: SnippetC
     lowered: list[Finding] = []
     for finding in candidates:
         pattern = _snippet_pattern(finding.category)
-        windows = snippet_windows(scan.normalized_text, pattern, int(settings.get("context_chars", 240)),
-                                  int(settings.get("max_matches_per_finding", 2))) if pattern else []
+        if not pattern:
+            continue
+        # Ask about EVERY match of the pattern, not just the first two: lowering requires that all of
+        # a finding's matches were checked and all are descriptions. Extract one window beyond the
+        # budget so "more matches than we can verify" is detected and fails closed.
+        windows = snippet_windows(scan.normalized_text, pattern, int(settings.get("context_chars", 240)), budget + 1)
+        if not windows:
+            continue
+        if len(windows) > budget:
+            # More matches than the remaining check budget can verify: keep the finding (fail closed)
+            # instead of lowering it on a partial sample an attacker can hide an instruction behind.
+            continue
         verdicts: list[str] = []
         for snippet, matched in windows:
-            if budget <= 0:
-                verdicts.append("unknown")
-                break
             if finding.category in CONDITIONAL_SNIPPET_CATEGORIES and SCHEME_URL_RE.search(DEFANGED_URL_RE.sub(" ", snippet)):
                 verdicts.append("has_url")  # never lowered: a key/secret request next to a URL is treated as real
                 scan.snippet_checks.append({"category": finding.category, "verdict": "has_url",
