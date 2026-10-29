@@ -31,3 +31,12 @@
      restarts, and rolls back on failure.
    - Run modes: `python scripts/asg_run_modes.py --config <cfg> --show`.
 6. **Never.** Bind non-loopback, disable guards, or keep test mode on outside a test session.
+
+7. **Changing the model endpoint.**
+   - The gateway's `llm_inspector` goes through `model_runtime\inspector_relay.py`, which reads `MODEL_BROKER_HOST` /
+     `MODEL_BROKER_PORT` from `asg-env.json`. If that endpoint has no live backend, the inspector fails closed and EVERY
+     input is reported as `llm_inspector:error` (blocked).
+   - `start_asg.ps1` reads `asg-env.json` once when it starts. Killing only the gateway/relay makes the supervisor restart
+     them with the OLD environment; after editing `asg-env.json` run `Stop-ScheduledTask` / `Start-ScheduledTask`
+     on the gateway task (`AgentSecurityGateway`) so the supervisor itself restarts.
+   - Check with `asg_inspect` on a harmless sentence (expect `blocked: false`) and an injection sentence (expect `blocked: true`).

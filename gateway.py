@@ -251,7 +251,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retention_days": DEFAULT_ARTIFACT_RETENTION_DAYS,
     },
     "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
-    "require_known_run_id": False,
+    "require_known_run_id": True,
     "agents": {},
     "routes": {
         "security.inspect_only": {
@@ -1146,8 +1146,13 @@ def enforce_run_scope(decision: RouteDecision, cfg: dict[str, Any], agent_id: st
         return
     if not isinstance(run, dict):
         raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' has invalid policy")
-    if "expires_at" in run and parse_datetime(str(run["expires_at"])) < dt.datetime.now(dt.timezone.utc):
-        raise GatewayError(403, "run_expired", f"run_id '{run_id}' is expired")
+    if "expires_at" in run:
+        try:
+            expired = parse_datetime(str(run["expires_at"])) < dt.datetime.now(dt.timezone.utc)
+        except (TypeError, ValueError):
+            raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' has an invalid expires_at") from None
+        if expired:
+            raise GatewayError(403, "run_expired", f"run_id '{run_id}' is expired")
     denied_routes = set(str(item) for item in run.get("denied_routes") or [])
     if decision.route_id in denied_routes:
         raise GatewayError(403, "run_scope_denied", f"run_id '{run_id}' denies route '{decision.route_id}'")
@@ -1521,8 +1526,13 @@ def action_guard(headers: Any, payload: dict[str, Any], cfg: dict[str, Any] | No
     normalized, removed = security.normalize_untrusted_text(content, effective_cfg)
     if removed["truncated"] or len(content) > int(effective_cfg.get("normalize", {}).get("max_content_chars", 40_000)):
         findings.append(security.Finding("action_guard:inspection_limit", 10, "complete action exceeds inspection limit"))
-    normalized += "\n" + "\n".join(security.normalize_untrusted_text(text, effective_cfg)[0]
-                                    for text in security.multipart_texts(payload))
+    part_texts = []
+    for text in security.multipart_texts(payload):
+        part_normalized, part_removed = security.normalize_untrusted_text(text, effective_cfg)
+        if part_removed["truncated"]:
+            findings.append(security.Finding("action_guard:inspection_limit", 10, "complete action exceeds inspection limit"))
+        part_texts.append(part_normalized)
+    normalized += "\n" + "\n".join(part_texts)
 
     if header_value(headers, "X-Target-URL"):
         findings.append(security.Finding("action_guard:caller_controlled_backend", 10, "X-Target-URL is not allowed"))
@@ -4112,19 +4122,34 @@ def relax_fetch_action_url_query(scan: Any, payload: dict[str, Any], cfg: dict[s
     if not hosts:
         return
     text = re.sub(r"(?is)<think>.*?</think>", "", security.extract_openai_response_text(payload)).strip()
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        # json.loads keeps the last duplicate; a worker parser may keep the first, so refuse the ambiguity.
+        keys = [key for key, _value in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate key")
+        return dict(pairs)
+
     try:
-        action = json.loads(text)
-    except json.JSONDecodeError:
+        action = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except ValueError:  # JSONDecodeError is a ValueError
         return
     if not (isinstance(action, dict) and set(action) == {"action", "url"} and action.get("action") == "fetch" and isinstance(action.get("url"), str)):
         return
     parts = urllib.parse.urlsplit(action["url"])
     if parts.scheme != "https" or parts.username or parts.password or parts.port not in (None, 443) or (parts.hostname or "") not in hosts:
         return
+    # Drop findings only when the verified URL is the sole URL-with-query in everything that was scanned
+    # (think blocks, other choices, reasoning fields included); otherwise a second query URL would be hidden.
+    query_urls = [m.group(0) for m in security.URL_PATTERN.finditer(scan.normalized_text) if urllib.parse.urlsplit(m.group(0)).query]
+    if not query_urls or any(url != action["url"] for url in query_urls):
+        return
     scan.findings = [f for f in scan.findings if f.category != "output_dlp:url_query"]
     scan.risk_score = sum(f.severity for f in scan.findings)
     guard = cfg.get("output_guard", {})
-    scan.blocked = scan.risk_score >= int(guard.get("block_risk_score", cfg.get("block_risk_score", 8)))
+    # Recompute from what remains, but keep the reasons a score threshold does not express (incomplete inspection).
+    inspection_incomplete = any(f.category == "boundary:scan_limit" for f in scan.findings)
+    scan.blocked = inspection_incomplete or scan.risk_score >= int(guard.get("block_risk_score", cfg.get("block_risk_score", 8)))
     scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", cfg.get("review_risk_score", 4)))
 
 
