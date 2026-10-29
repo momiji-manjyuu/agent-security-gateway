@@ -151,7 +151,11 @@ ARTIFACT_REVIEW_MAX_CLAIMS = 12
 ARTIFACT_REVIEW_MAX_FLAGS = 20
 ARTIFACT_REVIEW_MAX_FIELD_CHARS = 500
 ARTIFACT_REVIEW_DEFAULT_MAX_CHARS = 40_000
-ARTIFACT_STATUSES = {"unchecked", "verified", "needs_review", "blocked"}
+ARTIFACT_STATUSES = {"unchecked", "verified", "verified_with_warnings", "needs_review", "blocked"}
+# Prefixes of review-level findings a route may release with a warning (artifact_policy.warning_release_categories).
+# "obfuscation:" is deliberately NOT a default: encoded blobs are the classic smuggling channel.
+WARNING_RELEASE_CATEGORY_PREFIXES = ("prompt_injection:", "obfuscation:")
+DEFAULT_WARNING_RELEASE_CATEGORIES = ("prompt_injection:",)
 ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-f0-9]{32}$")
 ARTIFACT_SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 ARTIFACT_PARTITION_PATTERN = re.compile(r"^\d{4}/\d{2}/\d{2}$")
@@ -696,6 +700,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
                             errors.append(f"routes.{route_id}.artifact_policy.allowed_statuses contains invalid status: {status}")
             if "review_injection_as_warning" in artifact_policy and not isinstance(artifact_policy.get("review_injection_as_warning"), bool):
                 errors.append(f"routes.{route_id}.artifact_policy.review_injection_as_warning must be a boolean")
+            if "warning_release_categories" in artifact_policy:
+                categories = artifact_policy.get("warning_release_categories")
+                if (not isinstance(categories, list) or not categories
+                        or any(item not in WARNING_RELEASE_CATEGORY_PREFIXES for item in categories)):
+                    errors.append(f"routes.{route_id}.artifact_policy.warning_release_categories must be a non-empty array of: "
+                                  + ", ".join(WARNING_RELEASE_CATEGORY_PREFIXES))
             if "max_artifact_bytes" in artifact_policy:
                 route_max, route_max_ok = parse_int(artifact_policy.get("max_artifact_bytes"), default=0)
                 if not route_max_ok or route_max <= 0:
@@ -2996,6 +3006,7 @@ def ensure_artifact_store(root: Path) -> None:
         "manifests",
         "quarantine/unchecked",
         "quarantine/verified",
+        "quarantine/verified_with_warnings",
         "quarantine/needs_review",
         "quarantine/blocked",
     ):
@@ -3600,19 +3611,32 @@ def inspect_artifact_content(content: bytes, media_type: str, cfg: dict[str, Any
     }
 
 
+def artifact_warning_eligible(scan: Any, prefixes: tuple[str, ...]) -> bool:
+    """Review-level findings only, all of them in the allowed categories (no secret/DLP/URL/canary/normalization finding)."""
+    if scan.blocked:
+        return False
+    active = [f for f in scan.findings if f.severity > 0]
+    return bool(active) and all(f.category.startswith(prefixes) for f in active)
+
+
 def apply_injection_review_warning(inspection: dict[str, Any], decision: RouteDecision, cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Rev19 (opt-in per route: artifact_policy.review_injection_as_warning): a worker answer that only *describes*
-    injection attempts (review-level prompt_injection/obfuscation findings, nothing blocking, no secret/DLP/URL/canary
-    finding) is released with a mandatory warning instead of being withheld. Anything that blocks stays blocked."""
-    if route_artifact_policy(decision).get("review_injection_as_warning") is not True:
+    injection attempts (review-level findings in artifact_policy.warning_release_categories, default prompt_injection:
+    only; nothing blocking, no secret/DLP/URL/canary finding) is released with a mandatory warning instead of being
+    withheld. Rev24: it gets its own status `verified_with_warnings`, so a consumer that only looks at `status` cannot
+    mistake it for a clean `verified` artifact. Anything that blocks stays blocked."""
+    policy = route_artifact_policy(decision)
+    if policy.get("review_injection_as_warning") is not True:
         return None
     scan = inspection["scan"]
-    if inspection.get("status") != "needs_review" or inspection.get("reason") != "artifact_scan_requires_review" or scan.blocked:
+    if inspection.get("status") != "needs_review" or inspection.get("reason") != "artifact_scan_requires_review":
+        return None
+    configured = policy.get("warning_release_categories")
+    prefixes = tuple(str(item) for item in configured) if isinstance(configured, list) and configured else DEFAULT_WARNING_RELEASE_CATEGORIES
+    if not artifact_warning_eligible(scan, prefixes):
         return None
     active = [f for f in scan.findings if f.severity > 0]
-    if not active or any(not f.category.startswith(("prompt_injection:", "obfuscation:")) for f in active):
-        return None
-    inspection["status"] = "verified"
+    inspection["status"] = "verified_with_warnings"
     inspection["reason"] = "verified_with_warnings"
     return {"source": "(worker answer)", "stage": "artifact_scan", "outcome": "warned",
             "categories": sorted({f.category for f in active}), "max_risk": int(scan.risk_score)}
@@ -3704,9 +3728,16 @@ def enforce_artifact_operation(decision: RouteDecision, operation: str) -> None:
 
 def verify_stored_artifact_content(content: bytes, manifest: dict[str, Any], cfg: dict[str, Any]) -> None:
     # A previous scanner's verified label cannot authorize unchecked legacy bytes.
-    if manifest.get("status") == "verified":
+    status = manifest.get("status")
+    if status in {"verified", "verified_with_warnings"}:
         inspection = inspect_artifact_content(content, normalize_media_type(manifest.get("media_type")), cfg)
-        if inspection["status"] != "verified":
+        if status == "verified_with_warnings":
+            # still a review-level, describe-only artifact: never blocked, never gained a finding outside the warning categories
+            still_warned = (inspection["status"] == "needs_review" and inspection["reason"] == "artifact_scan_requires_review"
+                            and artifact_warning_eligible(inspection["scan"], WARNING_RELEASE_CATEGORY_PREFIXES))
+            if not still_warned and inspection["status"] != "verified":
+                raise GatewayError(403, "artifact_reinspection_required", "stored artifact no longer passes content inspection")
+        elif inspection["status"] != "verified":
             raise GatewayError(403, "artifact_reinspection_required", "stored artifact no longer passes content inspection")
 
 
@@ -4359,7 +4390,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.write_json(
                 200,
                 {
-                    "ok": manifest["status"] in {"verified", "needs_review"},
+                    "ok": manifest["status"] in {"verified", "verified_with_warnings", "needs_review"},
                     "request_id": request_id,
                     "artifact_ref": public_artifact_ref(manifest),
                     "manifest": public_artifact_manifest(manifest),

@@ -171,8 +171,11 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
                                                      "media_type", "size_bytes", "content_sha256", "created_at")}
         # ASG's own per-run record of risky sources (defanged, metadata only) - present even if the worker omitted warnings
         out["warnings_asg"] = man.get("asg_warnings") or []
-        out["status"] = "ok" if man.get("status") == "verified" else "artifact_" + str(man.get("status"))
-        if man.get("status") == "verified":
+        # verified_with_warnings = ASG released a describe-only answer with warnings: content is returned, but the
+        # status stays distinct so the parent cannot mistake it for a clean verified artifact (see warnings_asg).
+        status = man.get("status")
+        out["status"] = {"verified": "ok", "verified_with_warnings": "ok_with_warnings"}.get(status, "artifact_" + str(status))
+        if status in ("verified", "verified_with_warnings"):
             body, hdrs = asg("GET", f"/v1/artifacts/{aid}/content", route="security.artifacts.download",
                              capability="download_artifact", run_id=run_id, raw=True)
             out["result_untrusted"] = body.decode("utf-8", "replace")[:12000]

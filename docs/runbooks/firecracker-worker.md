@@ -123,7 +123,9 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_s
 
 ## Rev19
 - `fc.artifacts.submit` の `artifact_policy.review_injection_as_warning: true` を有効にすると、注入の「説明」のみによる review 判定
-  (prompt_injection / obfuscation、ブロック値未満、秘密・DLP・URL・canary 無し) の回答を `verified_with_warnings` として親へ返す。
+  (prompt_injection、ブロック値未満、秘密・DLP・URL・canary 無し) の回答を、独立した status `verified_with_warnings` として親へ返す (Rev24: 以前は `verified` に上書きしていた)。
+  `obfuscation:` は既定では対象外 (符号化ブロブは密輸経路)。必要なら `artifact_policy.warning_release_categories: ["prompt_injection:", "obfuscation:"]` で明示的に許可する。
+  ダウンロード側ルートは `allowed_statuses` に `verified_with_warnings` を明示しない限り拒否する (既定は `verified` のみ)。`spawn_worker` は `ok_with_warnings` を返す。
   manifest の `asg_warnings` に `artifact_scan / warned` が必ず付き、taint `describes_untrusted_instructions` が付く。ブロック級はそのまま保留。
 - 出力側スニペット判定の「URL あり」判定は無害化済み URL (`hxxps://`, `[.]`) を数えない。
 - Windows 側アカウント分離・自己修復・SPOF は `setup/windows-service-account/README.md`。

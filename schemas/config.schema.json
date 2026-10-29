@@ -279,10 +279,20 @@
                 "enum": [
                   "unchecked",
                   "verified",
+                  "verified_with_warnings",
                   "needs_review",
                   "blocked"
                 ]
               }
+            },
+            "review_injection_as_warning": {
+              "type": "boolean"
+            },
+            "warning_release_categories": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"enum": ["prompt_injection:", "obfuscation:"]},
+              "default": ["prompt_injection:"]
             },
             "max_artifact_bytes": {
               "type": "integer",

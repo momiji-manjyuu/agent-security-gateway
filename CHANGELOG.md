@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Artifacts released with a warning (`artifact_policy.review_injection_as_warning`) now get their own status `verified_with_warnings` instead of being overwritten to `verified`, so a consumer that only reads `status` cannot lose the warning. Routes only serve it when `artifact_policy.allowed_statuses` lists it (the default stays `["verified"]`); stored warned artifacts are re-inspected on read. `spawn_worker` returns `ok_with_warnings`. Review finding V5.
+- `obfuscation:` findings are no longer released with a warning by default; `artifact_policy.warning_release_categories` (`prompt_injection:`, `obfuscation:`) selects the categories explicitly.
 - Run scope is fail-closed by default: `require_known_run_id` now defaults to `true` (set it to `false` explicitly for compatibility mode), and a static run policy with an unparseable `expires_at` is denied with 403 instead of raising. Review finding V3.
 - `relax_fetch_action_url_query` is stricter: duplicate JSON keys are refused, the `url_query` findings are dropped only when the verified fetch URL is the only URL-with-query in everything that was scanned (think blocks, other fields), and `blocked` keeps incomplete-inspection (`boundary:scan_limit`) instead of being recomputed from the score alone. Review finding V2.
 - Multipart text parts that exceed the inspection limit now raise `action_guard:inspection_limit` like the plain body does. Review finding V4.
