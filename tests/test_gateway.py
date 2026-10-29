@@ -58,6 +58,7 @@ class FakeBackendHandler(gateway.http.server.BaseHTTPRequestHandler):
 class GatewayTests(unittest.TestCase):
     def make_config(self, tmp: str, *, backend_url: str = "mock://dry-run", token: str = "test-token-1234567890") -> dict:
         cfg = json.loads(json.dumps(gateway.DEFAULT_CONFIG))
+        cfg["require_known_run_id"] = False  # compat mode is an explicit opt-in; the default is fail-closed
         cfg["audit_log"] = str(Path(tmp) / "audit.jsonl")
         cfg["kill_switch_file"] = str(Path(tmp) / "KILL_SWITCH")
         cfg["approval_store"] = str(Path(tmp) / "approvals.jsonl")
