@@ -17,7 +17,7 @@
    | `fc.llm.chat` | `action_policy.read_only_model: true` | model has no tools |
    | `fc.llm.chat` | `report_run_warnings: true` | per-run warnings |
    | `fc.llm.chat` | `output_policy.allow_fetch_query_to_run_hosts: true` | query strings allowed only in exact fetch actions to run-registered hosts |
-   | `fc.artifacts.submit` | `artifact_policy.review_injection_as_warning: true` | describe-only answers released with a warning |
+   | `fc.artifacts.submit` | `artifact_policy.review_injection_as_warning: true` | describe-only answers released as status `verified_with_warnings` (add it to the download route's `allowed_statuses`; `warning_release_categories` defaults to `prompt_injection:` only) |
 
    Also set `llm_snippet_check.apply_to_output: true`.
 4. **Service.**
