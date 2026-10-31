@@ -1,0 +1,13 @@
+{
+  "listen_host": "192.168.1.90",
+  "listen_port": 8790,
+  "searxng_url": "http://127.0.0.1:8080",
+  "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY",
+  "register_key_env": "ASG_RESEARCH_REGISTER_KEY",
+  "allowed_agents": ["fc_worker"],
+  "blocked_hosts": [],
+  "blocked_suffixes": [".onion", ".local", ".internal", ".lan", ".localhost"],
+  "blocked_url_regex": [],
+  "max_results": 8,
+  "limits": {"searches": 25, "fetches": 60, "bytes": 8388608, "hosts": 25, "page_chars": 12000, "links": 40}
+}

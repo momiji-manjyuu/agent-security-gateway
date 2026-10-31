@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1] / "setup" / "firecracker-worker"
 # static example-file test and the shell parser test so the two cannot drift apart.
 FC_ENV_KEYS = ("ASG_FC_GOLDEN", "ASG_FC_BIN", "ASG_FC_USER", "ASG_FC_GROUP", "ASG_FC_BRIDGE", "ASG_FC_TAP",
                "ASG_FC_HOST_IP", "ASG_FC_GUEST_IP", "ASG_FC_ASG_PORT", "ASG_FC_RUN_ROOT", "ASG_FC_LOG_DIR",
-               "ASG_FC_KVM_PERMS", "ASG_FC_AGENT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT")
-FC_ENV_NUMERIC_KEYS = ("ASG_FC_ASG_PORT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT")
+               "ASG_FC_KVM_PERMS", "ASG_FC_AGENT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT",
+               "ASG_FC_TIMEOUT_MAX", "ASG_FC_RESEARCH_URL", "ASG_FC_RESEARCH_KEY_FILE")
+FC_ENV_NUMERIC_KEYS = ("ASG_FC_ASG_PORT", "ASG_FC_MEM_MIB", "ASG_FC_VCPUS", "ASG_FC_TIMEOUT", "ASG_FC_TIMEOUT_MAX")
 
 
 def load_agent():
@@ -66,12 +67,28 @@ class WorkerAgentTruncationTests(unittest.TestCase):
 
     def test_orchestrator_caps(self):
         text = (ROOT / "asg-fc-worker").read_text(encoding="utf-8")
-        caps = dict((m[0], (int(m[1]), int(m[2]))) for m in re.findall(r'cap\("(\w+)", (\d+), (\d+)\)', text))
-        self.assertEqual(caps["max_tokens"], (32768, 32768))
-        self.assertEqual(caps["max_seconds"], (1200, 1800))
+        block = text[text.index("PROFILES = {"):text.index("if not isinstance(profile, str)")]
+        profiles = {}
+        for name, body in re.findall(r'"(\w+)": \{(.*?)\},?\n', block, re.S):
+            profiles[name] = {k: (int(d), int(c)) for k, d, c in re.findall(r'"(\w+)": \((\d+), (\d+)\)', body)}
+        self.assertEqual(set(profiles), {"reader", "researcher"})
+        reader, researcher = profiles["reader"], profiles["researcher"]
+        self.assertEqual(reader["max_tokens"], (32768, 32768))
+        self.assertEqual(reader["max_seconds"], (1200, 1800))
+        self.assertLessEqual(reader["max_llm_calls"][1], 6)
         vm = int(re.search(r"ASG_FC_TIMEOUT=(\d+)", text).group(1))
-        self.assertGreater(vm, caps["max_seconds"][1])  # VM outlives the longest run
-        self.assertLessEqual(caps["max_llm_calls"][1], 6)
+        self.assertGreater(vm, reader["max_seconds"][1])  # VM outlives the longest reader run
+        vm_max = int(re.search(r"ASG_FC_TIMEOUT_MAX=(\d+)", text).group(1))
+        self.assertGreaterEqual(vm_max, researcher["max_seconds"][1] + 120)  # longest researcher run + slack fits the VM cap
+        for k, (d, c) in researcher.items():
+            self.assertLessEqual(d, c, k)
+            self.assertGreaterEqual(c, reader[k][1], k)  # researcher is never below reader
+
+    def test_unknown_profile_and_missing_research_config_fail_closed(self):
+        text = (ROOT / "asg-fc-worker").read_text(encoding="utf-8")
+        self.assertIn('bad("profile")', text)
+        self.assertIn("research_service_not_configured", text)
+        self.assertIn("research_register_failed", text)
 
 
 class OrchestratorHardeningTests(unittest.TestCase):

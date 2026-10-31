@@ -710,6 +710,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 route_max, route_max_ok = parse_int(artifact_policy.get("max_artifact_bytes"), default=0)
                 if not route_max_ok or route_max <= 0:
                     errors.append(f"routes.{route_id}.artifact_policy.max_artifact_bytes must be a positive integer")
+        route_output_policy = route.get("output_policy")
+        if isinstance(route_output_policy, dict) and "untrusted_tool_result" in route_output_policy:
+            if not isinstance(route_output_policy.get("untrusted_tool_result"), bool):
+                errors.append(f"routes.{route_id}.output_policy.untrusted_tool_result must be a boolean")
+            elif route_output_policy["untrusted_tool_result"] and kind != "http_json":
+                errors.append(f"routes.{route_id}.output_policy.untrusted_tool_result is only valid on http_json routes")
         backend = route.get("backend", {})
         if kind == "canary":
             if route.get("backend"):
@@ -2809,6 +2815,7 @@ def output_text_for_route(payload: dict[str, Any], route_kind: str) -> str:
 def enforce_output_guard(payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> security.ScanResult:
     enforce_canary(cfg, payload, agent_id=None, client_ip="backend", source="backend_response")
     scan = security.output_guard_scan_for_upstream(payload, cfg, None)
+    relax_untrusted_tool_result(scan, cfg, decision)
     if decision.route.get("kind") == "openai_chat_completions":
         relax_fetch_action_url_query(scan, payload, cfg, decision)
         security.apply_snippet_check(scan, cfg, model_output=True)
@@ -4138,6 +4145,35 @@ def load_run_warnings(cfg: dict[str, Any], run_id: str | None) -> list[dict[str,
                         entry["categories"].append(item.get("category"))
                     entry["max_risk"] = max(entry["max_risk"], int(record.get("risk") or 0))
     return list(merged.values())[:RUN_WARNINGS_MAX]
+
+
+# Location-shape DLP findings (where a URL/path points), as opposed to content findings (secrets, injection, schemes).
+UNTRUSTED_TOOL_RESULT_RELAXABLE = frozenset(
+    f"{prefix}:{name}"
+    for prefix in ("input_dlp", "output_dlp")
+    for name in ("private_host", "high_entropy_path", "encoded_path", "url_query", "url_fragment", "punycode_host", "url_shortener", "local_path")
+)
+
+
+def relax_untrusted_tool_result(scan: Any, cfg: dict[str, Any], decision: RouteDecision) -> None:
+    """Opt-in per http_json route (output_policy.untrusted_tool_result). The response is untrusted web content on its way to
+    a model that has its own input guard, so URL/path SHAPE findings (localhost, long or encoded paths, query strings in
+    documentation links) are not egress evidence here. Everything else still decides: secrets, canary, prompt injection,
+    obfuscation, dangerous schemes, userinfo or sensitive query parameters, IP literals, system disclosure and any
+    incomplete inspection (boundary:scan_limit)."""
+    policy = decision.route.get("output_policy")
+    if not (isinstance(policy, dict) and policy.get("untrusted_tool_result") is True) or decision.route.get("kind") != "http_json":
+        return
+    dropped = [f for f in scan.findings if f.category in UNTRUSTED_TOOL_RESULT_RELAXABLE]
+    if not dropped:
+        return
+    scan.findings = [f for f in scan.findings if f.category not in UNTRUSTED_TOOL_RESULT_RELAXABLE]
+    scan.relaxed_categories = sorted({f.category for f in dropped})
+    guard = security.output_guard_config_for_capability(cfg, None).get("output_guard", {})
+    scan.risk_score = sum(f.severity for f in scan.findings)
+    incomplete = any(f.category == "boundary:scan_limit" for f in scan.findings)
+    scan.blocked = incomplete or scan.risk_score >= int(guard.get("block_risk_score", cfg.get("block_risk_score", 8)))
+    scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", cfg.get("review_risk_score", 4)))
 
 
 def relax_fetch_action_url_query(scan: Any, payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> None:

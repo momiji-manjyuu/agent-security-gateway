@@ -14,6 +14,8 @@ ASG_FC_GOLDEN=/srv/asg/golden/current; ASG_FC_BIN=/srv/asg/bin/firecracker; ASG_
 ASG_FC_BRIDGE=asgbr0; ASG_FC_TAP=asgtap-w; ASG_FC_HOST_IP=10.90.0.1; ASG_FC_GUEST_IP=10.90.0.2; ASG_FC_ASG_PORT=8788
 ASG_FC_RUN_ROOT=/run/asg; ASG_FC_LOG_DIR=/srv/asg/logs; ASG_FC_KVM_PERMS=/usr/local/sbin/asg-kvm-perms
 ASG_FC_AGENT=/usr/local/lib/asg/worker_agent.py; ASG_FC_MEM_MIB=2048; ASG_FC_VCPUS=2; ASG_FC_TIMEOUT=1920
+# researcher profile: VM wall-clock = profile max_seconds + 120 s, never above ASG_FC_TIMEOUT_MAX; research service (optional)
+ASG_FC_TIMEOUT_MAX=3000; ASG_FC_RESEARCH_URL=; ASG_FC_RESEARCH_KEY_FILE=
 # Parse the root-owned env file as DATA, never source it: a hostile or corrupt line must not execute as
 # root. Only known ASG_FC_* keys, plain KEY=VALUE lines (optional surrounding quotes, optional comment
 # after whitespace, like the example file); no expansion, substitution or shell metacharacters - any
@@ -31,7 +33,7 @@ load_fc_worker_env() {
     if [[ ${#value} -ge 2 && ( $value == \"*\" || $value == \'*\' ) ]]; then value=${value:1:${#value}-2}; fi
     if [[ ! $key =~ ^ASG_FC_[A-Z0-9_]+$ ]]; then echo "env_file_invalid: line $n bad key" >&2; return 1; fi
     case $key in
-      ASG_FC_ASG_PORT|ASG_FC_MEM_MIB|ASG_FC_VCPUS|ASG_FC_TIMEOUT)
+      ASG_FC_ASG_PORT|ASG_FC_MEM_MIB|ASG_FC_VCPUS|ASG_FC_TIMEOUT|ASG_FC_TIMEOUT_MAX)
         [[ $value =~ ^[0-9]+$ ]] || { echo "env_file_invalid: line $n $key must be numeric" >&2; return 1; } ;;
       *)
         if [[ -z $value || $value == -* || ! $value =~ ^[A-Za-z0-9_./:+@%=-]+$ ]]; then
@@ -55,6 +57,9 @@ load_fc_worker_env() {
       ASG_FC_MEM_MIB) ASG_FC_MEM_MIB=$value ;;
       ASG_FC_VCPUS) ASG_FC_VCPUS=$value ;;
       ASG_FC_TIMEOUT) ASG_FC_TIMEOUT=$value ;;
+      ASG_FC_TIMEOUT_MAX) ASG_FC_TIMEOUT_MAX=$value ;;
+      ASG_FC_RESEARCH_URL) ASG_FC_RESEARCH_URL=$value ;;
+      ASG_FC_RESEARCH_KEY_FILE) ASG_FC_RESEARCH_KEY_FILE=$value ;;
       *) echo "env_file_invalid: line $n unknown key $key" >&2; return 1 ;;
     esac
   done < "$file"
@@ -78,7 +83,6 @@ CRED=${CRED%$'\r'}
 IFS= read -r -t 10 SPEC || die no_spec
 SPEC=${SPEC%$'\r'}
 (( ${#SPEC} <= 16384 )) || die spec_too_large
-TIMEOUT=$ASG_FC_TIMEOUT
 exec 9>"$ASG_FC_RUN_ROOT/fc-worker.lock"; flock -w 400 9 || die busy
 T0=$(date +%s.%N)
 "$ASG_FC_KVM_PERMS"
@@ -115,8 +119,16 @@ if not isinstance(s, dict):
 task = s.get("task")
 if not isinstance(task, str) or not 1 <= len(task) <= 4000:
     bad("task")
+profile = s.get("profile", "reader")
+# name -> (default, cap) per limit; an unknown profile fails closed. The hub run scope must independently list the routes.
+PROFILES = {
+    "reader": {"max_steps": (6, 8), "max_llm_calls": (4, 6), "max_tokens": (32768, 32768), "max_seconds": (1200, 1800), "page_chars": (6000, 8000)},
+    "researcher": {"max_steps": (24, 30), "max_llm_calls": (30, 40), "max_tokens": (32768, 32768), "max_seconds": (1800, 2400), "page_chars": (8000, 12000)},
+}
+if not isinstance(profile, str) or profile not in PROFILES:
+    bad("profile")
 hosts = s.get("allowed_hosts") or []
-if not isinstance(hosts, list) or not 1 <= len(hosts) <= 10:
+if not isinstance(hosts, list) or len(hosts) > 10 or (profile == "reader" and not hosts):
     bad("allowed_hosts")
 for h in hosts:
     if not isinstance(h, str) or not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", h) or len(h) > 253:
@@ -134,18 +146,18 @@ for u in urls:
         port_ok = p.port in (None, 443)
     except ValueError:
         port_ok = False
-    if p.hostname not in hosts or p.username is not None or not port_ok:
+    if (profile == "reader" and p.hostname not in hosts) or p.username is not None or not port_ok:
         bad("url")
 L = s.get("limits") or {}
 if not isinstance(L, dict):
     bad("limits")
-def cap(k, d, hi):
+def cap(k):
+    d, hi = PROFILES[profile][k]
     v = L.get(k, d)
     if isinstance(v, bool) or not isinstance(v, int):
         bad("limit_" + k)
     return max(1, min(v, hi))
-limits = {"max_steps": cap("max_steps", 6, 8), "max_llm_calls": cap("max_llm_calls", 4, 6), "max_tokens": cap("max_tokens", 32768, 32768),
-          "max_seconds": cap("max_seconds", 1200, 1800), "page_chars": cap("page_chars", 6000, 8000)}
+limits = {k: cap(k) for k in PROFILES[profile]}
 probes = s.get("probe_targets") or []
 if not isinstance(probes, list) or len(probes) > 12:
     bad("probe_targets")
@@ -160,9 +172,36 @@ for t in probes:
     except ipaddress.AddressValueError:
         bad("probe_target")
 json.dump({"asg": {"run_id": os.environ["ASG_RUN_ID"], "task_id": os.environ["ASG_TASK_ID"], "task": task, "urls": urls,
-                   "allowed_hosts": hosts, "limits": limits, "probe_lan": bool(s.get("probe_lan")), "probe_targets": probes,
+                   "profile": profile, "allowed_hosts": hosts, "limits": limits, "probe_lan": bool(s.get("probe_lan")), "probe_targets": probes,
                    "credential": os.environ["ASG_CRED"], "asg_url": os.environ["ASG_GUEST_URL"]}}, open(sys.argv[1], "w"))
+open(sys.argv[1] + ".timeout", "w").write("%d\n" % (limits["max_seconds"] + 120))
+open(sys.argv[1] + ".profile", "w").write(profile + "\n")
 P
+TIMEOUT=$(cat "$RUN/metadata.json.timeout"); PROFILE=$(cat "$RUN/metadata.json.profile")
+[[ $TIMEOUT =~ ^[0-9]+$ && $PROFILE =~ ^[a-z_]{1,32}$ ]] || die bad_spec
+(( TIMEOUT > ASG_FC_TIMEOUT_MAX )) && TIMEOUT=$ASG_FC_TIMEOUT_MAX
+(( TIMEOUT < ASG_FC_TIMEOUT )) && TIMEOUT=$ASG_FC_TIMEOUT
+rm -f "$RUN/metadata.json.timeout" "$RUN/metadata.json.profile"
+if [[ $PROFILE == researcher ]]; then
+  # register the run (seed URLs + quotas) with the research service BEFORE the VM boots; fail closed when unavailable
+  [[ -n $ASG_FC_RESEARCH_URL && -n $ASG_FC_RESEARCH_KEY_FILE ]] || die research_service_not_configured
+  RS_URL=$ASG_FC_RESEARCH_URL RS_KEY_FILE=$ASG_FC_RESEARCH_KEY_FILE python3 - "$RUN/metadata.json" <<'P' || die research_register_failed
+import datetime, hashlib, hmac, json, os, sys, urllib.request
+m = json.load(open(sys.argv[1]))["asg"]
+key = open(os.environ["RS_KEY_FILE"]).read().strip()
+if len(key) < 32:
+    raise SystemExit(1)
+body = json.dumps({"run_id": m["run_id"], "seed_urls": m["urls"],
+                   "limits": {"fetches": m["limits"]["max_steps"] * 2, "searches": m["limits"]["max_steps"]}}).encode()
+ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+sig = "sha256=" + hmac.new(key.encode(), ts.encode() + b"\n" + body, hashlib.sha256).hexdigest()
+req = urllib.request.Request(os.environ["RS_URL"].rstrip("/") + "/register", data=body, method="POST",
+                             headers={"Content-Type": "application/json", "X-Register-Timestamp": ts, "X-Register-Signature": sig})
+r = urllib.request.urlopen(req, timeout=15)
+if r.status != 200:
+    raise SystemExit(1)
+P
+fi
 unset CRED SPEC
 cat > "$RUN/vm.json" <<J
 { "boot-source": { "kernel_image_path": "$G/vmlinux",
@@ -217,7 +256,7 @@ for l in wl:
     if m: submit = "failed " + m.group(1)
     m = re.search(r"ASG_WORKER probe ((?:\d{1,3}\.){3}\d{1,3}:\d{1,5}) ([a-zA-Z0-9]{1,12})$", l)
     if m: probes.append({"target": m.group(1), "result": m.group(2)})
-    m = re.search(r"ASG_WORKER (keyscan hits=\d+ files=\d+(?: first=[A-Za-z0-9/._:-]{0,60})?|neg_llm_[a-z_]+ http=\d{3}(?: code=[a-z_]{0,48})?|llm (?:ok call=\d+ action=[a-z]+|http=\d{3} code=[a-z_]{0,48})|fetch [A-Za-z0-9_]{1,32}(?: host=[a-z0-9.-]{1,80})?|fatal [A-Za-z]{1,48})$", l)
+    m = re.search(r"ASG_WORKER (keyscan hits=\d+ files=\d+(?: first=[A-Za-z0-9/._:-]{0,60})?|neg_llm_[a-z_]+ http=\d{3}(?: code=[a-z_]{0,48})?|llm (?:ok call=\d+ action=[a-z]+|http=\d{3} code=[a-z_]{0,48})|fetch [A-Za-z0-9_]{1,32}(?: host=[a-z0-9.-]{1,80})?|search [A-Za-z0-9_]{1,32}(?: n=\d{1,3})?|fatal [A-Za-z]{1,48})$", l)
     if m: events.append(m.group(1))
 print(json.dumps({"ok": e["DONE"] == "1" and aid is not None, "worker_id": e["ID"], "golden": e["GVER"],
   "artifact_id": aid, "artifact_status_reported_by_worker": st, "submit": submit, "lan_probes": probes, "worker_events": events,

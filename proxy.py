@@ -398,6 +398,7 @@ class ScanResult:
     blocked: bool
     requires_review: bool
     snippet_checks: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    relaxed_categories: list[str] = dataclasses.field(default_factory=list)
 
     def public_dict(self) -> dict[str, Any]:
         public = {
@@ -411,6 +412,8 @@ class ScanResult:
         }
         if self.snippet_checks:
             public["snippet_checks"] = self.snippet_checks
+        if self.relaxed_categories:
+            public["relaxed_categories"] = self.relaxed_categories
         return public
 
 

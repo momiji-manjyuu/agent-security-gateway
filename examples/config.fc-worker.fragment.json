@@ -11,11 +11,15 @@
       ],
       "allowed_capabilities": [
         "submit_artifact",
-        "worker_llm"
+        "worker_llm",
+        "worker_search",
+        "worker_fetch"
       ],
       "allowed_routes": [
         "fc.artifacts.submit",
-        "fc.llm.chat"
+        "fc.llm.chat",
+        "fc.search",
+        "fc.fetch"
       ]
     },
     "parent_mcp": {
@@ -100,6 +104,70 @@
       },
       "action_policy": {
         "read_only_model": true
+      },
+      "report_run_warnings": true
+    },
+    "fc.search": {
+      "kind": "http_json",
+      "description": "researcher profile only: web search via the research service (filtered results). Callable only if spawn_worker registered the route for that run.",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "worker_search",
+      "require_run_id": true,
+      "backend": {
+        "mode": "http",
+        "base_url": "http://<RESEARCH_SERVICE_HOST>:8790",
+        "path": "/search",
+        "method": "POST",
+        "timeout_seconds": 60,
+        "require_signature": true
+      },
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "max_messages": 1
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true,
+        "untrusted_tool_result": true
+      },
+      "report_run_warnings": true
+    },
+    "fc.fetch": {
+      "kind": "http_json",
+      "description": "researcher profile only: fetch of a URL eligible for this run (seed, search result or linked page); checked and fetched by the research service.",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "worker_fetch",
+      "require_run_id": true,
+      "backend": {
+        "mode": "http",
+        "base_url": "http://<RESEARCH_SERVICE_HOST>:8790",
+        "path": "/fetch",
+        "method": "POST",
+        "timeout_seconds": 60,
+        "require_signature": true
+      },
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "max_messages": 1
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true,
+        "untrusted_tool_result": true
       },
       "report_run_warnings": true
     },

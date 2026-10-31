@@ -17,6 +17,7 @@
    | `fc.llm.chat` | `action_policy.read_only_model: true` | model has no tools |
    | `fc.llm.chat` | `report_run_warnings: true` | per-run warnings |
    | `fc.llm.chat` | `output_policy.allow_fetch_query_to_run_hosts: true` | query strings allowed only in exact fetch actions to run-registered hosts |
+   | `fc.search`, `fc.fetch` | `output_policy.untrusted_tool_result: true` | researcher tool results are untrusted web pages: URL/path SHAPE findings (localhost, long or encoded paths, query strings, local paths in docs) no longer block; secrets, canary, injection, obfuscation, dangerous schemes, userinfo/sensitive query parameters, IP literals, system disclosure and incomplete inspection still do. Only valid on `http_json` routes; relaxed categories appear as `relaxed_categories` in the scan audit |
    | `fc.artifacts.submit` | `artifact_policy.review_injection_as_warning: true` | describe-only answers released as status `verified_with_warnings` (add it to the download route's `allowed_statuses`; `warning_release_categories` defaults to `prompt_injection:` only) |
 
    Also set `llm_snippet_check.apply_to_output: true`.
@@ -39,4 +40,9 @@
    - `start_asg.ps1` reads `asg-env.json` once when it starts. Killing only the gateway/relay makes the supervisor restart
      them with the OLD environment; after editing `asg-env.json` run `Stop-ScheduledTask` / `Start-ScheduledTask`
      on the gateway task (`AgentSecurityGateway`) so the supervisor itself restarts.
+   - `Stop-ScheduledTask` stops only the supervisor: the child `gateway.py` and `inspector_relay.py` processes keep
+     running, the old gateway keeps port 8788 with the OLD config and environment, and the new one cannot bind. After
+     a config or environment change also stop every `python` process whose command line contains `gateway.py` or
+     `inspector_relay.py`, then start the task, and confirm the change took effect: `/healthz` must show the new route
+     count and a worker run must report the expected model (the artifact footer lists `model(s) via ASG fc.llm.chat`).
    - Check with `asg_inspect` on a harmless sentence (expect `blocked: false`) and an injection sentence (expect `blocked: true`).
