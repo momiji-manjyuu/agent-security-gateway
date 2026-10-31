@@ -143,6 +143,23 @@ class SpawnWorkerProfileTests(unittest.TestCase):
             self.assertTrue(r["backend"]["require_signature"])
             self.assertIn(r["required_capability"], w["allowed_capabilities"])
 
+    def test_fragment_passthrough_codes_are_valid_and_emitted_by_the_research_service(self):
+        import re
+        frag = json.loads((ROOT.parents[1] / "examples" / "config.fc-worker.fragment.json").read_text(encoding="utf-8"))
+        service = (ROOT.parent / "research-service" / "research_service.py").read_text(encoding="utf-8")
+        for route in ("fc.search", "fc.fetch"):
+            codes = frag["routes"][route]["backend"]["passthrough_error_codes"]
+            self.assertEqual(len(codes), len(set(codes)))
+            for code in codes:
+                self.assertRegex(code, r"^[a-z][a-z0-9_]{2,39}$")
+                # url_<reason> codes are built from url_problem() reasons; the rest appear verbatim in the service
+                if code.startswith("url_") and code != "url_not_eligible":
+                    self.assertIn('return "%s"' % code[4:], service, code)
+                else:
+                    self.assertIn('"%s"' % code, service, code)
+            for secret_like in ("bad_signature", "bad_body_hash", "caller_not_allowed", "bad_timestamp", "service_not_configured"):
+                self.assertNotIn(secret_like, codes)  # auth/config internals are never surfaced
+
 
 if __name__ == "__main__":
     unittest.main()

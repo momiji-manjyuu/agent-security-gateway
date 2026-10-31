@@ -762,6 +762,17 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 timeout, timeout_ok = parse_int(backend.get("timeout_seconds", 180), default=180)
                 if not timeout_ok or not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
                     errors.append(f"routes.{route_id}.backend.timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")
+                if "passthrough_error_codes" in backend:
+                    codes = backend.get("passthrough_error_codes")
+                    if kind != "http_json":
+                        errors.append(f"routes.{route_id}.backend.passthrough_error_codes is only valid on http_json routes")
+                    elif not isinstance(codes, list) or not codes or any(
+                        not isinstance(code, str) or not BACKEND_ERROR_CODE_RE.fullmatch(code) for code in codes
+                    ):
+                        errors.append(
+                            f"routes.{route_id}.backend.passthrough_error_codes must be a non-empty list of lowercase codes "
+                            "(a-z, 0-9, underscore; 3-40 characters)"
+                        )
                 if "max_review_chars" in backend:
                     max_review_chars, max_review_chars_ok = parse_int(backend.get("max_review_chars"), default=0)
                     if not max_review_chars_ok or max_review_chars <= 0:
@@ -2358,8 +2369,39 @@ def forward_http_json(
             return response.status, parsed
     except (socket.timeout, TimeoutError) as exc:
         raise GatewayError(504, "backend_timeout", "backend request timed out") from exc
+    except urllib.error.HTTPError as exc:
+        passed = passthrough_backend_error(backend, exc)
+        if passed is not None:
+            raise passed from exc
+        raise GatewayError(502, "backend_error", f"backend request failed: {type(exc).__name__}") from exc
     except urllib.error.URLError as exc:
         raise GatewayError(502, "backend_error", f"backend request failed: {type(exc).__name__}") from exc
+
+
+BACKEND_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,39}")
+BACKEND_ERROR_BODY_MAX = 4096
+
+
+def passthrough_backend_error(backend: dict[str, Any], exc: urllib.error.HTTPError) -> GatewayError | None:
+    """Opt-in per http_json route (backend.passthrough_error_codes). A backend rejection is opaque `backend_error` by default.
+    When the operator lists exact codes, a backend 4xx whose JSON body carries {"error": {"code": <listed code>}} is surfaced to
+    the caller as `backend_<code>` with the backend's status. Only the listed code is forwarded: never the body, message or
+    headers. Anything else (other codes, malformed or oversized bodies, 5xx, auth statuses) stays `backend_error`."""
+    allowed = backend.get("passthrough_error_codes")
+    if not isinstance(allowed, list) or not 400 <= exc.code <= 499 or exc.code in {401, 407}:
+        return None
+    try:
+        body = json.loads(exc.read(BACKEND_ERROR_BODY_MAX + 1).decode("utf-8", errors="replace"))
+        error = body.get("error") if isinstance(body, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        exc.close()
+    if not isinstance(code, str) or code not in allowed or not BACKEND_ERROR_CODE_RE.fullmatch(code):
+        return None
+    return GatewayError(exc.code, "backend_" + code, "backend rejected the request",
+                        audit_extra={"backend_status": exc.code, "backend_code": code})
 
 
 # Model "thinking" side channels that some OpenAI-compatible backends return next to message.content.

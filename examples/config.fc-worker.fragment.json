@@ -121,7 +121,8 @@
         "path": "/search",
         "method": "POST",
         "timeout_seconds": 60,
-        "require_signature": true
+        "require_signature": true,
+        "passthrough_error_codes": ["url_not_eligible", "url_scheme", "url_userinfo", "url_port", "url_ip_literal", "url_host", "url_blocked_host", "url_blocked_url", "url_malformed", "non_public_address", "dns_failed", "fetch_failed", "too_many_redirects", "redirect_not_allowed", "content_type_not_allowed", "host_quota_exceeded", "fetch_quota_exceeded", "byte_quota_exceeded", "search_quota_exceeded", "empty_query", "search_backend_error"]
       },
       "input_policy": {
         "accepted_taint": [
@@ -153,7 +154,8 @@
         "path": "/fetch",
         "method": "POST",
         "timeout_seconds": 60,
-        "require_signature": true
+        "require_signature": true,
+        "passthrough_error_codes": ["url_not_eligible", "url_scheme", "url_userinfo", "url_port", "url_ip_literal", "url_host", "url_blocked_host", "url_blocked_url", "url_malformed", "non_public_address", "dns_failed", "fetch_failed", "too_many_redirects", "redirect_not_allowed", "content_type_not_allowed", "host_quota_exceeded", "fetch_quota_exceeded", "byte_quota_exceeded", "search_quota_exceeded", "empty_query", "search_backend_error"]
       },
       "input_policy": {
         "accepted_taint": [
