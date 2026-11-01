@@ -1458,7 +1458,11 @@ def normalized_allowed_private_instruction_hosts(decision: RouteDecision) -> set
 def private_url_hosts(text: str) -> set[str]:
     hosts: set[str] = set()
     for match in security.URL_PATTERN.finditer(text):
-        parsed = urllib.parse.urlsplit(match.group(0))
+        try:
+            parsed = urllib.parse.urlsplit(match.group(0))
+        except ValueError:
+            hosts.add("(unparseable)")  # never in an allow list, so the route cannot allow it
+            continue
         host = (parsed.hostname or "").lower().strip("[]")
         if host and is_private_host(host):
             hosts.add(host)
@@ -1577,7 +1581,13 @@ def action_guard(headers: Any, payload: dict[str, Any], cfg: dict[str, Any] | No
         findings.append(security.Finding("action_guard:dangerous_uri_scheme", 10, "dangerous URI scheme is not allowed"))
 
     for match in security.URL_PATTERN.finditer(normalized):
-        parsed = urllib.parse.urlsplit(match.group(0))
+        try:
+            parsed = urllib.parse.urlsplit(match.group(0))
+        except ValueError:
+            # e.g. a bracketed IPv6 literal (http://[::1]/): the URL pattern stops at "]", so the candidate cannot be parsed.
+            # Fail closed instead of raising, and never treat it as an allowed host.
+            findings.append(security.Finding("action_guard:private_network_target", 10, "private, loopback, or metadata URL target is not allowed"))
+            continue
         if parsed.hostname and is_private_host(parsed.hostname):
             findings.append(security.Finding("action_guard:private_network_target", 10, "private, loopback, or metadata URL target is not allowed"))
         if parsed.hostname and parsed.hostname.strip("[]") == "169.254.169.254":

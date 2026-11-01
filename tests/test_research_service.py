@@ -180,6 +180,30 @@ class RunFlowTests(unittest.TestCase):
             rs.do_search(self.reg.get("run-1"), "\x00 ", self.cfg, fetcher=f)
 
 
+class AddressRedactionTests(unittest.TestCase):
+    def test_non_global_addresses_are_replaced_and_loopback_names_kept(self):
+        text = ("http://192.168.1.10:8080/admin http://10.0.0.5/x 172.16.0.1 169.254.169.254 0.0.0.0 "
+                "http://[::1]:8080/x [fe80::1%25eth0] [2001:db8::1] fe80::1 ::1 ::ffff:10.0.0.1")
+        out = rs.clean_text(text, 1000)
+        for leaked in ("192.168", "10.0.0", "172.16", "169.254", "0.0.0.0", "[::1]", "fe80", "2001:db8", "::1 "):
+            self.assertNotIn(leaked, out)
+        self.assertIn("http://private-address.invalid:8080/admin", out)
+        self.assertIn("http://ipv6-address.invalid:8080/x", out)
+        kept = rs.clean_text("http://127.0.0.1:3000/ and http://localhost:8080/", 200)
+        self.assertEqual(kept, "http://127.0.0.1:3000/ and http://localhost:8080/")
+
+    def test_ordinary_text_is_untouched(self):
+        text = "public 8.8.8.8 and 1.2.3.4 version 2.0.1.5 time 12:30:45 std::vector C::D a::b 999.1.1.1 10.0.0.256"
+        self.assertEqual(rs.clean_text(text, 500), text)
+
+    def test_replacement_applies_to_titles_snippets_and_page_text(self):
+        raw = {"results": [{"url": "https://docs.example.org/a", "title": "Setup on 192.168.0.2", "content": "connect to 10.1.1.1:22"}]}
+        hit = rs.filter_results(raw, rs.DEFAULTS)[0]
+        self.assertNotRegex(hit["title"] + hit["snippet"], r"192\.168|10\.1\.1")
+        title, text, _links = rs.extract_page("<title>host 10.2.3.4</title><p>see http://[::1]:80/</p>", "https://docs.example.org/", "text/html")
+        self.assertNotRegex(rs.clean_text(title, 100) + rs.clean_text(text, 100), r"10\.2\.3|\[::1\]")
+
+
 class SignatureTests(unittest.TestCase):
     def hub_headers(self, raw, path="/fetch", route="fc.fetch", agent="fc_worker@run-1", run="run-1", ts=None, key=KEY):
         ts = ts or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")

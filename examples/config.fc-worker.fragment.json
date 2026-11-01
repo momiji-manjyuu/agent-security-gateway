@@ -95,6 +95,10 @@
         "allow_missing_taint": false,
         "max_messages": 12,
         "block_on_review": false,
+        "allowed_private_instruction_hosts": [
+          "localhost",
+          "127.0.0.1"
+        ],
         "allow_scanner_findings": [
           "input_dlp:private_host",
           "input_dlp:high_entropy_path",

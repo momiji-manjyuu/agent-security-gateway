@@ -476,7 +476,11 @@ def normalize_untrusted_text(text: str, cfg: dict[str, Any]) -> tuple[str, dict[
 
 def untrusted_url_findings(url: str, *, category_prefix: str) -> list[Finding]:
     findings: list[Finding] = []
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        # e.g. a bracketed IPv6 literal cut at "]" by the URL pattern: fail closed instead of raising
+        return [Finding(f"{category_prefix}:malformed_url", 8, "URL could not be parsed (for example a bracketed IPv6 literal)")]
     host = (parsed.hostname or "").lower()
 
     if "@" in parsed.netloc.rsplit("]", 1)[-1]:
@@ -1612,7 +1616,10 @@ def sentence_candidates(text: str) -> list[str]:
 
 
 def sanitize_url_for_report(url: str) -> dict[str, str]:
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return {"url": "[unparseable]", "host": "", "url_sha256": sha256_text(url)}
     if parsed.scheme.lower() not in {"http", "https"}:
         safe_url = f"{parsed.scheme}:[omitted]"
     else:
@@ -1708,7 +1715,10 @@ def host_allowed_by_policy(host: str, allowed_domains: list[Any]) -> bool:
 def url_policy_findings(url: str, cfg: dict[str, Any], *, category_prefix: str) -> list[Finding]:
     guard = cfg.get("output_guard", {})
     findings: list[Finding] = []
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return [Finding(f"{category_prefix}:malformed_url", 8, "URL could not be parsed (for example a bracketed IPv6 literal)")]
     host = parsed.hostname or ""
     host_lower = host.lower()
 

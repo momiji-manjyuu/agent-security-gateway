@@ -24,6 +24,11 @@ Placeholders: `<WORKER_HOST>` is the Firecracker host's LAN address, `<LOGIN_USE
 - Fetch: only URLs that are *eligible* for the run (a seed registered by the orchestrator, a search result, or a link of
   a page the run already fetched). The service resolves DNS itself, requires every answer to be globally routable,
   pins the TLS connection to the validated IP, re-checks redirects, and limits content type, size and time.
+- Address redaction: private, loopback, link-local, metadata and reserved IP addresses in titles, snippets and page text
+  are replaced (`private-address.invalid`, `ipv6-address.invalid`) so a documentation page that mentions a router or the
+  metadata address is not withheld whole by the hub guards. `localhost` and `127.0.0.1` are kept (the `fc.llm.chat`
+  route lists them in `allowed_private_instruction_hosts`). The hub guards stay in place as the second layer. Redeploy
+  `research_service.py` (section 4) after updating it.
 - Per-run quotas (searches, fetches, bytes, distinct hosts); unregistered runs are denied.
 - Hub requests must carry the hub's backend HMAC signature; `/register` (called only by `asg-fc-worker`) has its own key.
 

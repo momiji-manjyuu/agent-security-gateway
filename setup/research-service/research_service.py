@@ -71,8 +71,51 @@ def load_config(path=None):
     return cfg
 
 
+# Private/loopback/link-local/metadata addresses in page text are replaced before the text leaves this service: the hub's
+# guards block a whole request that mentions one, and the worker cannot reach them anyway (fetches go through this service).
+# 127.0.0.1 and "localhost" stay: the hub route lists them in input_policy.allowed_private_instruction_hosts.
+KEEP_ADDRESSES = frozenset({"127.0.0.1"})
+REDACTED_V4 = "private-address.invalid"
+REDACTED_V6 = "ipv6-address.invalid"
+V4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)")
+V6_BRACKET_RE = re.compile(r"\[([0-9A-Fa-f:.%\w]*:[0-9A-Fa-f:.%\w]*)\]")
+V6_BARE_RE = re.compile(r"(?<![0-9A-Za-z:])[0-9A-Fa-f:]{2,45}(?![0-9A-Za-z:])")
+
+
+def _non_global(ip):
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+
+
+def redact_addresses(text):
+    def v4(m):
+        try:
+            ip = ipaddress.ip_address(m.group(0))
+        except ValueError:
+            return m.group(0)
+        return REDACTED_V4 if _non_global(ip) and str(ip) not in KEEP_ADDRESSES else m.group(0)
+
+    def v6_bracket(m):  # any bracketed IPv6 literal: the hub's URL pattern cannot parse it, and it is never needed in text
+        try:
+            ipaddress.IPv6Address(m.group(1).split("%", 1)[0])
+        except ValueError:
+            return m.group(0)
+        return REDACTED_V6
+
+    def v6_bare(m):
+        if m.group(0).count(":") < 2 or (len(m.group(0)) < 5 and m.group(0) != "::1"):  # skip short look-alikes such as C::D
+            return m.group(0)
+        try:
+            ip = ipaddress.IPv6Address(m.group(0))
+        except ValueError:
+            return m.group(0)
+        mapped = ip.ipv4_mapped
+        return REDACTED_V6 if _non_global(ip) or (mapped is not None and _non_global(mapped)) else m.group(0)
+
+    return V6_BARE_RE.sub(v6_bare, V4_RE.sub(v4, V6_BRACKET_RE.sub(v6_bracket, text)))
+
+
 def clean_text(value, limit):
-    return CTRL_RE.sub("", html.unescape(str(value or ""))).strip()[:limit]
+    return redact_addresses(CTRL_RE.sub("", html.unescape(str(value or "")))).strip()[:limit]
 
 
 def norm_url(url):
