@@ -94,7 +94,17 @@
         ],
         "allow_missing_taint": false,
         "max_messages": 12,
-        "block_on_review": false
+        "block_on_review": false,
+        "allow_scanner_findings": [
+          "input_dlp:private_host",
+          "input_dlp:high_entropy_path",
+          "input_dlp:encoded_path",
+          "input_dlp:url_query",
+          "input_dlp:url_fragment",
+          "input_dlp:punycode_host",
+          "input_dlp:url_shortener",
+          "input_dlp:local_path"
+        ]
       },
       "output_policy": {
         "block_secrets": true,
