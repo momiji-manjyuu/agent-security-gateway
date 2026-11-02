@@ -1,0 +1,22 @@
+[Unit]
+Description=SearXNG (local search backend for the ASG research service)
+After=network-online.target
+
+[Service]
+User=searxng
+Group=searxng
+Environment=SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+WorkingDirectory=/usr/local/searxng/searxng-src
+ExecStart=/usr/local/searxng/searx-pyenv/bin/python -m searx.webapp
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/usr/local/searxng
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

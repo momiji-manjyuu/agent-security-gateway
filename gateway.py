@@ -710,6 +710,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 route_max, route_max_ok = parse_int(artifact_policy.get("max_artifact_bytes"), default=0)
                 if not route_max_ok or route_max <= 0:
                     errors.append(f"routes.{route_id}.artifact_policy.max_artifact_bytes must be a positive integer")
+        route_output_policy = route.get("output_policy")
+        if isinstance(route_output_policy, dict) and "untrusted_tool_result" in route_output_policy:
+            if not isinstance(route_output_policy.get("untrusted_tool_result"), bool):
+                errors.append(f"routes.{route_id}.output_policy.untrusted_tool_result must be a boolean")
+            elif route_output_policy["untrusted_tool_result"] and kind != "http_json":
+                errors.append(f"routes.{route_id}.output_policy.untrusted_tool_result is only valid on http_json routes")
         backend = route.get("backend", {})
         if kind == "canary":
             if route.get("backend"):
@@ -756,6 +762,17 @@ def validate_config(cfg: dict[str, Any]) -> None:
                 timeout, timeout_ok = parse_int(backend.get("timeout_seconds", 180), default=180)
                 if not timeout_ok or not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
                     errors.append(f"routes.{route_id}.backend.timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")
+                if "passthrough_error_codes" in backend:
+                    codes = backend.get("passthrough_error_codes")
+                    if kind != "http_json":
+                        errors.append(f"routes.{route_id}.backend.passthrough_error_codes is only valid on http_json routes")
+                    elif not isinstance(codes, list) or not codes or any(
+                        not isinstance(code, str) or not BACKEND_ERROR_CODE_RE.fullmatch(code) for code in codes
+                    ):
+                        errors.append(
+                            f"routes.{route_id}.backend.passthrough_error_codes must be a non-empty list of lowercase codes "
+                            "(a-z, 0-9, underscore; 3-40 characters)"
+                        )
                 if "max_review_chars" in backend:
                     max_review_chars, max_review_chars_ok = parse_int(backend.get("max_review_chars"), default=0)
                     if not max_review_chars_ok or max_review_chars <= 0:
@@ -1441,7 +1458,11 @@ def normalized_allowed_private_instruction_hosts(decision: RouteDecision) -> set
 def private_url_hosts(text: str) -> set[str]:
     hosts: set[str] = set()
     for match in security.URL_PATTERN.finditer(text):
-        parsed = urllib.parse.urlsplit(match.group(0))
+        try:
+            parsed = urllib.parse.urlsplit(match.group(0))
+        except ValueError:
+            hosts.add("(unparseable)")  # never in an allow list, so the route cannot allow it
+            continue
         host = (parsed.hostname or "").lower().strip("[]")
         if host and is_private_host(host):
             hosts.add(host)
@@ -1560,7 +1581,13 @@ def action_guard(headers: Any, payload: dict[str, Any], cfg: dict[str, Any] | No
         findings.append(security.Finding("action_guard:dangerous_uri_scheme", 10, "dangerous URI scheme is not allowed"))
 
     for match in security.URL_PATTERN.finditer(normalized):
-        parsed = urllib.parse.urlsplit(match.group(0))
+        try:
+            parsed = urllib.parse.urlsplit(match.group(0))
+        except ValueError:
+            # e.g. a bracketed IPv6 literal (http://[::1]/): the URL pattern stops at "]", so the candidate cannot be parsed.
+            # Fail closed instead of raising, and never treat it as an allowed host.
+            findings.append(security.Finding("action_guard:private_network_target", 10, "private, loopback, or metadata URL target is not allowed"))
+            continue
         if parsed.hostname and is_private_host(parsed.hostname):
             findings.append(security.Finding("action_guard:private_network_target", 10, "private, loopback, or metadata URL target is not allowed"))
         if parsed.hostname and parsed.hostname.strip("[]") == "169.254.169.254":
@@ -2352,8 +2379,39 @@ def forward_http_json(
             return response.status, parsed
     except (socket.timeout, TimeoutError) as exc:
         raise GatewayError(504, "backend_timeout", "backend request timed out") from exc
+    except urllib.error.HTTPError as exc:
+        passed = passthrough_backend_error(backend, exc)
+        if passed is not None:
+            raise passed from exc
+        raise GatewayError(502, "backend_error", f"backend request failed: {type(exc).__name__}") from exc
     except urllib.error.URLError as exc:
         raise GatewayError(502, "backend_error", f"backend request failed: {type(exc).__name__}") from exc
+
+
+BACKEND_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,39}")
+BACKEND_ERROR_BODY_MAX = 4096
+
+
+def passthrough_backend_error(backend: dict[str, Any], exc: urllib.error.HTTPError) -> GatewayError | None:
+    """Opt-in per http_json route (backend.passthrough_error_codes). A backend rejection is opaque `backend_error` by default.
+    When the operator lists exact codes, a backend 4xx whose JSON body carries {"error": {"code": <listed code>}} is surfaced to
+    the caller as `backend_<code>` with the backend's status. Only the listed code is forwarded: never the body, message or
+    headers. Anything else (other codes, malformed or oversized bodies, 5xx, auth statuses) stays `backend_error`."""
+    allowed = backend.get("passthrough_error_codes")
+    if not isinstance(allowed, list) or not 400 <= exc.code <= 499 or exc.code in {401, 407}:
+        return None
+    try:
+        body = json.loads(exc.read(BACKEND_ERROR_BODY_MAX + 1).decode("utf-8", errors="replace"))
+        error = body.get("error") if isinstance(body, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        exc.close()
+    if not isinstance(code, str) or code not in allowed or not BACKEND_ERROR_CODE_RE.fullmatch(code):
+        return None
+    return GatewayError(exc.code, "backend_" + code, "backend rejected the request",
+                        audit_extra={"backend_status": exc.code, "backend_code": code})
 
 
 # Model "thinking" side channels that some OpenAI-compatible backends return next to message.content.
@@ -2809,6 +2867,7 @@ def output_text_for_route(payload: dict[str, Any], route_kind: str) -> str:
 def enforce_output_guard(payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> security.ScanResult:
     enforce_canary(cfg, payload, agent_id=None, client_ip="backend", source="backend_response")
     scan = security.output_guard_scan_for_upstream(payload, cfg, None)
+    relax_untrusted_tool_result(scan, cfg, decision)
     if decision.route.get("kind") == "openai_chat_completions":
         relax_fetch_action_url_query(scan, payload, cfg, decision)
         security.apply_snippet_check(scan, cfg, model_output=True)
@@ -4138,6 +4197,35 @@ def load_run_warnings(cfg: dict[str, Any], run_id: str | None) -> list[dict[str,
                         entry["categories"].append(item.get("category"))
                     entry["max_risk"] = max(entry["max_risk"], int(record.get("risk") or 0))
     return list(merged.values())[:RUN_WARNINGS_MAX]
+
+
+# Location-shape DLP findings (where a URL/path points), as opposed to content findings (secrets, injection, schemes).
+UNTRUSTED_TOOL_RESULT_RELAXABLE = frozenset(
+    f"{prefix}:{name}"
+    for prefix in ("input_dlp", "output_dlp")
+    for name in ("private_host", "high_entropy_path", "encoded_path", "url_query", "url_fragment", "punycode_host", "url_shortener", "local_path")
+)
+
+
+def relax_untrusted_tool_result(scan: Any, cfg: dict[str, Any], decision: RouteDecision) -> None:
+    """Opt-in per http_json route (output_policy.untrusted_tool_result). The response is untrusted web content on its way to
+    a model that has its own input guard, so URL/path SHAPE findings (localhost, long or encoded paths, query strings in
+    documentation links) are not egress evidence here. Everything else still decides: secrets, canary, prompt injection,
+    obfuscation, dangerous schemes, userinfo or sensitive query parameters, IP literals, system disclosure and any
+    incomplete inspection (boundary:scan_limit)."""
+    policy = decision.route.get("output_policy")
+    if not (isinstance(policy, dict) and policy.get("untrusted_tool_result") is True) or decision.route.get("kind") != "http_json":
+        return
+    dropped = [f for f in scan.findings if f.category in UNTRUSTED_TOOL_RESULT_RELAXABLE]
+    if not dropped:
+        return
+    scan.findings = [f for f in scan.findings if f.category not in UNTRUSTED_TOOL_RESULT_RELAXABLE]
+    scan.relaxed_categories = sorted({f.category for f in dropped})
+    guard = security.output_guard_config_for_capability(cfg, None).get("output_guard", {})
+    scan.risk_score = sum(f.severity for f in scan.findings)
+    incomplete = any(f.category == "boundary:scan_limit" for f in scan.findings)
+    scan.blocked = incomplete or scan.risk_score >= int(guard.get("block_risk_score", cfg.get("block_risk_score", 8)))
+    scan.requires_review = scan.risk_score >= int(guard.get("review_risk_score", cfg.get("review_risk_score", 4)))
 
 
 def relax_fetch_action_url_query(scan: Any, payload: dict[str, Any], cfg: dict[str, Any], decision: RouteDecision) -> None:

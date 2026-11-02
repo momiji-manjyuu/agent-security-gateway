@@ -11,11 +11,15 @@
       ],
       "allowed_capabilities": [
         "submit_artifact",
-        "worker_llm"
+        "worker_llm",
+        "worker_search",
+        "worker_fetch"
       ],
       "allowed_routes": [
         "fc.artifacts.submit",
-        "fc.llm.chat"
+        "fc.llm.chat",
+        "fc.search",
+        "fc.fetch"
       ]
     },
     "parent_mcp": {
@@ -90,7 +94,21 @@
         ],
         "allow_missing_taint": false,
         "max_messages": 12,
-        "block_on_review": false
+        "block_on_review": false,
+        "allowed_private_instruction_hosts": [
+          "localhost",
+          "127.0.0.1"
+        ],
+        "allow_scanner_findings": [
+          "input_dlp:private_host",
+          "input_dlp:high_entropy_path",
+          "input_dlp:encoded_path",
+          "input_dlp:url_query",
+          "input_dlp:url_fragment",
+          "input_dlp:punycode_host",
+          "input_dlp:url_shortener",
+          "input_dlp:local_path"
+        ]
       },
       "output_policy": {
         "block_secrets": true,
@@ -100,6 +118,72 @@
       },
       "action_policy": {
         "read_only_model": true
+      },
+      "report_run_warnings": true
+    },
+    "fc.search": {
+      "kind": "http_json",
+      "description": "researcher profile only: web search via the research service (filtered results). Callable only if spawn_worker registered the route for that run.",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "worker_search",
+      "require_run_id": true,
+      "backend": {
+        "mode": "http",
+        "base_url": "http://<RESEARCH_SERVICE_HOST>:8790",
+        "path": "/search",
+        "method": "POST",
+        "timeout_seconds": 60,
+        "require_signature": true,
+        "passthrough_error_codes": ["url_not_eligible", "url_scheme", "url_userinfo", "url_port", "url_ip_literal", "url_host", "url_blocked_host", "url_blocked_url", "url_malformed", "non_public_address", "dns_failed", "fetch_failed", "too_many_redirects", "redirect_not_allowed", "content_type_not_allowed", "host_quota_exceeded", "fetch_quota_exceeded", "byte_quota_exceeded", "search_quota_exceeded", "empty_query", "search_backend_error"]
+      },
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "max_messages": 1
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true,
+        "untrusted_tool_result": true
+      },
+      "report_run_warnings": true
+    },
+    "fc.fetch": {
+      "kind": "http_json",
+      "description": "researcher profile only: fetch of a URL eligible for this run (seed, search result or linked page); checked and fetched by the research service.",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "worker_fetch",
+      "require_run_id": true,
+      "backend": {
+        "mode": "http",
+        "base_url": "http://<RESEARCH_SERVICE_HOST>:8790",
+        "path": "/fetch",
+        "method": "POST",
+        "timeout_seconds": 60,
+        "require_signature": true,
+        "passthrough_error_codes": ["url_not_eligible", "url_scheme", "url_userinfo", "url_port", "url_ip_literal", "url_host", "url_blocked_host", "url_blocked_url", "url_malformed", "non_public_address", "dns_failed", "fetch_failed", "too_many_redirects", "redirect_not_allowed", "content_type_not_allowed", "host_quota_exceeded", "fetch_quota_exceeded", "byte_quota_exceeded", "search_quota_exceeded", "empty_query", "search_backend_error"]
+      },
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_web",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "max_messages": 1
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true,
+        "untrusted_tool_result": true
       },
       "report_run_warnings": true
     },

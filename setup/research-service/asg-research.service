@@ -1,0 +1,24 @@
+[Unit]
+Description=ASG research service (search + eligible-URL fetch for researcher workers)
+After=network-online.target
+
+[Service]
+User=asg-research
+Group=asg
+EnvironmentFile=/etc/asg/research.env
+ExecStart=/usr/bin/python3 /usr/local/lib/asg/research_service.py /etc/asg/research-service.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

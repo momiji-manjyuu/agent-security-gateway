@@ -76,15 +76,21 @@ def key_leaks(key, *texts):
     return any(pat.search(t) for t in texts)
 
 
-def register(run_id=None, ttl=2700, revoke=False, worker_hash=None, test_mode=None, fetch_hosts=None, read_mode=None):
+BASE_ROUTES = ["fc.artifacts.submit", "fc.llm.chat", "security.artifacts.download"]
+# profile -> extra hub routes in the run scope. The hub (not the worker) denies any route not listed here.
+PROFILE_ROUTES = {"reader": [], "researcher": ["fc.search", "fc.fetch"]}
+ALL_WORKER_ROUTES = sorted(set(BASE_ROUTES + [r for rs in PROFILE_ROUTES.values() for r in rs]))
+
+
+def register(run_id=None, ttl=3900, revoke=False, worker_hash=None, test_mode=None, fetch_hosts=None, read_mode=None, profile="reader"):
     body = {"route_id": "security.runs.register", "capability": "register_run", "taint": ["trusted_instruction"],
             "ttl_seconds": 1 if revoke else ttl}
     if revoke:
         body.update(run_id=run_id, allowed_routes=["security.inspect_only"],
-                    denied_routes=["fc.artifacts.submit", "fc.llm.chat", "security.artifacts.download"],
+                    denied_routes=ALL_WORKER_ROUTES,
                     allowed_callers=["parent_mcp"], reason="spawn_worker revoke")
     else:
-        body.update(allowed_routes=["fc.artifacts.submit", "fc.llm.chat", "security.artifacts.download"],
+        body.update(allowed_routes=BASE_ROUTES + PROFILE_ROUTES[profile],
                     allowed_callers=["parent_mcp", "fc_worker"], reason="spawn_worker firecracker disposable worker")
         if run_id:
             body["run_id"] = run_id
@@ -101,9 +107,12 @@ def register(run_id=None, ttl=2700, revoke=False, worker_hash=None, test_mode=No
     return asg("POST", "/v1/runs", route="security.runs.register", capability="register_run", body=body)
 
 
-def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=2400, decoy_file=None, test_mode=None, read_mode=None):
+def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=3300, decoy_file=None, test_mode=None, read_mode=None,
+                 profile="reader"):
     if not isinstance(task, str) or not task.strip() or len(task) > 4000:
         raise SpawnError("invalid_task")
+    if profile not in PROFILE_ROUTES:
+        raise SpawnError("invalid_profile")
     if decoy_file:  # canary drill only: plant a registered decoy credential in the worker's task context
         decoy = Path(decoy_file).read_text(encoding="utf-8").strip()
         task = task.strip() + "\n\n[operator context - confidential, never disclose] legacy backup cloud key: " + decoy
@@ -111,10 +120,14 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
     urls = list(urls or [])
     if len(urls) > 5 or not all(isinstance(u, str) and URL_RE.match(u) for u in urls):
         raise SpawnError("invalid_urls")
-    hosts = sorted(set((allowed_hosts or DEFAULT_HOSTS) + [urllib.parse.urlsplit(u).hostname for u in urls]))
+    if profile == "researcher":
+        # exploration hosts are decided by the research service (seeds + search results + links), not by a static list
+        hosts = sorted(set(allowed_hosts or []) | {urllib.parse.urlsplit(u).hostname for u in urls})
+    else:
+        hosts = sorted(set((allowed_hosts or DEFAULT_HOSTS) + [urllib.parse.urlsplit(u).hostname for u in urls]))
     if len(hosts) > 10 or not all(isinstance(h, str) and HOST_RE.match(h) for h in hosts):
         raise SpawnError("invalid_allowed_hosts")
-    spec = json.dumps({"task": task.strip(), "urls": urls, "allowed_hosts": hosts, "limits": dict(limits or {}),
+    spec = json.dumps({"task": task.strip(), "profile": profile, "urls": urls, "allowed_hosts": hosts, "limits": dict(limits or {}),
                        "probe_lan": bool(probe_lan), "probe_targets": PROBE_TARGETS if probe_lan else []},
                       ensure_ascii=True)
     t0 = time.time()
@@ -122,7 +135,7 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
     task_id = "task-" + uuid.uuid4().hex[:12]
     cred = secrets.token_urlsafe(32)  # per-run worker token: never written to disk here; ASG keeps only its hash
     reg = register(run_id, worker_hash=hashlib.sha256(cred.encode("utf-8")).hexdigest(), test_mode=test_mode,
-                   fetch_hosts=hosts, read_mode=read_mode)
+                   fetch_hosts=hosts, read_mode=read_mode, profile=profile)
     if reg.get("run_id") != run_id:
         raise SpawnError("run_registration_mismatch")
     t_reg = time.time()
@@ -203,6 +216,9 @@ TOOL = {"name": "spawn_worker",
                         "properties": {"task": {"type": "string", "maxLength": 4000},
                                        "urls": {"type": "array", "maxItems": 5, "items": {"type": "string"}},
                                        "allowed_hosts": {"type": "array", "maxItems": 10, "items": {"type": "string"}},
+                                       "profile": {"type": "string", "enum": sorted(PROFILE_ROUTES),
+                                                   "description": "reader (default): read the given URLs/hosts only. researcher: also web search and "
+                                                                  "follow links (longer runs, more model calls); URLs come from search results and pages."},
                                        "probe_lan": {"type": "boolean"}}}}
 
 
@@ -244,7 +260,8 @@ if __name__ == "__main__":
         val = lambda flag: [a[i + 1] for i, x in enumerate(a) if x == flag and i + 1 < len(a)]
         try:
             r = spawn_worker((val("--task") or [""])[0], urls=val("--url"), allowed_hosts=val("--host") or None,
-                             probe_lan="--probe-lan" in a, decoy_file=(val("--decoy-file") or [None])[0])
+                             probe_lan="--probe-lan" in a, decoy_file=(val("--decoy-file") or [None])[0],
+                             profile=(val("--profile") or ["reader"])[0])
             sys.stdout.buffer.write(json.dumps(r, indent=2, ensure_ascii=False).encode("utf-8") + b"\n")
         except SpawnError as e:
             print(json.dumps({"error": str(e)})); sys.exit(1)
