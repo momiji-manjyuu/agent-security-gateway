@@ -130,7 +130,7 @@ class SpawnRepoAuditorTests(unittest.TestCase):
         calls = []
         self.sw.asg = lambda method, path, **kw: calls.append(kw["body"]) or {"run_id": kw["body"].get("run_id")}
         self.sw.register("r1", profile="repo_auditor")
-        self.sw.register("r2", revoke=True)
+        self.sw.register("r2", revoke=True, profile="repo_auditor")
         self.assertEqual(calls[0]["allowed_routes"], self.sw.BASE_ROUTES + ["fc.repo"])
         self.assertIn("fc.repo", calls[1]["denied_routes"])
 

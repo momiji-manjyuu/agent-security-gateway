@@ -83,12 +83,18 @@ PROFILE_ROUTES = {"reader": [], "researcher": ["fc.search", "fc.fetch"], "repo_a
 ALL_WORKER_ROUTES = sorted(set(BASE_ROUTES + [r for rs in PROFILE_ROUTES.values() for r in rs]))
 
 
+def run_routes(profile):
+    """Routes a run of this profile was registered with. The hub rejects a registration that names an undefined route, so the
+    revoke record must only name routes the run itself could use (a hub that predates a newer profile's route still revokes)."""
+    return sorted(set(BASE_ROUTES + PROFILE_ROUTES[profile]))
+
+
 def register(run_id=None, ttl=3900, revoke=False, worker_hash=None, test_mode=None, fetch_hosts=None, read_mode=None, profile="reader"):
     body = {"route_id": "security.runs.register", "capability": "register_run", "taint": ["trusted_instruction"],
             "ttl_seconds": 1 if revoke else ttl}
     if revoke:
         body.update(run_id=run_id, allowed_routes=["security.inspect_only"],
-                    denied_routes=ALL_WORKER_ROUTES,
+                    denied_routes=run_routes(profile),
                     allowed_callers=["parent_mcp"], reason="spawn_worker revoke")
     else:
         body.update(allowed_routes=BASE_ROUTES + PROFILE_ROUTES[profile],
@@ -221,7 +227,7 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
                             "asg_fetch": round(t_fetch - t_orch, 2)}
     finally:
         try:
-            rv = register(run_id, revoke=True)
+            rv = register(run_id, revoke=True, profile=profile)
             out["revoked"] = {"ok": rv.get("run_id") == run_id, "expires_at": rv.get("expires_at")}
         except SpawnError as e:
             out["revoked"] = {"ok": False, "error": str(e)}
