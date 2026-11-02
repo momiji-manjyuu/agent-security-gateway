@@ -124,6 +124,7 @@ profile = s.get("profile", "reader")
 PROFILES = {
     "reader": {"max_steps": (6, 8), "max_llm_calls": (4, 6), "max_tokens": (32768, 32768), "max_seconds": (1200, 1800), "page_chars": (6000, 8000)},
     "researcher": {"max_steps": (24, 30), "max_llm_calls": (30, 40), "max_tokens": (32768, 32768), "max_seconds": (1800, 2400), "page_chars": (8000, 12000)},
+    "repo_auditor": {"max_steps": (30, 40), "max_llm_calls": (30, 40), "max_tokens": (32768, 32768), "max_seconds": (1800, 2400), "page_chars": (8000, 12000)},
 }
 if not isinstance(profile, str) or profile not in PROFILES:
     bad("profile")
@@ -148,6 +149,22 @@ for u in urls:
         port_ok = False
     if (profile == "reader" and p.hostname not in hosts) or p.username is not None or not port_ok:
         bad("url")
+# repo_auditor: repositories are chosen by the parent's trusted request and registered with the research service by this
+# script; the worker only ever names one of them. No other profile may carry repositories, and repo_auditor takes no URLs/hosts.
+repos = s.get("repos") or []
+if not isinstance(repos, list) or len(repos) > 3 or (profile == "repo_auditor") != bool(repos) or (profile == "repo_auditor" and (urls or hosts)):
+    bad("repos")
+repo_specs = []
+for r in repos:
+    if not isinstance(r, dict) or set(r) - {"forge", "owner", "repo", "ref"}:
+        bad("repo")
+    forge, owner, name, ref = r.get("forge", "github.com"), r.get("owner"), r.get("repo"), r.get("ref")
+    if not all(isinstance(x, str) for x in (forge, owner, name, ref)) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,60}", forge):
+        bad("repo")
+    if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", owner) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", name)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,99}", ref)) or ".." in ref or "//" in ref or ref.endswith(("/", ".")) or name.endswith(".git"):
+        bad("repo")
+    repo_specs.append({"forge": forge, "owner": owner, "repo": name, "ref": ref})
 L = s.get("limits") or {}
 if not isinstance(L, dict):
     bad("limits")
@@ -173,6 +190,7 @@ for t in probes:
         bad("probe_target")
 json.dump({"asg": {"run_id": os.environ["ASG_RUN_ID"], "task_id": os.environ["ASG_TASK_ID"], "task": task, "urls": urls,
                    "profile": profile, "allowed_hosts": hosts, "limits": limits, "probe_lan": bool(s.get("probe_lan")), "probe_targets": probes,
+                   "repos": [x["owner"] + "/" + x["repo"] for x in repo_specs], "repo_specs": repo_specs,
                    "credential": os.environ["ASG_CRED"], "asg_url": os.environ["ASG_GUEST_URL"]}}, open(sys.argv[1], "w"))
 open(sys.argv[1] + ".timeout", "w").write("%d\n" % (limits["max_seconds"] + 120))
 open(sys.argv[1] + ".profile", "w").write(profile + "\n")
@@ -182,7 +200,7 @@ TIMEOUT=$(cat "$RUN/metadata.json.timeout"); PROFILE=$(cat "$RUN/metadata.json.p
 (( TIMEOUT > ASG_FC_TIMEOUT_MAX )) && TIMEOUT=$ASG_FC_TIMEOUT_MAX
 (( TIMEOUT < ASG_FC_TIMEOUT )) && TIMEOUT=$ASG_FC_TIMEOUT
 rm -f "$RUN/metadata.json.timeout" "$RUN/metadata.json.profile"
-if [[ $PROFILE == researcher ]]; then
+if [[ $PROFILE == researcher || $PROFILE == repo_auditor ]]; then
   # register the run (seed URLs + quotas) with the research service BEFORE the VM boots; fail closed when unavailable
   [[ -n $ASG_FC_RESEARCH_URL && -n $ASG_FC_RESEARCH_KEY_FILE ]] || die research_service_not_configured
   RS_URL=$ASG_FC_RESEARCH_URL RS_KEY_FILE=$ASG_FC_RESEARCH_KEY_FILE python3 - "$RUN/metadata.json" <<'P' || die research_register_failed
@@ -191,8 +209,9 @@ m = json.load(open(sys.argv[1]))["asg"]
 key = open(os.environ["RS_KEY_FILE"]).read().strip()
 if len(key) < 32:
     raise SystemExit(1)
-body = json.dumps({"run_id": m["run_id"], "seed_urls": m["urls"],
-                   "limits": {"fetches": m["limits"]["max_steps"] * 2, "searches": m["limits"]["max_steps"]}}).encode()
+body = json.dumps({"run_id": m["run_id"], "seed_urls": m["urls"], "repos": m.get("repo_specs", []),
+                   "limits": {"fetches": m["limits"]["max_steps"] * 2, "searches": m["limits"]["max_steps"],
+                             "repo_calls": m["limits"]["max_steps"] * 2}}).encode()
 ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 sig = "sha256=" + hmac.new(key.encode(), ts.encode() + b"\n" + body, hashlib.sha256).hexdigest()
 req = urllib.request.Request(os.environ["RS_URL"].rstrip("/") + "/register", data=body, method="POST",

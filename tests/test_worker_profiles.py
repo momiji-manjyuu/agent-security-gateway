@@ -131,7 +131,7 @@ class SpawnWorkerProfileTests(unittest.TestCase):
             self.sw.spawn_worker("t", profile="admin")
 
     def test_mcp_exposes_only_known_profiles(self):
-        self.assertEqual(self.sw.TOOL["inputSchema"]["properties"]["profile"]["enum"], ["reader", "researcher"])
+        self.assertEqual(self.sw.TOOL["inputSchema"]["properties"]["profile"]["enum"], ["reader", "repo_auditor", "researcher"])
 
     def test_fragment_registers_routes_for_run_scoped_worker(self):
         frag = json.loads((ROOT.parents[1] / "examples" / "config.fc-worker.fragment.json").read_text(encoding="utf-8"))

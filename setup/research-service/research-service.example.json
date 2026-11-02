@@ -9,5 +9,10 @@
   "blocked_suffixes": [".onion", ".local", ".internal", ".lan", ".localhost"],
   "blocked_url_regex": [],
   "max_results": 8,
-  "limits": {"searches": 25, "fetches": 60, "bytes": 8388608, "hosts": 25, "page_chars": 12000, "links": 40}
+  "limits": {"searches": 25, "fetches": 60, "bytes": 8388608, "hosts": 25, "page_chars": 12000, "links": 40, "repo_calls": 150},
+  "repo_forges": {"github.com": "https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"},
+  "repo_max_archive_bytes": 26214400,
+  "repo_max_uncompressed_bytes": 62914560,
+  "repo_max_files": 5000,
+  "repo_max_file_bytes": 524288
 }

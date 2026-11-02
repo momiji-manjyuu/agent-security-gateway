@@ -36,6 +36,7 @@ PROBE_TARGETS = _CFG.get("probe_targets", [])                 # [[ipv4, port], .
 ART_RE = re.compile(r"^art_[a-f0-9]{32}$")
 URL_RE = re.compile(r"^https://[A-Za-z0-9._~%/?=&+():,-]{1,290}$")
 HOST_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
+REPO_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]{0,99})/([A-Za-z0-9][A-Za-z0-9_.-]{0,99})(?:@([A-Za-z0-9][A-Za-z0-9_./-]{0,99}))?$")
 DEFAULT_HOSTS = _CFG.get("default_hosts", ["example.com", "www.example.com", "en.wikipedia.org", "ja.wikipedia.org"])
 
 
@@ -78,7 +79,7 @@ def key_leaks(key, *texts):
 
 BASE_ROUTES = ["fc.artifacts.submit", "fc.llm.chat", "security.artifacts.download"]
 # profile -> extra hub routes in the run scope. The hub (not the worker) denies any route not listed here.
-PROFILE_ROUTES = {"reader": [], "researcher": ["fc.search", "fc.fetch"]}
+PROFILE_ROUTES = {"reader": [], "researcher": ["fc.search", "fc.fetch"], "repo_auditor": ["fc.repo"]}
 ALL_WORKER_ROUTES = sorted(set(BASE_ROUTES + [r for rs in PROFILE_ROUTES.values() for r in rs]))
 
 
@@ -107,8 +108,24 @@ def register(run_id=None, ttl=3900, revoke=False, worker_hash=None, test_mode=No
     return asg("POST", "/v1/runs", route="security.runs.register", capability="register_run", body=body)
 
 
+def parse_repos(repos):
+    """"owner/name[@ref]" strings (github.com, ref defaults to HEAD) -> specs for the orchestrator; the worker never picks them."""
+    out = []
+    for r in repos or []:
+        m = REPO_RE.match(r) if isinstance(r, str) else None
+        if not m or m.group(1) in (".", "..") or m.group(2) in (".", "..") or m.group(2).endswith(".git"):
+            raise SpawnError("invalid_repos")
+        ref = m.group(3) or "HEAD"
+        if ".." in ref or "//" in ref or ref.endswith(("/", ".")):
+            raise SpawnError("invalid_repos")
+        out.append({"forge": "github.com", "owner": m.group(1), "repo": m.group(2), "ref": ref})
+    if len(out) > 3:
+        raise SpawnError("invalid_repos")
+    return out
+
+
 def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=False, timeout=3300, decoy_file=None, test_mode=None, read_mode=None,
-                 profile="reader"):
+                 profile="reader", repos=None):
     if not isinstance(task, str) or not task.strip() or len(task) > 4000:
         raise SpawnError("invalid_task")
     if profile not in PROFILE_ROUTES:
@@ -120,14 +137,19 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
     urls = list(urls or [])
     if len(urls) > 5 or not all(isinstance(u, str) and URL_RE.match(u) for u in urls):
         raise SpawnError("invalid_urls")
-    if profile == "researcher":
+    repo_specs = parse_repos(repos)
+    if (profile == "repo_auditor") != bool(repo_specs) or (profile == "repo_auditor" and (urls or allowed_hosts)):
+        raise SpawnError("invalid_repos")  # repo_auditor needs 1-3 repositories and takes no URLs/hosts; other profiles take none
+    if profile == "repo_auditor":
+        hosts = []
+    elif profile == "researcher":
         # exploration hosts are decided by the research service (seeds + search results + links), not by a static list
         hosts = sorted(set(allowed_hosts or []) | {urllib.parse.urlsplit(u).hostname for u in urls})
     else:
         hosts = sorted(set((allowed_hosts or DEFAULT_HOSTS) + [urllib.parse.urlsplit(u).hostname for u in urls]))
     if len(hosts) > 10 or not all(isinstance(h, str) and HOST_RE.match(h) for h in hosts):
         raise SpawnError("invalid_allowed_hosts")
-    spec = json.dumps({"task": task.strip(), "profile": profile, "urls": urls, "allowed_hosts": hosts, "limits": dict(limits or {}),
+    spec = json.dumps({"task": task.strip(), "profile": profile, "urls": urls, "allowed_hosts": hosts, "limits": dict(limits or {}), "repos": repo_specs,
                        "probe_lan": bool(probe_lan), "probe_targets": PROBE_TARGETS if probe_lan else []},
                       ensure_ascii=True)
     t0 = time.time()
@@ -139,7 +161,7 @@ def spawn_worker(task, urls=None, allowed_hosts=None, limits=None, probe_lan=Fal
     if reg.get("run_id") != run_id:
         raise SpawnError("run_registration_mismatch")
     t_reg = time.time()
-    out = {"run_id": run_id, "task_id": task_id, **({"test_mode": test_mode} if test_mode else {}), **({"read_mode": read_mode} if read_mode else {}), "task": task.strip()[:200].split("[operator context")[0], "urls": urls, "allowed_hosts": hosts,
+    out = {"run_id": run_id, "task_id": task_id, **({"test_mode": test_mode} if test_mode else {}), **({"read_mode": read_mode} if read_mode else {}), "task": task.strip()[:200].split("[operator context")[0], "urls": urls, "allowed_hosts": hosts, **({"repos": repos} if repo_specs else {}),
            "run_expires_at": reg.get("expires_at")}
     try:
         # guard: the parent's provider key (dsh apiKeyEnv) must never reach the worker
@@ -216,9 +238,12 @@ TOOL = {"name": "spawn_worker",
                         "properties": {"task": {"type": "string", "maxLength": 4000},
                                        "urls": {"type": "array", "maxItems": 5, "items": {"type": "string"}},
                                        "allowed_hosts": {"type": "array", "maxItems": 10, "items": {"type": "string"}},
+                                       "repos": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 210},
+                                                 "description": "repo_auditor only: GitHub repositories as owner/name or owner/name@ref (tag, branch or commit)."},
                                        "profile": {"type": "string", "enum": sorted(PROFILE_ROUTES),
                                                    "description": "reader (default): read the given URLs/hosts only. researcher: also web search and "
-                                                                  "follow links (longer runs, more model calls); URLs come from search results and pages."},
+                                                                  "follow links (longer runs, more model calls); URLs come from search results and pages. repo_auditor: read-only "
+                                                                  "review of the repos given in `repos` (tree, read, grep; nothing is executed)."},
                                        "probe_lan": {"type": "boolean"}}}}
 
 
@@ -261,7 +286,7 @@ if __name__ == "__main__":
         try:
             r = spawn_worker((val("--task") or [""])[0], urls=val("--url"), allowed_hosts=val("--host") or None,
                              probe_lan="--probe-lan" in a, decoy_file=(val("--decoy-file") or [None])[0],
-                             profile=(val("--profile") or ["reader"])[0])
+                             profile=(val("--profile") or ["reader"])[0], repos=val("--repo") or None)
             sys.stdout.buffer.write(json.dumps(r, indent=2, ensure_ascii=False).encode("utf-8") + b"\n")
         except SpawnError as e:
             print(json.dumps({"error": str(e)})); sys.exit(1)
