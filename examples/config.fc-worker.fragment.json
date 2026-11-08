@@ -13,13 +13,15 @@
         "submit_artifact",
         "worker_llm",
         "worker_search",
-        "worker_fetch"
+        "worker_fetch",
+        "worker_repo"
       ],
       "allowed_routes": [
         "fc.artifacts.submit",
         "fc.llm.chat",
         "fc.search",
-        "fc.fetch"
+        "fc.fetch",
+        "fc.repo"
       ]
     },
     "parent_mcp": {
@@ -174,6 +176,39 @@
       "input_policy": {
         "accepted_taint": [
           "untrusted_web",
+          "model_output"
+        ],
+        "allow_missing_taint": false,
+        "max_messages": 1
+      },
+      "output_policy": {
+        "block_secrets": true,
+        "block_private_urls": true,
+        "block_internal_paths": true,
+        "untrusted_tool_result": true
+      },
+      "report_run_warnings": true
+    },
+    "fc.repo": {
+      "kind": "http_json",
+      "description": "repo_auditor profile only: read-only tree/read/grep over a repository snapshot the orchestrator registered for this run; served by the research service (the worker never names a URL).",
+      "allowed_callers": [
+        "fc_worker"
+      ],
+      "required_capability": "worker_repo",
+      "require_run_id": true,
+      "backend": {
+        "mode": "http",
+        "base_url": "http://<RESEARCH_SERVICE_HOST>:8790",
+        "path": "/repo",
+        "method": "POST",
+        "timeout_seconds": 90,
+        "require_signature": true,
+        "passthrough_error_codes": ["repo_not_registered", "repo_not_found", "repo_quota_exceeded", "bad_op", "bad_path", "bad_pattern", "bad_start_line", "path_not_found", "not_a_directory", "not_text_file", "file_too_large", "non_public_address", "dns_failed", "archive_fetch_failed", "archive_too_large", "archive_too_many_files", "archive_unsafe_path", "archive_invalid", "archive_empty"]
+      },
+      "input_policy": {
+        "accepted_taint": [
+          "untrusted_github",
           "model_output"
         ],
         "allow_missing_taint": false,

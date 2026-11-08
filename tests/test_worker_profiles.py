@@ -118,12 +118,21 @@ class SpawnWorkerProfileTests(unittest.TestCase):
         self.assertEqual(calls[0]["allowed_routes"], self.sw.BASE_ROUTES)
         self.assertEqual(calls[1]["allowed_routes"], self.sw.BASE_ROUTES + ["fc.search", "fc.fetch"])
 
-    def test_revoke_denies_every_worker_route(self):
+    def test_revoke_denies_every_route_the_run_had(self):
         calls = []
         self.sw.asg = lambda method, path, **kw: calls.append(kw["body"]) or {}
-        self.sw.register("r1", revoke=True)
+        self.sw.register("r1", revoke=True, profile="researcher")
         for route in ("fc.search", "fc.fetch", "fc.llm.chat", "fc.artifacts.submit"):
             self.assertIn(route, calls[0]["denied_routes"])
+
+    def test_revoke_names_only_routes_of_the_runs_profile(self):
+        # a hub that does not define a newer profile's route would reject the revoke record (undefined route) and leave the run live
+        calls = []
+        self.sw.asg = lambda method, path, **kw: calls.append(kw["body"]) or {}
+        self.sw.register("r1", revoke=True, profile="reader")
+        self.sw.register("r2", revoke=True, profile="researcher")
+        self.assertEqual(calls[0]["denied_routes"], sorted(self.sw.BASE_ROUTES))
+        self.assertNotIn("fc.repo", calls[1]["denied_routes"])
 
     def test_unknown_profile_rejected_before_any_call(self):
         self.sw.asg = lambda *a, **k: self.fail("must not reach ASG")
@@ -131,7 +140,7 @@ class SpawnWorkerProfileTests(unittest.TestCase):
             self.sw.spawn_worker("t", profile="admin")
 
     def test_mcp_exposes_only_known_profiles(self):
-        self.assertEqual(self.sw.TOOL["inputSchema"]["properties"]["profile"]["enum"], ["reader", "researcher"])
+        self.assertEqual(self.sw.TOOL["inputSchema"]["properties"]["profile"]["enum"], ["reader", "repo_auditor", "researcher"])
 
     def test_fragment_registers_routes_for_run_scoped_worker(self):
         frag = json.loads((ROOT.parents[1] / "examples" / "config.fc-worker.fragment.json").read_text(encoding="utf-8"))

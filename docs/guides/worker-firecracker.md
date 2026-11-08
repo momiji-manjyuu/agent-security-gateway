@@ -23,15 +23,19 @@ Runbooks with full details: [../runbooks/firecracker-golden-image.md](../runbook
 4. **Health.** Add `asg-health-check.sh` to the login user's crontab, see [health-monitoring.md](health-monitoring.md).
 5. **Limits** (enforced by the orchestrator as root): steps ≤ 8, LLM calls ≤ 6, `max_tokens` ≤ 32768,
    `max_seconds` ≤ 1800, ≤ 5 URLs, ≤ 10 allowed hosts.
-6. **Profiles.** `spawn_worker` selects `reader` (default) or `researcher`; the profile decides which hub routes the
+6. **Profiles.** `spawn_worker` selects `reader` (default), `researcher` or `repo_auditor`; the profile decides which hub routes the
    run scope lists and which limits the orchestrator applies.
 
    | Profile | Extra routes | Caps (steps / LLM calls / seconds / page chars) |
    |---|---|---|
    | `reader` | none | 8 / 6 / 1800 / 8000 |
    | `researcher` | `fc.search`, `fc.fetch` | 30 / 40 / 2400 / 12000 |
+   | `repo_auditor` | `fc.repo` | 40 / 40 / 2400 / 12000 |
 
-   `researcher` needs the research service and the two hub routes: see
+   `repo_auditor` also takes `repos` (1-3 `owner/name[@ref]` GitHub repositories, chosen by the parent, no URLs/hosts) and is
+   read-only: tree, file read and literal grep over a snapshot held by the research service; nothing is executed.
+
+   `researcher` and `repo_auditor` need the research service and their hub routes: see
    [../runbooks/research-service.md](../runbooks/research-service.md) and
    [../design/worker-profiles.md](../design/worker-profiles.md). The VM wall-clock cap is the profile's
    `max_seconds` + 120 s, never above `ASG_FC_TIMEOUT_MAX`.

@@ -127,5 +127,6 @@ max_steps ≤ 8, max_llm_calls ≤ 6, max_tokens ≤ 32768 (既定 32768), max_s
   `obfuscation:` は既定では対象外 (符号化ブロブは密輸経路)。必要なら `artifact_policy.warning_release_categories: ["prompt_injection:", "obfuscation:"]` で明示的に許可する。
   ダウンロード側ルートは `allowed_statuses` に `verified_with_warnings` を明示しない限り拒否する (既定は `verified` のみ)。`spawn_worker` は `ok_with_warnings` を返す。
   manifest の `asg_warnings` に `artifact_scan / warned` が必ず付き、taint `describes_untrusted_instructions` が付く。ブロック級はそのまま保留。
+  **ダウンロード側ルートの `input_policy.accepted_taint` にも `describes_untrusted_instructions` を明示する必要がある** (無いと提出は `verified_with_warnings` で通るが、ダウンロードは `taint_denied` で拒否される。fail closed なので安全側だが機能しない)。実機で確認済み (Rev29)。
 - 出力側スニペット判定の「URL あり」判定は無害化済み URL (`hxxps://`, `[.]`) を数えない。
 - Windows 側アカウント分離・自己修復・SPOF は `setup/windows-service-account/README.md`。

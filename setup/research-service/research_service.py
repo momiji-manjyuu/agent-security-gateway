@@ -7,11 +7,17 @@ backend). The orchestrator registers each run (/register, separate key) before t
 
   POST /search    {query}  -> filtered results from a local SearXNG (URL fixed in config, never from a request)
   POST /fetch     {url}    -> page text + links, only for URLs that are eligible for this run
-  POST /register  {run_id, seed_urls, limits}   (orchestrator only)
+  POST /repo      {repo, action, ...} -> list_tree / read_file / grep over a read-only snapshot of a repository the
+                  orchestrator registered for this run (repo_auditor profile; archive from a configured forge only)
+  POST /register  {run_id, seed_urls, limits, repos}   (orchestrator only)
   GET  /healthz
 
 A URL is eligible when it is a registered seed, was returned by this run's search, or was linked from a page
 this run already fetched. Everything is deterministic: no model decides anything here.
+
+Repositories are never chosen by the worker: the orchestrator registers {forge, owner, repo, ref} per run, the archive
+URL comes from the operator's `repo_forges` templates, and the tarball is held in memory (never extracted to disk;
+links, devices and unsafe paths are not kept) and served read-only.
 """
 import datetime as dt
 import hashlib
@@ -20,6 +26,7 @@ import html
 import html.parser
 import http.client
 import http.server
+import io
 import ipaddress
 import json
 import os
@@ -27,20 +34,26 @@ import re
 import socket
 import ssl
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
+import zlib
 
 DEFAULTS = {
     "listen_host": "127.0.0.1", "listen_port": 8790,
     "searxng_url": "http://127.0.0.1:8080",
     "backend_hmac_key_env": "ASG_BACKEND_HMAC_KEY", "register_key_env": "ASG_RESEARCH_REGISTER_KEY",
-    "allowed_agents": ["fc_worker"], "route_ids": {"/search": "fc.search", "/fetch": "fc.fetch"},
+    "allowed_agents": ["fc_worker"], "route_ids": {"/search": "fc.search", "/fetch": "fc.fetch", "/repo": "fc.repo"},
     "blocked_hosts": [], "blocked_suffixes": [".onion", ".local", ".internal", ".lan", ".localhost"],
     "blocked_url_regex": [],
     "max_results": 8, "snippet_chars": 300, "title_chars": 160, "query_chars": 300,
-    "limits": {"searches": 25, "fetches": 60, "bytes": 8 * 1024 * 1024, "hosts": 25, "page_chars": 12000, "links": 40},
-    "limit_caps": {"searches": 60, "fetches": 150, "bytes": 32 * 1024 * 1024, "hosts": 60, "page_chars": 20000, "links": 80},
+    "limits": {"searches": 25, "fetches": 60, "bytes": 8 * 1024 * 1024, "hosts": 25, "page_chars": 12000, "links": 40, "repo_calls": 150},
+    "limit_caps": {"searches": 60, "fetches": 150, "bytes": 32 * 1024 * 1024, "hosts": 60, "page_chars": 20000, "links": 80, "repo_calls": 400},
+    # repo_auditor: forge name -> archive URL template ({owner}, {repo}, {ref}); a null value removes a default forge
+    "repo_forges": {"github.com": "https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"},
+    "repo_max_archive_bytes": 25 * 1024 * 1024, "repo_max_uncompressed_bytes": 60 * 1024 * 1024, "repo_max_members": 20000,
+    "repo_max_files": 5000, "repo_max_file_bytes": 512 * 1024, "repo_list_entries": 200, "repo_grep_matches": 50, "repo_max_repos": 3,
     "run_ttl_seconds": 4500, "fetch_timeout": 20, "max_page_bytes": 1024 * 1024, "max_redirects": 3,
     "allowed_content_types": ["text/html", "text/plain", "text/markdown", "application/xhtml+xml"],
 }
@@ -66,6 +79,13 @@ def load_config(path=None):
     su = urllib.parse.urlsplit(cfg["searxng_url"])
     if su.scheme not in ("http", "https") or not su.hostname:
         raise ValueError("searxng_url invalid")
+    cfg["repo_forges"] = {k: v for k, v in cfg["repo_forges"].items() if v is not None}
+    for name, tmpl in cfg["repo_forges"].items():
+        if not isinstance(tmpl, str) or set(re.findall(r"\{(\w*)\}", tmpl)) - {"owner", "repo", "ref"}:
+            raise ValueError("repo_forges template invalid: " + name)
+        fu = urllib.parse.urlsplit(tmpl.format(owner="o", repo="r", ref="x"))
+        if fu.scheme != "https" or not fu.hostname or fu.username or fu.port not in (None, 443):
+            raise ValueError("repo_forges template must be a plain https URL: " + name)
     for rx in cfg["blocked_url_regex"]:
         re.compile(rx)
     return cfg
@@ -237,11 +257,12 @@ def extract_page(body, base_url, content_type):
 
 
 class RunState:
-    def __init__(self, limits, ttl, seeds):
+    def __init__(self, limits, ttl, seeds, repos=None):
         self.limits, self.expires = limits, time.time() + ttl
         self.eligible = {norm_url(s) for s in seeds}
         self.hosts = {urllib.parse.urlsplit(s).hostname for s in seeds}
-        self.searches = self.fetches = self.bytes = 0
+        self.searches = self.fetches = self.bytes = self.repo_calls = 0
+        self.repos = {r["name"]: dict(r, lock=threading.Lock(), snapshot=None) for r in (repos or [])}
         self.lock = threading.Lock()
 
 
@@ -249,17 +270,22 @@ class Registry:
     def __init__(self, cfg):
         self.cfg, self.runs, self.lock = cfg, {}, threading.Lock()
 
-    def register(self, run_id, seeds, limits):
+    def register(self, run_id, seeds, limits, repos=None):
         caps, base = self.cfg["limit_caps"], self.cfg["limits"]
         merged = dict(base)
         for k, v in (limits or {}).items():
             if k in caps and isinstance(v, int) and not isinstance(v, bool) and v > 0:
                 merged[k] = min(v, caps[k])
-        seeds = [s for s in (seeds or [])[:10] if not url_problem(s, self.cfg)]
+        seeds = [s for s in (seeds or [])[:10] if isinstance(s, str) and not url_problem(s, self.cfg)]
+        specs = []
+        for raw in (repos or [])[:self.cfg["repo_max_repos"]]:
+            spec = repo_spec(raw, self.cfg)
+            if spec and spec["name"] not in {x["name"] for x in specs}:
+                specs.append(spec)
         with self.lock:
             self._gc()
-            self.runs[run_id] = RunState(merged, self.cfg["run_ttl_seconds"], seeds)
-        return {"run_id": run_id, "seeds": len(seeds), "limits": merged}
+            self.runs[run_id] = RunState(merged, self.cfg["run_ttl_seconds"], seeds, specs)
+        return {"run_id": run_id, "seeds": len(seeds), "repos": len(specs), "limits": merged}
 
     def _gc(self):
         now = time.time()
@@ -287,8 +313,10 @@ def check_eligible(run, url, cfg, strict_host_cap=True):
     return host
 
 
-def http_get_pinned(url, addrs, cfg, ctx=None):
-    """One GET to a pre-validated IP with TLS verification against the real hostname. No redirect following."""
+def http_get_pinned(url, addrs, cfg, ctx=None, max_bytes=None, accept="text/html,text/plain;q=0.9"):
+    """One GET to a pre-validated IP with TLS verification against the real hostname. No redirect following.
+    At most max_bytes + 1 bytes are returned so the caller can tell "too large" from "exactly the cap"."""
+    custom_cap, max_bytes = max_bytes is not None, max_bytes or cfg["max_page_bytes"]
     u = urllib.parse.urlsplit(url)
     host = u.hostname
     ctx = ctx or ssl.create_default_context()
@@ -302,11 +330,11 @@ def http_get_pinned(url, addrs, cfg, ctx=None):
     conn.sock = tls
     try:
         path = (u.path or "/") + ("?" + u.query if u.query else "")
-        conn.request("GET", path, headers={"Host": host, "User-Agent": "asg-research-service/1", "Accept": "text/html,text/plain;q=0.9",
+        conn.request("GET", path, headers={"Host": host, "User-Agent": "asg-research-service/1", "Accept": accept,
                                            "Accept-Encoding": "identity", "Connection": "close"})
         r = conn.getresponse()
-        data = r.read(cfg["max_page_bytes"] + 1)
-        return r.status, {k.lower(): v for k, v in r.getheaders()}, data[:cfg["max_page_bytes"]]
+        data = r.read(max_bytes + 1)
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, data if custom_cap else data[:max_bytes]
     finally:
         conn.close()
 
@@ -366,6 +394,203 @@ def do_fetch(run, url, cfg, getter=None, resolver=None):
         run.eligible.add(norm_url(current))
     return {"url": norm_url(url), "final_url": norm_url(current), "status": status, "title": clean_text(title, 200),
             "text": clean_text(text, run.limits["page_chars"]), "links": links}
+
+
+# ---- repo_auditor: read-only snapshots of registered repositories -------------------------------------------------------
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+REPO_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./-]{0,99}$")
+FORGE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,60}$")
+CODE_CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f​-‏‪-‮⁦-⁩]")
+
+
+def clean_code(value, limit):
+    """Control/bidi characters removed and non-public addresses redacted; unlike clean_text no HTML unescaping (source code)."""
+    return redact_addresses(CODE_CTRL_RE.sub("", str(value or ""))).strip("\n")[:limit]
+
+
+def repo_spec(raw, cfg):
+    """Validate one orchestrator-registered repository ({forge, owner, repo, ref}); None when it is not acceptable."""
+    if not isinstance(raw, dict) or set(raw) - {"forge", "owner", "repo", "ref"}:
+        return None
+    forge, owner, repo, ref = raw.get("forge", "github.com"), raw.get("owner"), raw.get("repo"), raw.get("ref")
+    if not all(isinstance(x, str) for x in (forge, owner, repo, ref)) or forge not in cfg["repo_forges"] or not FORGE_RE.match(forge):
+        return None
+    if not (REPO_NAME_RE.match(owner) and REPO_NAME_RE.match(repo) and REPO_REF_RE.match(ref)) or repo.endswith(".git"):
+        return None
+    if owner in (".", "..") or repo in (".", "..") or ".." in ref or "//" in ref or ref.endswith(("/", ".")):
+        return None
+    return {"forge": forge, "owner": owner, "repo": repo, "ref": ref, "name": (owner + "/" + repo).lower()}
+
+
+def repo_path(value, allow_empty=True):
+    """Repository-relative path used only as a dictionary key (never touches the filesystem); hygiene check."""
+    if value is None or value == "":
+        if allow_empty:
+            return ""
+        raise Denied(400, "bad_path")
+    if not isinstance(value, str) or len(value) > 300 or CODE_CTRL_RE.search(value) or "\\" in value or value.startswith("/"):
+        raise Denied(400, "bad_path")
+    parts = value.rstrip("/").split("/")
+    if any(p in ("", ".", "..") for p in parts) or len(parts) > 30:
+        raise Denied(400, "bad_path")
+    return "/".join(parts)
+
+
+class Snapshot:
+    def __init__(self):
+        self.files = {}     # path -> bytes (text files only)
+        self.meta = {}      # path -> (size, kind) for every file: kind text | binary | large
+        self.skipped = 0    # links, devices and other non-regular members (never kept)
+
+    def children(self, prefix):
+        base = prefix + "/" if prefix else ""
+        out = {}
+        for path, (size, kind) in self.meta.items():
+            if not path.startswith(base):
+                continue
+            head, sep, _ = path[len(base):].partition("/")
+            if sep:
+                out.setdefault(head, {"name": head, "type": "dir"})
+            else:
+                out[head] = {"name": head, "type": "file", "size": size, **({} if kind == "text" else {"kind": kind})}
+        return sorted(out.values(), key=lambda e: (e["type"] != "dir", e["name"]))
+
+
+def load_archive(data, cfg):
+    """Read a .tar.gz fully in memory. Unsafe member names reject the archive; links/devices are skipped, never created."""
+    snap, declared, members = Snapshot(), 0, 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            for m in tf:
+                members += 1
+                declared += max(0, m.size)
+                if members > cfg["repo_max_members"] or declared > cfg["repo_max_uncompressed_bytes"]:
+                    raise Denied(502, "archive_too_large")
+                name = m.name
+                parts = name.split("/")
+                if (name.startswith("/") or "\\" in name or CODE_CTRL_RE.search(name) or len(name) > 400 or len(parts) > 40
+                        or any(p in (".", "..") for p in parts) or parts[0] == ""):
+                    raise Denied(502, "archive_unsafe_path")
+                if m.isdir():
+                    continue
+                if not m.isreg():
+                    snap.skipped += 1
+                    continue
+                rel = "/".join(p for p in parts[1:] if p)  # the archive's single top-level directory is dropped
+                if not rel:
+                    continue
+                if len(snap.meta) >= cfg["repo_max_files"] and rel not in snap.meta:
+                    raise Denied(502, "archive_too_many_files")
+                if m.size > cfg["repo_max_file_bytes"]:
+                    snap.meta[rel] = (m.size, "large")
+                    snap.files.pop(rel, None)
+                    continue
+                blob = tf.extractfile(m).read(m.size)
+                if b"\x00" in blob[:4096]:
+                    snap.meta[rel] = (len(blob), "binary")
+                    snap.files.pop(rel, None)
+                    continue
+                snap.files[rel], snap.meta[rel] = blob, (len(blob), "text")
+    except Denied:
+        raise
+    except (tarfile.TarError, EOFError, OSError, zlib.error, ValueError):
+        raise Denied(502, "archive_invalid") from None
+    if not snap.meta:
+        raise Denied(502, "archive_empty")
+    return snap
+
+
+def download_archive(spec, cfg, getter=None, resolver=None):
+    getter = getter or http_get_pinned
+    url = cfg["repo_forges"][spec["forge"]].format(owner=urllib.parse.quote(spec["owner"], safe=""), repo=urllib.parse.quote(spec["repo"], safe=""),
+                                                   ref=urllib.parse.quote(spec["ref"], safe="/"))
+    addrs = public_addresses(urllib.parse.urlsplit(url).hostname, resolver)
+    try:
+        status, _, body = getter(url, addrs, cfg, max_bytes=cfg["repo_max_archive_bytes"], accept="application/gzip, application/x-gzip;q=0.9")
+    except (OSError, ssl.SSLError, http.client.HTTPException):
+        raise Denied(502, "archive_fetch_failed") from None
+    if status == 404:
+        raise Denied(404, "repo_not_found")
+    if status != 200:
+        raise Denied(502, "archive_fetch_failed")
+    if len(body) > cfg["repo_max_archive_bytes"]:
+        raise Denied(502, "archive_too_large")
+    return body
+
+
+def get_snapshot(spec, cfg, getter=None, resolver=None):
+    with spec["lock"]:
+        if spec["snapshot"] is None:
+            spec["snapshot"] = load_archive(download_archive(spec, cfg, getter, resolver), cfg)
+        return spec["snapshot"]
+
+
+def do_repo(run, payload, cfg, getter=None, resolver=None):
+    op = payload.get("op")
+    if op not in ("list_tree", "read_file", "grep"):
+        raise Denied(400, "bad_op")
+    name = payload.get("repo")
+    spec = run.repos.get(name.strip().lower()) if isinstance(name, str) else None
+    if spec is None:
+        raise Denied(403, "repo_not_registered")
+    with run.lock:
+        if run.repo_calls >= run.limits["repo_calls"]:
+            raise Denied(429, "repo_quota_exceeded")
+        run.repo_calls += 1
+    snap = get_snapshot(spec, cfg, getter, resolver)
+    ident = {"repo": spec["owner"] + "/" + spec["repo"], "ref": spec["ref"]}
+    if op == "list_tree":
+        path = repo_path(payload.get("path"))
+        if path in snap.meta:
+            raise Denied(400, "not_a_directory")
+        entries = snap.children(path)
+        if not entries and path:
+            raise Denied(404, "path_not_found")
+        cap = cfg["repo_list_entries"]
+        shown = [dict(e, name=clean_code(e["name"], 200)) for e in entries[:cap]]
+        return {**ident, "path": path, "entries": shown, "total_entries": len(entries), "truncated": len(entries) > cap}
+    if op == "read_file":
+        path = repo_path(payload.get("path"), allow_empty=False)
+        if path not in snap.meta:
+            raise Denied(404, "path_not_found")
+        _, kind = snap.meta[path]
+        if kind == "large":
+            raise Denied(413, "file_too_large")
+        if kind == "binary":
+            raise Denied(415, "not_text_file")
+        start = payload.get("start_line", 1)
+        if isinstance(start, bool) or not isinstance(start, int) or start < 1:
+            raise Denied(400, "bad_start_line")
+        lines = snap.files[path].decode("utf-8", "replace").split("\n")
+        budget, out, n = run.limits["page_chars"], [], start
+        while n <= len(lines) and budget > 0:
+            line = clean_code(lines[n - 1].rstrip("\r"), 500)
+            out.append("%d: %s" % (n, line))
+            budget -= len(line) + 8
+            n += 1
+        return {**ident, "path": path, "start_line": start, "end_line": n - 1 if out else start - 1, "total_lines": len(lines),
+                "truncated": n <= len(lines), "next_start_line": n if n <= len(lines) else None, "text": "\n".join(out)}
+    pattern = payload.get("pattern")
+    if not isinstance(pattern, str) or not 1 <= len(pattern.strip()) <= 200:
+        raise Denied(400, "bad_pattern")
+    prefix = repo_path(payload.get("path"))
+    fold = payload.get("ignore_case", True) is not False
+    needle = pattern.lower() if fold else pattern
+    base = prefix + "/" if prefix else ""
+    matches, scanned, truncated = [], 0, False
+    for path in sorted(snap.files):
+        if prefix and path != prefix and not path.startswith(base):
+            continue
+        scanned += 1
+        for i, line in enumerate(snap.files[path].decode("utf-8", "replace").split("\n"), 1):
+            if needle in (line.lower() if fold else line):
+                if len(matches) >= cfg["repo_grep_matches"]:
+                    truncated = True
+                    break
+                matches.append({"path": clean_code(path, 300), "line": i, "text": clean_code(line.rstrip("\r").strip(), 200)})
+        if truncated:
+            break
+    return {**ident, "pattern": clean_text(pattern, 200), "matches": matches, "files_scanned": scanned, "truncated": truncated}
 
 
 def do_search(run, query, cfg, fetcher=None):
@@ -495,13 +720,15 @@ def make_handler(cfg, registry):
                     run_id = payload.get("run_id")
                     if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
                         raise Denied(400, "bad_run_id")
-                    return self._send(200, registry.register(run_id, payload.get("seed_urls"), payload.get("limits")))
+                    return self._send(200, registry.register(run_id, payload.get("seed_urls"), payload.get("limits"), payload.get("repos")))
                 if path not in cfg["route_ids"]:
                     raise Denied(404, "not_found")
                 run_id, _ = verify_hub_request(hdrs, raw, path, cfg)
                 run = registry.get(run_id)
                 if path == "/search":
                     return self._send(200, do_search(run, payload.get("query"), cfg))
+                if path == "/repo":
+                    return self._send(200, do_repo(run, payload, cfg))
                 url = payload.get("url")
                 if not isinstance(url, str):
                     raise Denied(400, "bad_url")

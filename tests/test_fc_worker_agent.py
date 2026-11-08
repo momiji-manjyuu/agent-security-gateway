@@ -71,8 +71,8 @@ class WorkerAgentTruncationTests(unittest.TestCase):
         profiles = {}
         for name, body in re.findall(r'"(\w+)": \{(.*?)\},?\n', block, re.S):
             profiles[name] = {k: (int(d), int(c)) for k, d, c in re.findall(r'"(\w+)": \((\d+), (\d+)\)', body)}
-        self.assertEqual(set(profiles), {"reader", "researcher"})
-        reader, researcher = profiles["reader"], profiles["researcher"]
+        self.assertEqual(set(profiles), {"reader", "researcher", "repo_auditor"})
+        reader, researcher, auditor = profiles["reader"], profiles["researcher"], profiles["repo_auditor"]
         self.assertEqual(reader["max_tokens"], (32768, 32768))
         self.assertEqual(reader["max_seconds"], (1200, 1800))
         self.assertLessEqual(reader["max_llm_calls"][1], 6)
@@ -80,9 +80,14 @@ class WorkerAgentTruncationTests(unittest.TestCase):
         self.assertGreater(vm, reader["max_seconds"][1])  # VM outlives the longest reader run
         vm_max = int(re.search(r"ASG_FC_TIMEOUT_MAX=(\d+)", text).group(1))
         self.assertGreaterEqual(vm_max, researcher["max_seconds"][1] + 120)  # longest researcher run + slack fits the VM cap
+        self.assertGreaterEqual(vm_max, auditor["max_seconds"][1] + 120)
         for k, (d, c) in researcher.items():
             self.assertLessEqual(d, c, k)
             self.assertGreaterEqual(c, reader[k][1], k)  # researcher is never below reader
+        for k, (d, c) in auditor.items():
+            self.assertLessEqual(d, c, k)
+            self.assertGreaterEqual(c, reader[k][1], k)
+            self.assertLessEqual(c, 40 if k in ("max_steps", "max_llm_calls") else c, k)
 
     def test_unknown_profile_and_missing_research_config_fail_closed(self):
         text = (ROOT / "asg-fc-worker").read_text(encoding="utf-8")

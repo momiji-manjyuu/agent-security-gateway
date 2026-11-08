@@ -1,6 +1,7 @@
 # Worker profiles: research and repository work in disposable workers
 
-Status: design + phase 1 (researcher). Phases 2 and 3 are specified here and not implemented yet.
+Status: phase 1 (researcher) and phase 2 (repo_auditor) implemented. Phase 3 (repo_builder) is specified here and not
+implemented: it needs its own review of the no-network build VM class first.
 
 ## Goal
 
@@ -25,7 +26,7 @@ builds and tests, without widening what a compromised worker can reach.
 |---|---|---|---|
 | `reader` (today) | `fc.llm.chat`, `fc.artifacts.submit` | fetch of listed hosts | steps 8, llm 6, 1200 s |
 | `researcher` (phase 1) | + `fc.search`, `fc.fetch` | `search`, `fetch`, `final` | steps 30, llm 40, 3600 s |
-| `repo_auditor` (phase 2) | + `fc.repo` | `list_tree`, `read_file`, `grep`, `final` | steps 40, llm 40 |
+| `repo_auditor` (phase 2) | + `fc.repo` | `list_tree`, `read_file`, `grep`, `final` | steps 40, llm 40, 2400 s |
 | `repo_builder` (phase 3) | + `fc.repo`, run tool | + `run` (fixed command set) | exec caps below |
 
 Enforcement is layered, and each layer is independent:
@@ -87,15 +88,30 @@ rewrite it each turn) instead of re-sending every page, so long explorations fit
 A structured report artifact: findings, each with source URLs (no query strings), plus the same warnings list.
 Artifact status handling (`verified`, `verified_with_warnings`, quarantine) is unchanged.
 
-## Phase 2: repo_auditor
+## Phase 2: repo_auditor (implemented)
 
-- `fc.repo` fetches a repository archive (allowed forges only, size capped) via the research service, which
-  unpacks it safely (no absolute paths, `..`, links, device files; file count/size caps) and serves tree
-  listings, file reads and grep over a read-only snapshot keyed by `run_id`.
-- Repository files get their own taint class `repo_content`. Security-related repositories trigger input
-  guard false positives, so the route carries its own tuned `input_policy`/guard settings; a block still
-  drops that file from context with a warning (fail closed).
-- The worker never executes repository code in this profile.
+- **The orchestrator, not the worker, chooses the repositories.** `spawn_worker(profile="repo_auditor", repos=["owner/name@ref"])`
+  (1-3 GitHub repositories, ref defaults to `HEAD`, no URLs or hosts) is validated by the parent tool and again by
+  `asg-fc-worker`, which registers `{forge, owner, repo, ref}` with the research service before the VM boots. The worker can only
+  name one of those repositories; anything else is `repo_not_registered`.
+- `fc.repo` is an `http_json` route to the research service (`POST /repo`, signed like `fc.fetch`). The request body is
+  `{op: list_tree | read_file | grep, repo, path, start_line, pattern, ignore_case}`; there is no URL field. The archive URL comes
+  only from the operator's `repo_forges` templates (default: `https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}`), is
+  resolved by the service (public addresses only, connection pinned to the validated IP, no redirects) and is downloaded on the
+  first call of the run.
+- **Snapshot handling.** The tarball is read in memory and never extracted to disk. A member name that is absolute, contains
+  `..` or `.` components, a backslash or control characters rejects the whole archive. Symlinks, hard links, devices and FIFOs
+  are skipped (counted, never followed). Caps: 25 MiB archive, 60 MiB uncompressed (declared sizes), 20000 members, 5000 files,
+  512 KiB per file; binary files (NUL in the first 4 KiB) and oversized files are listed but not readable.
+- **Tools.** `list_tree` lists one directory (200 entries), `read_file` returns numbered lines (page_chars per call, continue at
+  `next_start_line`), `grep` is a literal, case-insensitive substring search (no regex, so no ReDoS) capped at 50 matches.
+  Control and bidi characters are removed and private/loopback/link-local addresses are redacted (`127.0.0.1` kept) exactly as for
+  web pages; source code is not HTML-unescaped. Per-run quota `repo_calls` (default 150, cap 400).
+- The route sets `output_policy.untrusted_tool_result: true` (repository text is untrusted content full of paths, hosts and
+  URLs) and accepts the taint `untrusted_github` on the request. The model call and the artifact still carry `untrusted_web`.
+  Injection, secrets, obfuscation and incomplete-inspection findings still block; a block drops that tool output from the model's
+  context with a warning (fail closed), as for the researcher.
+- The worker never executes repository code and has no network path to the forge.
 
 ## Phase 3: repo_builder (build and test execution)
 
